@@ -5,8 +5,10 @@ the whole loop. Real integrations are opt-in: set GCL_INTEG_PYTHON to the python
 environment with `litellm[proxy]` and `nemoguardrails[server]` installed.
 """
 
+import json
 import os
 import sys
+import urllib.error
 from pathlib import Path
 from typing import ClassVar
 
@@ -97,7 +99,6 @@ def test_standin_has_a_listener_per_stage_and_reopens_after_refused():
 
 
 def test_standin_rejects_wrong_path_and_unknown_stage():
-    import urllib.error
 
     path = LiteLLMProxy.protocol.path
     with StandInScanner(LiteLLMProxy.protocol) as sc:
@@ -449,11 +450,58 @@ def test_an_output_only_integration_gets_output_controls_and_faults(tmp_path):
     assert not any(s.stage == "input" and not s.control for s in sc)
 
 
+def test_mock_mcp_server_speaks_streamable_http_and_records_tool_calls():
+    import urllib.request
+
+    with MockModel("tool result GCL-R-i03", host="::1") as m:
+        assert m.base.startswith("http://[::1]:")
+
+        def rpc(msg, sid=None):
+            hdr = {"Content-Type": "application/json", **({"Mcp-Session-Id": sid} if sid else {})}
+            r = urllib.request.urlopen(urllib.request.Request(m.base + "/mcp/", data=json.dumps(msg).encode(),
+                                                              headers=hdr), timeout=3)
+            return r.headers.get("Mcp-Session-Id"), (json.loads(r.read()) if r.status == 200 else None)
+
+        sid1, init = rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        sid2, _ = rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        assert init["result"]["capabilities"] == {"tools": {}} and sid1 != sid2  # one session per client
+        _, res = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                      "params": {"name": "gcl_probe", "arguments": {"note": "hola GCL-U-i03"}}}, sid1)
+        assert res["result"]["content"][0]["text"] == "tool result GCL-R-i03"
+        assert len(m.events) == 1 and len(m.tool_events) == 1
+
+
+def test_static_posts_and_policy_faults_on_the_standin():
+    import urllib.request
+
+    from gcl.enforce.adapters import INVARIANT_CHECK as P
+
+    with StandInScanner(P) as sc:
+        base = sc.base_for("input")
+        sc.configure({"input": "allow", "output": "allow"})
+        assert _post_json(base + "/api/v1/push/trace", {"x": 1}) == {"id": ["gcl-trace"]}
+        assert sc.consulted("input") == 0
+        pol = base + "/api/v1/dataset/byuser/gcl/gcl/policy"
+        assert json.loads(urllib.request.urlopen(pol, timeout=3).read())["policies"][0]["action"] == "block"
+        sc.configure({"input": "policy_missing", "output": "allow"})
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(pol, timeout=3)
+        assert e.value.code == 404
+
+
+def test_retry_capable_adapters_get_a_retry_scenario(tmp_path):
+    from gcl.enforce.adapters import InvariantMCP
+
+    modes = {(s.stage, s.mode) for s in build_scenarios(InvariantMCP(sys.executable, tmp_path))}
+    assert ("input", "block_retry") in modes and ("input", "policy_missing") in modes
+    assert POLICY["block_retry"] == "stopped"
+
+
 def test_adapters_registry():
     assert set(ADAPTERS) == {"litellm", "nemo", "nemo-selfcheck", "openai-guardrails", "portkey",
                              "langchain-moderation", "mastra", "openai-agents", "pydantic-ai", "litellm-vendor",
                              "nemo-vendor", "crewai", "guardrails-ai",
-                             "reference"}
+                             "invariant-mcp", "reference"}
 
 
 # Real integrations: these pin what was observed on litellm 1.104.2 and nemoguardrails
@@ -593,3 +641,18 @@ def test_real_pydantic_ai_matches_its_docs(tmp_path):
     par = run_contracts(PydanticAI(PYD_PY, tmp_path / "p", "parallel"), 30)
     assert par["summary"]["documented_deviates"] == 0
     assert _by(par, "input", "block")["observed"] == "blocked after send"  # documented; no tool ran
+
+
+INV_PY = os.environ.get("GCL_INTEG_INVARIANT_PYTHON")  # an env with invariant-gateway 0.0.9
+
+
+@pytest.mark.skipif(not INV_PY, reason="set GCL_INTEG_INVARIANT_PYTHON")
+def test_real_invariant_mcp_retry_bypass_with_push(tmp_path):
+    from gcl.enforce.adapters import InvariantMCP
+
+    plain = run_contracts(InvariantMCP(INV_PY, tmp_path / "d", "default"), 20)
+    _controls_hold(plain)
+    assert _by(plain, "input", "block_retry")["observed"] == "stopped"
+    assert _by(plain, "input", "policy_missing")["observed"] == "tool executed"   # 404 policy → no guardrails
+    push = run_contracts(InvariantMCP(INV_PY, tmp_path / "p", "push"), 20, only={"i14"})
+    assert _by(push, "input", "block_retry")["observed"] == "tool executed"       # retry forwarded

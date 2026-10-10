@@ -57,7 +57,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .adapters import Adapter
-from .servers import FAULTS, MockModel, StandInScanner
+from .servers import FAULTS, POLICY_FAULTS, MockModel, StandInScanner
 
 # Widely spoken languages, rotated across scenarios: the plumbing must not depend on the
 # script or on non-ASCII bytes surviving a round trip.
@@ -82,7 +82,7 @@ REDACTED = {"es": "[contenido retirado por la política]", "fr": "[contenu retir
             "hi": "[नीति के कारण सामग्री हटाई गई]"}
 
 POLICY = {"allow": "passed", "block": "stopped", "modify": "modified", **{f: "stopped" for f in FAULTS},
-          "judge_refusal": "stopped"}
+          "judge_refusal": "stopped", "block_retry": "stopped", **{f: "stopped" for f in POLICY_FAULTS}}
 
 
 @dataclass
@@ -136,6 +136,8 @@ def build_scenarios(adapter: Adapter) -> list[Scenario]:
     proto = adapter.protocol
     faults = [f for f in FAULTS if not (f == "refused" and proto.shared_endpoint)]
     faults += list(proto.extra_faults)
+    if proto.get_routes and any("polic" in r for r in proto.get_routes):
+        faults += list(POLICY_FAULTS)
     # One URL for both stages: an output "refused" also refuses the input check, so it
     # cannot be told apart from an input failure. Not staged.
     out_faults = [f for f in faults if not (f == "refused" and proto.single_listener)]
@@ -143,6 +145,9 @@ def build_scenarios(adapter: Adapter) -> list[Scenario]:
         plan += [("input", f, False) for f in faults]
     if "modify_input" in caps:
         plan.append(("input", "modify", False))
+    if "retry" in caps:
+        # The same blocked request sent twice in one session: the second must be stopped too.
+        plan.append(("input", "block_retry", False))
     if "output" in caps:
         plan += [("output", f, False) for f in out_faults]
     if "modify_output" in caps:
@@ -325,7 +330,8 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
     started = time.time()
     t0 = time.monotonic()
     with StandInScanner(adapter.protocol) as scanner, \
-            MockModel("…", judge=scanner if adapter.protocol.shared_endpoint else None) as model:
+            MockModel("…", judge=scanner if adapter.protocol.shared_endpoint else None,
+                      host=getattr(adapter, "model_host", "127.0.0.1")) as model:
         scanner.configure({"input": "allow", "output": "allow"})
         model.tools_mode = "tools" in adapter.capabilities
         scanner.latency_s = getattr(adapter, "scanner_latency_s", 0.0)
@@ -334,11 +340,13 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
             adapter.start(model, scanner)
             for s in scenarios:
                 say(f"{s.id}: {s.stage} {s.mode} [{s.lang}]")
-                scanner.configure({"input": "allow", "output": "allow", s.stage: s.mode}, s.modify_text, sid=s.id)
+                served = "block" if s.mode == "block_retry" else s.mode
+                scanner.configure({"input": "allow", "output": "allow", s.stage: served}, s.modify_text, sid=s.id)
                 model.reset(f"{s.reply_text} {s.reply_sentinel}")
                 msg = [{"role": "user", "content": f"{s.user_text} {s.user_sentinel}"}]
                 begin = time.monotonic()
-                obs_by[s.id] = adapter.call(msg, timeout_s)
+                obs_by[s.id] = (adapter.call(msg, timeout_s, repeat=2) if s.mode == "block_retry"
+                                else adapter.call(msg, timeout_s))
                 # Hold the scenario's modes while the integration finishes reacting: a
                 # stalled scan is released (it closes unanswered), then we wait for quiet.
                 scanner.release_stalled()
@@ -379,9 +387,10 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
                 and sentinel in (e["scanned"] if e.get("scanned") is not None else e["body_text"])]
         # Only answers served with this scenario's own mode count: a late retry answered
         # by the next scenario's configuration is not evidence for this one.
-        consulted = sum(1 for e in mine if e["mode"] == s.mode)
-        foreign = sum(1 for e in mine if e["mode"] != s.mode)
-        unexpressed = any(not e.get("fault_expressed", True) for e in mine if e["mode"] == s.mode)
+        served = "block" if s.mode == "block_retry" else s.mode
+        consulted = sum(1 for e in mine if e["mode"] == served)
+        foreign = sum(1 for e in mine if e["mode"] != served)
+        unexpressed = any(not e.get("fault_expressed", True) for e in mine if e["mode"] == served)
         late = [round(e["t"] - windows[s.id][1], 2) for e in mev if e["t"] > windows[s.id][1]]
         expect = docs.get((s.stage, s.mode), docs.get(s.mode))
         if isinstance(expect, (tuple, set, frozenset)):
@@ -476,7 +485,9 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
         if s.stage == "output" and ev["model_input"] != "passed":
             return "the model never received this scenario's request, so no reply was generated"
         unchecked_input = s.stage == "input" and "input" not in adapter.capabilities
-        if s.mode != "refused" and ev["scanner_consulted_stage"] == 0 and not unchecked_input:
+        # A refused scanner, or a missing policy, may legitimately mean no consultation.
+        exempt = s.mode == "refused" or s.mode in POLICY_FAULTS
+        if not exempt and ev["scanner_consulted_stage"] == 0 and not unchecked_input:
             return "the scanner was never consulted for this stage with this scenario's text"
         return None
 

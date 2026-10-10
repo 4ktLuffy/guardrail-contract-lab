@@ -51,8 +51,8 @@ def main() -> None:
                                            "detail": repr(getattr(e, "guardrail_result", None))}})
                 return
             except Exception as e:  # anything else the library raised
-                self._json(500, {"error": {"type": type(e).__name__, "message": str(e), "detail": repr(e),
-                                           "attrs": {k: repr(v) for k, v in vars(e).items()}}})
+                self._json(500, {"error": {"type": type(e).__name__, "message": str(e), "detail": repr(e)},
+                                 "library_return": {"exception_attrs": {k: repr(v) for k, v in vars(e).items()}}})
                 return
             # Everything the caller could read, not just the first choice.
             full = r.llm_response.model_dump() if hasattr(r, "llm_response") else repr(r)

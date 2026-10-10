@@ -85,13 +85,13 @@ def main() -> None:
             try:
                 r = asyncio.run(agent.run(prompt))
             except (InputBlocked, OutputBlocked) as e:
-                self._json(400, {"error": {"type": type(e).__name__, "message": str(e), "detail": repr(e),
-                                           "attrs": {k: repr(v) for k, v in vars(e).items()}}})
+                self._json(400, {"error": {"type": type(e).__name__, "message": str(e), "detail": repr(e)},
+                                 "library_return": {"exception_attrs": {k: repr(v) for k, v in vars(e).items()}}})
                 return
             except Exception as e:  # guard exceptions and anything else
                 code = 500
-                self._json(code, {"error": {"type": type(e).__name__, "message": str(e), "detail": repr(e),
-                                           "attrs": {k: repr(v) for k, v in vars(e).items()}}})
+                self._json(code, {"error": {"type": type(e).__name__, "message": str(e), "detail": repr(e)},
+                                 "library_return": {"exception_attrs": {k: repr(v) for k, v in vars(e).items()}}})
                 return
             self._json(200, {"choices": [{"index": 0, "message": {"role": "assistant", "content": str(r.output)}}],
                              "library_return": [repr(m) for m in r.all_messages()]})

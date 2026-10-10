@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import threading
 import time
 from dataclasses import dataclass, field
@@ -20,14 +21,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 
 
+class _IPv6Server(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+
 class _Server:
     """A ThreadingHTTPServer on a free localhost port, run in a daemon thread."""
 
     handler_factory: Callable
 
+    host = "127.0.0.1"
+
     def __enter__(self):
         self._stop = threading.Event()
-        self._srv = ThreadingHTTPServer(("127.0.0.1", 0), self.handler_factory())
+        cls = _IPv6Server if ":" in self.host else ThreadingHTTPServer
+        self._srv = cls((self.host, 0), self.handler_factory())
         self._srv.daemon_threads = True
         self.port = self._srv.server_address[1]
         threading.Thread(target=self._srv.serve_forever, daemon=True).start()
@@ -40,20 +48,23 @@ class _Server:
 
     @property
     def base(self) -> str:
-        return f"http://127.0.0.1:{self.port}"
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"http://{host}:{self.port}"
 
 
 class MockModel(_Server):
     """OpenAI-compatible /v1/chat/completions with a fixed reply (streamed or not)."""
 
-    def __init__(self, reply: str, model: str = "gcl-mock", judge: StandInScanner | None = None):
-        self.reply, self.model = reply, model
+    def __init__(self, reply: str, model: str = "gcl-mock", judge: StandInScanner | None = None,
+                 host: str = "127.0.0.1"):
+        self.reply, self.model, self.host = reply, model, host
         self.judge = judge  # requests for judge.protocol.judge_model are the guard's, not the model's
         # Tool mode: when a request offers tools and carries no tool result yet, answer with
         # a call to the first tool, its argument the scenario's tool marker (GCL-T-<id>).
         # The tool's only effect is a POST to /gcl/tool, recorded in tool_events.
         self.tools_mode = False
         self.tool_events: list[dict] = []
+        self.mcp_sessions = 0
         self.events: list[dict] = []        # append-only: {"t", "body", "reply"}
         self.unexpected: list[str] = []
         self.inflight = 0
@@ -100,6 +111,48 @@ class MockModel(_Server):
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _mcp(self, raw: bytes):
+                """A minimal MCP server (streamable HTTP, JSON responses): one tool,
+                gcl_probe. A tools/call is recorded as a provider event (its arguments
+                are what reached the server) and answered with the scripted reply."""
+                try:
+                    msg = json.loads(raw or b"{}")
+                except ValueError:
+                    self._json(400, {"error": "bad json"})
+                    return
+                method, mid = msg.get("method"), msg.get("id")
+                if mid is None:  # a notification
+                    self.send_response(202)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if method == "initialize":
+                    # A fresh session per client: proxies key their state on it, and a
+                    # shared id would merge scenarios into one conversation.
+                    outer.mcp_sessions += 1
+                    self._mcp_session = f"gcl-mcp-{outer.mcp_sessions}"
+                    result = {"protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2025-03-26"),
+                              "capabilities": {"tools": {}}, "serverInfo": {"name": "gcl-mock", "version": "1"}}
+                elif method == "tools/list":
+                    result = {"tools": [{"name": "gcl_probe", "description": "Record a note.",
+                                         "inputSchema": {"type": "object", "properties": {"note": {"type": "string"}},
+                                                         "required": ["note"]}}]}
+                elif method == "tools/call":
+                    params = msg.get("params") or {}
+                    outer.events.append({"t": time.monotonic(), "body": params, "reply": outer.reply})
+                    outer.tool_events.append({"t": time.monotonic(), "body": json.dumps(params, ensure_ascii=False)})
+                    result = {"content": [{"type": "text", "text": outer.reply}], "isError": False}
+                else:
+                    result = {}
+                b = json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}, ensure_ascii=False).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                sid = getattr(self, "_mcp_session", None) or self.headers.get("Mcp-Session-Id") or "gcl-mcp-0"
+                self.send_header("Mcp-Session-Id", sid)
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
             def do_GET(self):
                 if self.path.rstrip("/").endswith("/models"):
                     self._json(200, {"object": "list", "data": [{"id": outer.model, "object": "model"}]})
@@ -119,6 +172,9 @@ class MockModel(_Server):
             def _post(self):
                 n = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(n)
+                if self.path.rstrip("/").endswith("/mcp"):
+                    self._mcp(raw)
+                    return
                 if self.path.rstrip("/").endswith("/gcl/tool"):
                     outer.tool_events.append({"t": time.monotonic(), "body": raw.decode("utf-8", "replace")})
                     self._json(200, {"ok": True})
@@ -219,6 +275,12 @@ class Protocol:
     # The text the guard was asked to check, from a request body (for ECHO_TEXT and for
     # binding consultation evidence to that text). None: the whole body.
     scanned: Callable[[dict], str | None] | None = None
+    # Static answers to GET requests (a policy source, an identity endpoint): route
+    # template -> JSON body. Recorded as events, never counted as consultations.
+    get_routes: dict = field(default_factory=dict)
+    # Static answers to other POST routes the integration calls (trace upload, preload):
+    # route template -> JSON body. Recorded, never counted as consultations.
+    static_posts: dict = field(default_factory=dict)
     # Protocol-specific faults: mode name -> full response body (sent with HTTP 200).
     extra_faults: dict = field(default_factory=dict)
     # Overrides for built-in content faults when verdicts are plain text, not JSON:
@@ -228,6 +290,9 @@ class Protocol:
 
 # Modes a stage can be put in. Verdict modes answer correctly; fault modes misbehave.
 VERDICTS = ("allow", "block", "modify")
+# Faults of the *policy source* (where an integration fetches its rules), for protocols
+# with GET routes: the policy is not found, or the source errors.
+POLICY_FAULTS = ("policy_missing", "policy_error")
 FAULTS = ("error", "timeout", "malformed", "empty", "wrong_schema", "unknown_verdict", "verdict_type",
           "refused")
 
@@ -367,6 +432,15 @@ class StandInScanner:
             body = json.loads(raw or b"{}")
         except ValueError:
             body = {}
+        path = h.path.split("?", 1)[0].rstrip("/")
+        for route, answer in proto.static_posts.items():
+            if re.fullmatch(re.sub(r"<[^>/]+>", "[^/]+", route.rstrip("/")), path):
+                self.events.append({"t": time.monotonic(), "stage": listener, "claimed_stage": None, "path": h.path,
+                                    "valid": False, "mode": "static", "body": body, "scanned": None,
+                                    "body_text": raw.decode("utf-8", "replace"), "answered": answer,
+                                    "fault_expressed": True, "t_done": time.monotonic()})
+                send(200, json.dumps(answer).encode())
+                return
         claimed = proto.stage_of(body) if isinstance(body, dict) else None
         path_ok = _path_ok(proto, h.path)
         if listener is not None and (by_name or proto.trust_listener):
@@ -451,6 +525,28 @@ class StandInScanner:
             ev["answered"] = "500 (unknown gcl mode)"
             send(500, b'{"error": "unknown gcl mode"}')
 
+    def serve_get(self, h: BaseHTTPRequestHandler, listener: str) -> None:
+        path = h.path.split("?", 1)[0].rstrip("/")
+        fault = next((m for m in self.modes.values() if m in POLICY_FAULTS), None)
+        for route, body in self.protocol.get_routes.items():
+            if re.fullmatch(re.sub(r"<[^>/]+>", "[^/]+", route.rstrip("/")), path):
+                if fault and "polic" in route:
+                    code = 404 if fault == "policy_missing" else 500
+                    b = b'{"error": "gcl stand-in: policy source fault"}'
+                else:
+                    b, code = json.dumps(body).encode(), 200
+                break
+        else:
+            b, code = b'{"error": "not found"}', 404
+        self.events.append({"t": time.monotonic(), "stage": listener, "claimed_stage": None, "path": h.path,
+                            "valid": False, "mode": "GET", "body": {}, "scanned": None, "body_text": "",
+                            "answered": code, "fault_expressed": True, "t_done": time.monotonic()})
+        h.send_response(code)
+        h.send_header("Content-Type", "application/json")
+        h.send_header("Content-Length", str(len(b)))
+        h.end_headers()
+        h.wfile.write(b)
+
     def handler_factory(self, listener: str):
         outer = self
 
@@ -461,6 +557,9 @@ class StandInScanner:
             def do_POST(self):
                 n = int(self.headers.get("Content-Length") or 0)
                 outer.serve(self, listener, self.rfile.read(n))
+
+            def do_GET(self):
+                outer.serve_get(self, listener)
 
         return H
 

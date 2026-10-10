@@ -93,13 +93,20 @@ else is labelled.
   scenario's behaviour; vendor routes are matched exactly; stage inference needs exactly
   one scenario identity — checked.
 
+## MCP, retry and policy sources (tests/test_enforce.py)
+- The mock MCP server answers initialize / tools/list / tools/call over streamable HTTP,
+  issues one session per client, and records tool calls at the server boundary; static
+  POST routes and GET policy routes answer without counting as consultations; policy-
+  source faults return 404 / 500 on policy routes; adapters with sessions get a
+  "block_retry" scenario — checked. Real run: Invariant Gateway 0.0.9 MCP proxy — opt-in.
+
 ## Independent review
 - Nine adversarial review rounds by independent models (eight by an OpenAI model, one by a
   separate Claude instance) before release. Every issue they reproduced — wrong verdicts,
   misattributed timeouts, rewrites that changed what a rule matches, unbounded
   subprocesses, overclaims — was fixed and pinned by a regression test
   (`tests/test_review_round*.py` and the suites above).
-- Local runs: 157 tests pass (plus 10 opt-in real-integration tests) on Python 3.11.14 and
+- Local runs: 160 tests pass (plus 11 opt-in real-integration tests) on Python 3.11.14 and
   3.13.15 with Node 25.8.0; the demo runs
   from an installed wheel outside the checkout.
 

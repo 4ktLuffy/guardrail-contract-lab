@@ -87,8 +87,8 @@ def main() -> None:
                             api_base=args.model_base, api_key="sk-gcl")
             except Exception as e:
                 code = 400 if type(e).__name__ == "ValidationError" else 500
-                self._json(code, {"error": {"type": type(e).__name__, "message": str(e), "detail": repr(e),
-                                           "attrs": {k: repr(v) for k, v in vars(e).items()}}})
+                self._json(code, {"error": {"type": type(e).__name__, "message": str(e), "detail": repr(e)},
+                                 "library_return": {"exception_attrs": {k: repr(v) for k, v in vars(e).items()}}})
                 return
             # Exactly what the docs tell an application to use; the driver does not judge it.
             self._json(200, {"choices": [{"index": 0, "message": {"role": "assistant",

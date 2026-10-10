@@ -1313,9 +1313,113 @@ class GuardrailsAI(Adapter):
                      {"model": "gcl-mock", "messages": messages}, None, timeout_s)
 
 
+# --------------------------------------------------------------------------- MCP: Invariant gateway
+_INV_POLICY = 'raise "gcl" if:\n    (msg: Message)\n    "GCL" in msg.content'
+
+INVARIANT_CHECK = Protocol(
+    name="Invariant guardrails API (POST /api/v1/policy/check/batch) and Explorer policy source",
+    verdicts={"allow": lambda b, m: {"result": [{"errors": []}]},
+              # The real API reports where the violation is; the gateway blocks only on errors
+              # that yield an annotation, i.e. that carry a range.
+              "block": lambda b, m: {"result": [{"errors": [{"args": ["GCL-BLOCKED by the stand-in"],
+                                                             "kwargs": {}, "ranges": ["messages.0"]}]}]},
+              "modify": lambda b, m: {"result": [{"errors": []}]}},
+    stage_of=_stage_by_sentinel, routes=("/api/v1/policy/check/batch",), single_listener=True,
+    wrong_schema={"status": "ok"},
+    static_posts={"/api/v1/push/trace": {"id": ["gcl-trace"]}, "/api/v1/trace/<id>/messages": {},
+                  "/api/v1/policy/load": {}},
+    get_routes={"/api/v1/user/identity": {"username": "gcl"},
+                "/api/v1/dataset/byuser/<user>/<dataset>/policy": {"policies": [
+                    {"id": "gcl-1", "name": "gcl", "content": _INV_POLICY, "action": "block", "enabled": True}]}},
+)
+
+
+def _mcp_post(url: str, msg: dict, headers: dict, timeout_s: float) -> tuple[int, dict, str]:
+    req = urllib.request.Request(url, data=json.dumps(msg, ensure_ascii=False).encode(),
+                                 headers={"Content-Type": "application/json",
+                                          "Accept": "application/json, text/event-stream", **headers})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as r:
+            return r.status, dict(r.headers.items()), r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers.items()), e.read().decode("utf-8", "replace")
+
+
+class InvariantMCP(Adapter):
+    """Invariant Gateway's MCP proxy (streamable HTTP) in front of gcl's mock MCP server.
+    The gateway pulls its blocking guardrails from the Explorer API and checks every
+    tools/call and its result with the Guardrails API — both served by the stand-in. The
+    client is an MCP client: initialize, initialized, then tools/call `gcl_probe` with the
+    scenario's text; the tool's result is the scenario's reply."""
+
+    name = "invariant-mcp"
+    protocol = INVARIANT_CHECK
+    capabilities: ClassVar[set[str]] = {"input", "output", "retry"}
+    model_host = "::1"  # the gateway rewrites localhost/127.0.0.1 to host.docker.internal
+    default_timeout_s = 20.0
+    # Gateway docs: "In case any of the checks fail, Gateway will return an HTTP error
+    # response instead of the LLM response." Nothing on the Guardrails or Explorer API
+    # being unreachable or answering something unexpected.
+    documented: ClassVar[dict] = {"default": dict(_BASE), "push": dict(_BASE)}
+    documented_sources: ClassVar[dict] = {"default": {
+        "source": "invariant-gateway 0.0.9 README / explorer.invariantlabs.ai docs (now redirecting)",
+        "read_for": "invariant-gateway 0.0.9",
+        "passage": "In case any of the checks fail, Gateway will return an HTTP error response instead of the "
+                   "LLM response. Failure of the guardrails service is not described."}}
+    documented_sources["push"] = documented_sources["default"]
+
+    def config_summary(self) -> dict:
+        return {"gateway": "gateway.serve:app (uvicorn)", "transport": "MCP streamable HTTP",
+                "guardrails": "1 blocking policy from the Explorer stand-in", "tool": "gcl_probe",
+                "push_to_explorer": self.profile == "push"}
+
+    def versions(self) -> dict:
+        return _versions(self.python, ["invariant-gateway", "httpx", "fastapi"])
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        self.port = _free_port()
+        self._mcp_base = model.base
+        url = scanner.base_for("input")
+        env = dict(os.environ, GUARDRAILS_API_URL=url, INVARIANT_API_URL=url,
+                   NO_PROXY="127.0.0.1,localhost,::1", no_proxy="127.0.0.1,localhost,::1")
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen([self.python, "-m", "uvicorn", "gateway.serve:app", "--host", "127.0.0.1",
+                                          "--port", str(self.port)], stdout=logf, stderr=subprocess.STDOUT,
+                                         env=env, start_new_session=True, cwd=str(self.workdir))
+        _wait_http(f"http://127.0.0.1:{self.port}/api/v1/gateway/health", self.proc, 90, self.log)
+
+    def call(self, messages: list[dict], timeout_s: float, repeat: int = 1) -> Observation:
+        """One MCP session; with repeat=2 the same tools/call is sent twice in it and the
+        second answer is returned (a client or agent retrying a blocked call)."""
+        url = f"http://127.0.0.1:{self.port}/api/v1/gateway/mcp/streamable"
+        h = {"mcp-server-base-url": self._mcp_base, "INVARIANT-PROJECT-NAME": "gcl",
+             "INVARIANT-API-KEY": "inv-gcl", "PUSH-INVARIANT-EXPLORER": "true" if self.profile == "push" else "false"}
+        t0 = time.perf_counter()
+        try:
+            code, hdrs, _ = _mcp_post(url, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "gcl", "version": "1"}}},
+                h, timeout_s)
+            sid = next((v for k, v in hdrs.items() if k.lower() == "mcp-session-id"), None)
+            if code >= 400 or not sid:
+                return Observation(code, "", True, time.perf_counter() - t0, f"initialize failed ({code})")
+            h = {**h, "mcp-session-id": sid}
+            _mcp_post(url, {"jsonrpc": "2.0", "method": "notifications/initialized"}, h, timeout_s)
+        except OSError as e:
+            return Observation(None, "", False, time.perf_counter() - t0, f"transport failure: {e}", transport=True)
+        text = messages[-1]["content"]
+        obs = None
+        for k in range(repeat):
+            left = max(1.0, timeout_s - (time.perf_counter() - t0))
+            obs = _post(url, {"jsonrpc": "2.0", "id": 2 + k, "method": "tools/call",
+                              "params": {"name": "gcl_probe", "arguments": {"note": text}}},
+                        {**h, "Accept": "application/json, text/event-stream"}, left)
+        return obs
+
+
 ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": OpenAIGuardrails,
             "nemo-selfcheck": NemoSelfCheck, "portkey": PortkeyGateway,
             "langchain-moderation": LangChainModeration, "mastra": MastraAgent, "openai-agents": OpenAIAgents,
             "pydantic-ai": PydanticAI, "litellm-vendor": LiteLLMVendor,
             "nemo-vendor": NemoVendor, "crewai": CrewAITask,
-            "guardrails-ai": GuardrailsAI, "reference": ReferenceGateway}
+            "guardrails-ai": GuardrailsAI, "invariant-mcp": InvariantMCP, "reference": ReferenceGateway}

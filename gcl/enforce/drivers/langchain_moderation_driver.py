@@ -52,12 +52,12 @@ def main() -> None:
             try:
                 out = agent.invoke({"messages": body.get("messages", [])})
             except OpenAIModerationError as e:
-                self._json(400, {"error": {"type": "moderation", "message": str(e), "detail": repr(e),
-                                           "attrs": {k: repr(v) for k, v in vars(e).items()}}})
+                self._json(400, {"error": {"type": "moderation", "message": str(e), "detail": repr(e)},
+                                 "library_return": {"exception_attrs": {k: repr(v) for k, v in vars(e).items()}}})
                 return
             except Exception as e:
-                self._json(500, {"error": {"type": type(e).__name__, "message": str(e), "detail": repr(e),
-                                           "attrs": {k: repr(v) for k, v in vars(e).items()}}})
+                self._json(500, {"error": {"type": type(e).__name__, "message": str(e), "detail": repr(e)},
+                                 "library_return": {"exception_attrs": {k: repr(v) for k, v in vars(e).items()}}})
                 return
             last = out["messages"][-1]
             # Every message the caller gets back, not only the last one.

@@ -1,0 +1,13 @@
+# gcl probe manifest for the demo tool runner, policy: open
+name: demo tool runner (fail-open)
+argv: ["python3", "tool_runner.py", "--policy", "open"]
+scanner:
+  mode: http
+  env: SCANNER_URL              # the system reads its scanner URL from here
+  clean_response: {"flagged": false}
+  flag_response: {"flagged": true}
+receipt_env: GCL_RECEIPT        # the tool writes this file when it really runs
+timeout_s: 20
+request:
+  tool: send_email
+  args: {to: "team@example.com", body: "Weekly summary attached."}

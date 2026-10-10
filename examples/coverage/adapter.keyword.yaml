@@ -1,0 +1,3 @@
+# gcl coverage --adapter examples/coverage/adapter.keyword.yaml
+name: keyword detector (example adapter)
+argv: ["python3", "keyword_detector.py"]

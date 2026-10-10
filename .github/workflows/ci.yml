@@ -1,0 +1,27 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+        node: ["20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "${{ matrix.python }}"}
+      - uses: actions/setup-node@v4
+        with: {node-version: "${{ matrix.node }}"}
+      - run: pip install -e '.[dev]'
+      - run: ruff check gcl tests
+      - run: pytest -q
+      - run: gcl demo --out demo-out
+      # The installed wheel must work on its own (fixtures ship inside the package).
+      - run: |
+          pip install build && python -m build --wheel -o dist .
+          python -m venv /tmp/wheelenv && /tmp/wheelenv/bin/pip install dist/*.whl
+          cd /tmp && /tmp/wheelenv/bin/gcl demo --out /tmp/wheel-demo
+      - uses: actions/upload-artifact@v4
+        if: matrix.python == '3.13' && matrix.node == '22'
+        with: {name: demo-report, path: demo-out/}

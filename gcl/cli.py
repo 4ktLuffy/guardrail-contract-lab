@@ -1,0 +1,300 @@
+"""Command line: `gcl check | coverage | probe | fix | demo`.
+
+Exit codes are for CI: 0 clean, 1 findings at or above --fail-on, 2 the run was
+incomplete (a requested engine or adapter was missing) — never reported as a pass.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import typer
+
+from . import report as R
+from .report.terminal import render_check
+from .rules import load_cases, load_rules
+
+app = typer.Typer(add_completion=False, no_args_is_help=True,
+                  help="Check whether a guardrail does what its config says.")
+
+DATA = Path(__file__).parent / "data"
+BUNDLED_CASES = DATA / "cases.multilingual.jsonl"
+LEVELS = {"note": 0, "warning": 1, "error": 2}
+
+
+@app.callback()
+def _root():
+    """Check whether a guardrail does what its config says."""
+
+
+def _engines(spec: str) -> list[str]:
+    from .engines import ENGINES
+
+    names = [e.strip() for e in spec.split(",") if e.strip()]
+    unknown = [n for n in names if n not in ENGINES]
+    if unknown or not names:
+        raise typer.BadParameter(f"unknown engine(s) {', '.join(unknown) or '(none)'}; "
+                                 f"choose from {', '.join(ENGINES)}", param_hint="--engines")
+    return names
+
+
+def _formats(spec: str) -> list[str]:
+    return [f.strip() for f in spec.split(",") if f.strip()]
+
+
+def _flags(py_flags: str | None, js_flags: str | None) -> dict:
+    from .engines import validate_flags
+
+    out = {}
+    for name, val, hint in (("python", py_flags, "--py-flags"), ("node", js_flags, "--js-flags")):
+        if val is None:
+            continue
+        try:
+            validate_flags(name, val)
+        except ValueError as e:
+            raise typer.BadParameter(str(e), param_hint=hint) from None
+        out[name] = val
+    return out
+
+
+def _load_rules_or_exit(path: Path):
+    import yaml
+
+    try:
+        rs = load_rules(path)
+    except (yaml.YAMLError, ValueError) as e:
+        typer.echo(f"error: cannot read {path}: {e}", err=True)
+        raise typer.Exit(2) from None
+    if not rs.rules:
+        typer.echo(f"error: no rules found in {path} "
+                   "(expected {category: [{pattern: …}]} or a list of rules)", err=True)
+        raise typer.Exit(2)
+    return rs
+
+
+def _say(msg: str) -> None:
+    typer.echo(f"[gcl] {msg}", err=True)
+
+
+def _exit(findings_levels: list[str], complete: bool, fail_on: str) -> int:
+    if not complete:
+        return 2
+    if fail_on == "never":
+        return 0
+    floor = LEVELS[fail_on]
+    return 1 if any(LEVELS.get(lv, 0) >= floor for lv in findings_levels) else 0
+
+
+def _write_outputs(doc: dict, out: Path | None, formats: list[str], html_fn=None, sarif=None):
+    if not out:
+        return
+    out.mkdir(parents=True, exist_ok=True)
+    if "json" in formats:
+        R.write_json(doc, out / "report.json")
+    if "sarif" in formats and sarif is not None:
+        R.write_json(sarif, out / "report.sarif")
+    if "html" in formats and html_fn is not None:
+        (out / "report.html").write_text(html_fn(doc), encoding="utf-8")
+
+
+@app.command()
+def check(
+    rules: Path = typer.Argument(..., exists=True, help="Rule file (YAML or JSON)."),
+    engines: str = typer.Option("python,node", help="Engines that load these rules."),
+    cases: Path | None = typer.Option(None, exists=True, help="Extra JSONL cases to run."),
+    benign: bool = typer.Option(True, help="Also run the bundled benign texts (12 languages)."),
+    py_flags: str | None = typer.Option(None, help="Python re flags the loader uses (default IM)."),
+    js_flags: str | None = typer.Option(None, help="JS RegExp flags the loader uses (default im)."),
+    deadline: float = typer.Option(3.0, help="Seconds per rule before it counts as hung."),
+    slow_ms: float = typer.Option(250.0, help="Report rules slower than this on long input."),
+    max_len: int | None = typer.Option(None, help="Time rules at this input length (use your "
+                                       "loader's input cap, e.g. 50000). Default 8000."),
+    redos: bool = typer.Option(True, help="Time every rule on adversarial long inputs."),
+    out: Path | None = typer.Option(None, help="Directory for report.json/.html/.sarif."),
+    format: str = typer.Option("json,html,sarif", help="Files to write into --out."),
+    fail_on: str = typer.Option("error", help="error | warning | note | never"),
+    quiet: bool = typer.Option(False, help="Only print the summary block."),
+):
+    """Does every rule compile and match the same in every engine that loads it?"""
+    from .check import run_check
+    from .report.html import render_html
+    from .report.sarif import to_sarif
+
+    names = _engines(engines)
+    fl = _flags(py_flags, js_flags)
+    if max_len is not None and max_len < 400:
+        raise typer.BadParameter("must be at least 400", param_hint="--max-len")
+    rs = _load_rules_or_exit(rules)
+    case_list = load_cases(cases) if cases else None
+    ben = [c for c in load_cases(BUNDLED_CASES) if c.get("label") == 0] if benign else None
+    res = run_check(rs, names, case_list, ben, fl, deadline, slow_ms, redos=redos,
+                    progress=None if quiet else _say, max_len=max_len)
+    sec = R.check_section(res)
+    doc = R.envelope("check", {"rules": str(rules), "cases": str(cases) if cases else None,
+                               "engines": names})
+    doc["check"] = sec
+    text = render_check(sec)
+    typer.echo(text.split("\n\n")[0] + "\n" + text.split("\n\n")[1] if quiet else text)
+    _write_outputs(doc, out, _formats(format), render_html, to_sarif(sec))
+    if out:
+        typer.echo(f"\nReports: {out}/")
+    raise typer.Exit(_exit([f.level for f in res.findings], res.complete, fail_on))
+
+
+@app.command()
+def coverage(
+    rules: Path | None = typer.Option(None, exists=True, help="Rule file to evaluate."),
+    adapter: Path | None = typer.Option(None, exists=True, help="Adapter manifest (YAML)."),
+    cases: Path = typer.Option(BUNDLED_CASES, exists=True, help="JSONL cases (default: bundled)."),
+    engines: str = typer.Option("python", help="With --rules: engine(s); first is primary."),
+    out: Path | None = typer.Option(None, help="Directory for report.json/.html."),
+    format: str = typer.Option("json,html", help="Files to write into --out."),
+    min_recall: float | None = typer.Option(None, help="Fail if any language is below this %."),
+    max_fp: float | None = typer.Option(None, help="Fail if any language's false-positive rate "
+                                        "(plain benign + hard negatives) is above this %."),
+    loader_drops_broken: bool = typer.Option(
+        False, help="Measure as a loader that silently skips rules it cannot compile "
+                    "(otherwise such rules make the run incomplete)."),
+):
+    """Per-language recall and false-positive rate, with intervals."""
+    from .coverage import detect_with_adapter, detect_with_rules, load_adapter, summarize
+    from .report.html import render_html
+    from .report.terminal import render_coverage
+
+    if bool(rules) == bool(adapter):
+        raise typer.BadParameter("give exactly one of --rules or --adapter")
+    case_list = load_cases(cases)
+    texts = [c["text"] for c in case_list]
+    if rules:
+        _load_rules_or_exit(rules)
+        dets = [detect_with_rules(str(rules), e, texts, loader_drops_broken=loader_drops_broken)
+                for e in _engines(engines)]
+    else:
+        dets = [detect_with_adapter(load_adapter(adapter), case_list)]
+    secs = [summarize(case_list, d) for d in dets]
+    for s in secs:
+        label = "bundled: cases.multilingual.jsonl" if cases == BUNDLED_CASES else str(cases)
+        s["cases"] = {"path": label, "n": len(case_list)}
+        s["fixtures_note"] = _fixture_note(case_list)
+    sec = secs[0]
+    if len(secs) > 1:
+        sec["compare"] = [{"detector": s["detector"], "note": s["note"], "aggregate": s["aggregate"],
+                           "by_lang": {lg: r["recall_pct"] for lg, r in s["by_lang"].items()}}
+                          for s in secs]
+    doc = R.envelope("coverage", {"rules": str(rules) if rules else None,
+                                  "adapter": str(adapter) if adapter else None,
+                                  "cases": "bundled" if cases == BUNDLED_CASES else str(cases)})
+    doc["coverage"] = sec
+    typer.echo(render_coverage(sec))
+    _write_outputs(doc, out, _formats(format), render_html)
+    complete = all(d.complete for d in dets)
+    bad = []
+    for s in secs:
+        for r in s["by_lang"].values():
+            if min_recall is not None and r["recall_pct"] is not None and r["recall_pct"] < min_recall:
+                bad.append("error")
+            if max_fp is not None and r["all_benign_fp_pct"] is not None \
+                    and r["all_benign_fp_pct"] > max_fp:
+                bad.append("error")
+    raise typer.Exit(_exit(bad, complete, "error"))
+
+
+@app.command()
+def probe(
+    adapter: Path = typer.Argument(..., exists=True, help="Probe manifest (YAML)."),
+    contract: Path | None = typer.Option(None, exists=True, help="Failure contract (YAML)."),
+    faults: str = typer.Option("timeout,error,malformed,empty,wrong_schema,refused",
+                                help="Faults to inject into the scanner."),
+    out: Path | None = typer.Option(None, help="Directory for report.json/.html."),
+    format: str = typer.Option("json,html", help="Files to write into --out."),
+):
+    """When the scanner fails, does the protected action still run?"""
+    from .probe import load_contract, load_manifest, probe_section, run_probe
+    from .report.html import render_html
+    from .report.terminal import render_probe
+
+    m = load_manifest(adapter)
+    con = load_contract(contract)
+    scenarios = run_probe(m, con, _formats(faults), progress=_say)
+    sec = probe_section(str(adapter), str(contract) if contract else None, scenarios)
+    sec["name"] = m.get("name", "")
+    doc = R.envelope("probe", {"adapter": str(adapter), "contract": str(contract) if contract else None})
+    doc["probe"] = sec
+    typer.echo(render_probe(sec))
+    _write_outputs(doc, out, _formats(format), render_html)
+    levels = ["error" for s in scenarios if s.verdict == "violated"]
+    complete = not any(s.verdict == "unverified" for s in scenarios)
+    raise typer.Exit(_exit(levels, complete, "error"))
+
+
+@app.command()
+def fix(
+    rules: Path = typer.Argument(..., exists=True, help="Rule file to make portable."),
+    output: Path | None = typer.Option(None, "--output", "-o",
+                                       help="Where to write (default: <name>.portable<ext>)."),
+    engines: str = typer.Option("python,node", help="Engines the fixed file must work in."),
+    py_flags: str | None = typer.Option(None, help="Python re flags the loader uses (default IM)."),
+    js_flags: str | None = typer.Option(None, help="JS RegExp flags the loader uses (default im)."),
+    scripts: str = typer.Option("", help="Extra scripts the rewrite must be exact for "
+                                "(e.g. cyrillic,arabic). Default: the scripts each rule uses, plus Latin."),
+):
+    """Rewrite rules so every engine reads them as Python does; verify before writing."""
+    from .fix import SCRIPTS, run_fix
+    from .report.terminal import render_fix
+
+    names = _engines(engines)
+    _flags(py_flags, js_flags)
+    _load_rules_or_exit(rules)
+    # An explicit empty string means "no flags", not "use the default".
+    flags = {"python": py_flags if py_flags is not None else "IM",
+             "node": js_flags if js_flags is not None else "im"}
+    extra = [x.strip() for x in scripts.split(",") if x.strip()]
+    bad = [x for x in extra if x not in SCRIPTS]
+    if bad:
+        raise typer.BadParameter(f"unknown script(s) {bad}; choose from {', '.join(SCRIPTS)}",
+                                 param_hint="--scripts")
+    out = output or rules.with_name(rules.stem + ".portable" + rules.suffix)
+    bundled = [c["text"] for c in load_cases(BUNDLED_CASES)]
+    summary = run_fix(rules, out, names, flags, bundled, extra)
+    if summary.get("error"):
+        typer.echo(f"{summary['error']}. Nothing written.")
+        raise typer.Exit(2)
+    typer.echo(render_fix(summary))
+
+
+@app.command()
+def demo(
+    out: Path = typer.Option(Path("demo-out"), help="Directory for the demo report."),
+    open_report: bool = typer.Option(False, "--open", help="Open the HTML report when done."),
+):
+    """Run the whole argument on bundled fixtures; write one HTML report."""
+    import time
+
+    from .demo import run_demo
+
+    t0 = time.perf_counter()
+    doc = run_demo(out, say=lambda m: typer.echo(f"  {m}"))
+    typer.echo("")
+    for h in doc["hero"]:
+        typer.echo(f"  {h['value']:>14}  {h['label']}")
+    typer.echo(f"\nReport: {out / 'report.html'}   ({time.perf_counter() - t0:.0f} s)")
+    if open_report:
+        import webbrowser
+
+        webbrowser.open((out / "report.html").resolve().as_uri())
+
+
+def _fixture_note(cases: list[dict]) -> str:
+    reviewed = sum(1 for c in cases if c.get("native_reviewed"))
+    if reviewed == len(cases):
+        return ""
+    return (f"{len(cases) - reviewed} of {len(cases)} cases are machine-written and not "
+            "native-reviewed; per-language samples are small, so read the intervals.")
+
+
+def main():  # pragma: no cover
+    app()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    app()

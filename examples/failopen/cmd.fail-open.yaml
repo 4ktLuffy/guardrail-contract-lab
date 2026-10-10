@@ -1,0 +1,11 @@
+# gcl probe manifest: subprocess scanner, policy open
+name: demo command-scanner runner (fail-open)
+argv: ["python3", "cmd_runner.py", "--policy", "open"]
+scanner:
+  mode: command
+  env: SCANNER_CMD
+receipt_env: GCL_RECEIPT
+timeout_s: 20
+request:
+  tool: create_file
+  args: {path: "notes.txt", content: "meeting notes"}

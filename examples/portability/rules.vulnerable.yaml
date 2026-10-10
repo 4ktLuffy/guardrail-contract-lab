@@ -1,0 +1,45 @@
+# A small, deliberately flawed rule set (written for this demo). Each rule is a
+# common way detection rules go wrong when one file is loaded by both a Python and
+# a JavaScript runtime. `gcl check` should flag every one of them.
+override:
+  - id: override-en
+    pattern: '(?i)\b(ignore|disregard)\s+(all\s+)?(previous|prior)\s+instructions?'
+    reason: Instruction override
+    severity: high
+  - id: override-ru
+    pattern: '\b(игнорируй|забудь)\b.{0,30}\bинструкци\w*'
+    reason: Instruction override (Russian)
+    severity: high
+    lang: ru
+  - id: override-de
+    pattern: '\b(ignoriere|vergiss)\b.{0,30}\b(Anweisungen|Regeln)\b'
+    reason: Instruction override (German)
+    severity: high
+    lang: de
+exfiltration:
+  - id: exfil-named
+    pattern: '(?P<verb>send|upload)\s+.{0,40}(api[_ ]?key|private key)'
+    reason: Secret exfiltration
+    severity: high
+  - id: exfil-end
+    pattern: 'curl\s+\S+\s*\|\s*(ba)?sh\Z'
+    reason: Pipe-to-shell at end of output
+    severity: high
+encoding:
+  - id: homoglyph-run
+    pattern: '[аеорсух]{3,}'
+    reason: Cyrillic lookalike letters
+    severity: medium
+  - id: fake-delimiter
+    pattern: '={3,}\s*(begin|end)\s+(system\s+)?prompt'
+    reason: Fake prompt delimiter
+    severity: medium
+  - id: repeated-noise
+    pattern: '(\w+\s?)+$'
+    reason: Long repeated token run
+    severity: low
+persona:
+  - id: dan-strict
+    pattern: '(?-i:\bDAN\b).{0,40}\b(anything|no limits)\b'
+    reason: DAN persona
+    severity: high

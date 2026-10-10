@@ -1,0 +1,4 @@
+# Failure contract: what must happen when the scanner itself fails.
+# Fail closed: no verdict means no tool call.
+default: block
+faults: {}

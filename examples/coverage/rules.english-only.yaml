@@ -1,0 +1,37 @@
+# A typical English-only injection rule set (written for this demo). Reasonable
+# rules -- they catch the English attacks -- but every keyword is English, so the
+# same intent in another language or script passes untouched.
+instructionOverride:
+  - id: ignore-previous
+    pattern: '\b(ignore|disregard|forget)\s+(all\s+|any\s+)?(the\s+)?(previous|prior|above|earlier)\s+(instructions?|rules?|prompts?|messages?)'
+  - id: new-instructions
+    pattern: '\b(this\s+is\s+)?(your\s+)?new\s+(system\s+prompt|instructions?|rules)\b'
+  - id: only-follow
+    pattern: '\bdo\s+only\s+what\s+this\s+(message|text)\s+says\b'
+disclosure:
+  - id: reveal-prompt
+    pattern: '\b(reveal|print|show|repeat|output)\s+(me\s+)?(your\s+)?(full\s+|hidden\s+|entire\s+)?(system\s+prompt|instructions)'
+secrecy:
+  - id: hide-from-user
+    pattern: "\\b(don't|do\\s+not|never)\\s+(tell|inform|mention\\s+(this\\s+)?to)\\s+the\\s+user\\b"
+  - id: keep-secret
+    pattern: '\bkeep\s+(this|it)\s+(a\s+)?secret\s+from\s+the\s+user\b'
+exfiltration:
+  - id: send-to-url
+    pattern: '\b(send|post|upload|forward)\b.{0,60}\bhttps?://'
+  - id: leak-secret
+    pattern: '\b(api[\s_-]?key|private\s+key|\.env\b|secret\s+key|password)'
+actions:
+  - id: run-shell
+    pattern: '\b(run|execute)\s+(the\s+following\s+)?(shell\s+)?command\b'
+  - id: delete-data
+    pattern: '\b(delete|drop|wipe)\s+(the\s+)?(production\s+)?(database|all\s+files|repo(sitory)?)\b'
+  - id: download-run
+    pattern: '\bdownload\b.{0,60}\b(and\s+)?(run|execute)\b'
+safety:
+  - id: disable-filters
+    pattern: '\b(turn\s+off|disable|remove|bypass)\s+(your\s+)?(safety|content)\s+(filters?|guidelines|restrictions)'
+  - id: no-rules-persona
+    pattern: '\b(pretend|act\s+as\s+if)\s+you\s+(are|were)\s+.{0,30}\b(no|without)\s+(rules|restrictions|limits)'
+  - id: never-refuse
+    pattern: '\b(never|must\s+not|do\s+not)\s+refuse\b'

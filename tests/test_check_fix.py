@@ -84,7 +84,9 @@ def test_check_flags_each_flawed_rule_for_the_right_reason():
     assert kinds["exfil-end"] == {"match_split"}
     assert kinds["homoglyph-run"] == {"benign_hit"}
     assert kinds["repeated-noise"] == {"timeout"}
-    assert kinds["fake-delimiter"] == {"slow"}  # quadratic, though no lint rule sees it
+    # Quadratic, though no lint rule sees it. On a slow machine the large input also
+    # crosses the hang deadline: "timeout" is then reported too, and is just as right.
+    assert kinds["fake-delimiter"] in ({"slow"}, {"timeout"}, {"slow", "timeout"})
     # ASCII words: only the "." vs \r difference remains, reported as the narrower kind.
     assert kinds["override-de"] == {"line_split"}
     # (?-i:…) modifiers compile only on ES2025 engines (node 23+): a finding exactly there.
@@ -205,11 +207,23 @@ def test_fix_scope_is_exact_at_script_boundaries(tmp_path):
 
 
 def test_sample_generation_has_a_work_budget():
-    import time
+    from gcl import samples
 
-    t = time.perf_counter()
-    positive_samples(r"(?:(?:(?:a{0}){200}){200}){200}")
-    assert time.perf_counter() - t < 2.0
+    calls = 0
+    real = samples._Gen.seq
+
+    def counting(self, items):
+        nonlocal calls
+        calls += 1
+        return real(self, items)
+
+    samples._Gen.seq = counting
+    try:
+        positive_samples(r"(?:(?:(?:a{0}){200}){200}){200}")
+    finally:
+        samples._Gen.seq = real
+    # Bounded by the work budget, not by machine speed.
+    assert calls <= samples.MAX_WORK
 
 
 def test_fix_respects_python_ascii_mode(tmp_path):

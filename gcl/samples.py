@@ -123,8 +123,9 @@ def _in(members, ch) -> bool:
 
 
 MAX_SAMPLE_LEN = 4000
-MAX_WORK = 200_000  # parse-tree nodes visited per sample; nested empty repeats are cheap
-                    # in output but not in work, so length alone does not bound them
+# Parse-tree nodes visited per rule, all variants together. Nested empty repeats are
+# cheap in output but not in work, so length alone does not bound them.
+MAX_WORK = 200_000
 
 
 class _TooBig(Exception):
@@ -145,12 +146,19 @@ def positive_samples(pattern: str, flags: int = re.I | re.M, n: int = 6) -> list
         return []
     out: list[str] = []
     seen: set[str] = set()
+    spent = 0  # one work budget for the whole rule, so a pathological tree costs at most
+    #            MAX_WORK node visits however many variants are tried
     for v in range(n * 2):
+        g = _Gen(v)
+        g.work = spent
         try:
-            g = _Gen(v)
             s = g.seq(tree)
-        except (RecursionError, ValueError, TypeError, _TooBig):
+        except _TooBig:
+            break  # budget gone: further variants would only hit it again
+        except (RecursionError, ValueError, TypeError):
+            spent = g.work
             continue
+        spent = g.work
         core = s.strip()
         if not core or core in seen:
             continue

@@ -54,8 +54,8 @@ else is labelled.
   engine-relevant hazards and the "one rule is the whole story" coverage note.
 
 ## enforce (tests/test_enforce.py)
-- Reference gateway: the strict build holds all 20 scenarios and conforms to its docs on
-  every one; the naive build deviates on all 14 fault scenarios (7 faults × 2 stages)
+- Reference gateway: the strict build holds all 22 scenarios and conforms to its docs on
+  every one; the naive build deviates on all 16 fault scenarios (8 faults × 2 stages)
   while all four controls hold — checked.
 - Adversarial gateways, each built to fool a sentinel-only judge: forwarding the blocked
   text with its marker stripped ("altered", violated); a rewrite that keeps only the
@@ -72,7 +72,8 @@ else is labelled.
   calls on the model's endpoint are routed to the stand-in, staged by content, and never
   counted as provider calls; a judge refusal is answered as OpenAI does — checked.
 - Real integrations (opt-in, `GCL_INTEG_PYTHON`): LiteLLM 1.104.2 proxy, NeMo Guardrails
-  0.24.1 server and openai-guardrails 0.3.3 run end to end through the same suite —
+  0.24.1 server, openai-guardrails 0.3.3 and the Portkey gateway 1.15.2 (Node) run end to
+  end through the same suite —
   checked locally, not in CI.
 
 ## Independent review
@@ -81,7 +82,7 @@ else is labelled.
   misattributed timeouts, rewrites that changed what a rule matches, unbounded
   subprocesses, overclaims — was fixed and pinned by a regression test
   (`tests/test_review_round*.py` and the suites above).
-- Local runs: 133 tests pass (plus 2 opt-in real-integration tests) on Python 3.11.14 and
+- Local runs: 131 tests pass (plus 5 opt-in real-integration tests) on Python 3.11.14 and
   3.13.15 with Node 25.8.0; the demo runs
   from an installed wheel outside the checkout.
 

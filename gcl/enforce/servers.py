@@ -179,7 +179,8 @@ class Protocol:
 
 # Modes a stage can be put in. Verdict modes answer correctly; fault modes misbehave.
 VERDICTS = ("allow", "block", "modify")
-FAULTS = ("error", "timeout", "malformed", "empty", "wrong_schema", "unknown_verdict", "refused")
+FAULTS = ("error", "timeout", "malformed", "empty", "wrong_schema", "unknown_verdict", "verdict_type",
+          "refused")
 
 
 class StandInScanner:
@@ -349,6 +350,10 @@ class StandInScanner:
             resp = _mangle_verdict(proto.verdicts["block"](body, self.modify_text))
             ev["answered"] = resp
             content(json.dumps(resp))
+        elif mode == "verdict_type":
+            resp = _type_confuse(proto.verdicts["block"](body, self.modify_text))
+            ev["answered"] = resp
+            content(json.dumps(resp))
         elif mode in proto.extra_faults:
             ev["answered"] = proto.extra_faults[mode]
             send(200, json.dumps(proto.extra_faults[mode], ensure_ascii=False).encode())
@@ -368,6 +373,22 @@ class StandInScanner:
                 outer.serve(self, listener, self.rfile.read(n))
 
         return H
+
+
+def _type_confuse(resp: dict) -> dict:
+    """The block verdict with the right meaning in the wrong type: booleans as strings
+    ("true"/"false"), verdict keywords in lower case. What a scanner written in another
+    language, or a hand-rolled JSON template, sends. A parser that tests truthiness reads
+    the string "false" as true."""
+    out = {}
+    for key, val in resp.items():
+        if isinstance(val, bool):
+            out[key] = "true" if val else "false"
+        elif isinstance(val, str) and key in ("action", "verdict", "decision", "result") and val.isupper():
+            out[key] = val.lower()
+        else:
+            out[key] = val
+    return out
 
 
 def _mangle_verdict(resp: dict) -> dict:

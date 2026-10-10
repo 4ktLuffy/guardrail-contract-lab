@@ -124,6 +124,7 @@ def _versions(python: str, dists: list[str]) -> dict:
 
 class Adapter:
     name = "base"
+    runtime = "python"  # "python": --python is the env's interpreter; "node": --env is the install dir
     protocol: Protocol
     capabilities: ClassVar[set[str]] = set()
     default_timeout_s = 45.0  # long enough for the integration's own scanner timeout to fire
@@ -381,7 +382,7 @@ class ReferenceGateway(Adapter):
     default_timeout_s = 15.0
     _closed: ClassVar[dict] = {**_BASE, **{f: "stopped" for f in
                                           ("error", "timeout", "malformed", "empty", "wrong_schema",
-                                           "unknown_verdict", "refused")}}
+                                           "unknown_verdict", "verdict_type", "refused")}}
     documented: ClassVar[dict] = {"strict": _closed, "naive": _closed}
     documented_sources: ClassVar[dict] = {
         p: {"source": "examples/enforce/ref_gateway.py (module docstring)", "read_for": "this release",
@@ -410,6 +411,105 @@ class ReferenceGateway(Adapter):
     def call(self, messages: list[dict], timeout_s: float) -> Observation:
         return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
                      {"model": "gcl-mock", "messages": messages}, None, timeout_s)
+
+
+# --------------------------------------------------------------------------- Portkey
+def _portkey_stage(body: dict) -> str | None:
+    return {"beforeRequestHook": "input", "afterRequestHook": "output"}.get(body.get("eventType"))
+
+
+def _portkey_modify(body: dict, text: str) -> dict:
+    """Rewrite every message (request) or every choice (response) to `text`, returned as
+    Portkey's transformedData, which replaces the body wholesale."""
+    if _portkey_stage(body) == "output":
+        rj = json.loads(json.dumps((body.get("response") or {}).get("json") or {}))
+        for ch in rj.get("choices") or []:
+            (ch.setdefault("message", {}))["content"] = text
+        return {"verdict": True, "transformedData": {"response": {"json": rj}}}
+    qj = json.loads(json.dumps((body.get("request") or {}).get("json") or {}))
+    for m in qj.get("messages") or []:
+        m["content"] = text
+    return {"verdict": True, "transformedData": {"request": {"json": qj}}}
+
+
+PORTKEY_WEBHOOK = Protocol(
+    name="Portkey default.webhook guardrail",
+    verdicts={"allow": lambda b, m: {"verdict": True},
+              "block": lambda b, m: {"verdict": False},
+              "modify": _portkey_modify},
+    stage_of=_portkey_stage,
+)
+
+PORTKEY_PROFILES = {"default": {}, "fail_on_error": {"failOnError": True}}
+
+
+class PortkeyGateway(Adapter):
+    """The open-source Portkey AI gateway (Node) with a `default.webhook` guardrail as a
+    before-request hook and an after-request hook, `deny: true` on both."""
+
+    name = "portkey"
+    runtime = "node"
+    protocol = PORTKEY_WEBHOOK
+    capabilities: ClassVar[set[str]] = {"input", "output", "modify_input", "modify_output"}
+    # Docs (bring-your-own-guardrails): "If your webhook fails to respond within the
+    # timeout period, Portkey will default to verdict: true." failOnError: "Treat a
+    # non-200 response or a timeout as a failed check." Nothing on unparseable or empty
+    # bodies, a missing verdict, a non-boolean verdict, or a refused connection.
+    documented: ClassVar[dict] = {
+        "default": {**_BASE, "timeout": "passed", "error": "passed"},
+        "fail_on_error": {**_BASE, "timeout": "stopped", "error": "stopped"},
+    }
+    documented_sources: ClassVar[dict] = {
+        "default": {"source": "https://portkey.ai/docs/product/guardrails/bring-your-own-guardrails",
+                    "read_for": "@portkey-ai/gateway 1.15.2 (docs page read 2026-10-10)",
+                    "passage": "If your webhook fails to respond within the timeout period, Portkey will "
+                               "default to verdict: true. failOnError: treat a non-200 response or a "
+                               "timeout as a failed check (default false)."}}
+    documented_sources["fail_on_error"] = documented_sources["default"]
+    default_timeout_s = 20.0
+
+    def config_summary(self) -> dict:
+        return {"hooks": ["before_request_hooks", "after_request_hooks"], "check": "default.webhook",
+                "deny": True, "webhook_timeout_ms": 3000, **PORTKEY_PROFILES[self.profile]}
+
+    def versions(self) -> dict:
+        try:
+            pj = Path(self.python) / "node_modules" / "@portkey-ai" / "gateway" / "package.json"
+            v = json.loads(pj.read_text())["version"]
+        except (OSError, ValueError, KeyError):
+            v = None
+        node = subprocess.run(["node", "--version"], capture_output=True, text=True).stdout.strip()
+        return {"@portkey-ai/gateway": v, "node": node}
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        params = lambda stage: {"webhookURL": f"{scanner.base_for(stage)}/guard", "timeout": 3000,  # noqa: E731
+                                **PORTKEY_PROFILES[self.profile]}
+        hook = lambda stage: [{"type": "guardrail", "id": f"gcl-{stage}", "deny": True,  # noqa: E731
+                               "checks": [{"id": "default.webhook", "parameters": params(stage)}]}]
+        self._config = {"before_request_hooks": hook("input"), "after_request_hooks": hook("output")}
+        self._model_base = model.openai_base
+        (self.workdir / "portkey-config.json").write_text(json.dumps(self._config, indent=2))
+        self.port = _free_port()
+        server = Path(self.python) / "node_modules" / "@portkey-ai" / "gateway" / "build" / "start-server.js"
+        env = dict(os.environ, TRUSTED_CUSTOM_HOSTS="localhost,127.0.0.1", NO_PROXY="127.0.0.1,localhost",
+                   PORT=str(self.port))
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen(["node", str(server), f"--port={self.port}", "--headless"], stdout=logf,
+                                         stderr=subprocess.STDOUT, env=env, start_new_session=True,
+                                         cwd=str(self.workdir))
+        _wait_http(f"http://127.0.0.1:{self.port}/", self.proc, 60, self.log)
+
+    def config_files(self) -> dict:
+        p = self.workdir / "portkey-config.json"
+        return {p.name: p.read_text()} if p.exists() else {}
+
+    def call(self, messages: list[dict], timeout_s: float) -> Observation:
+        return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                     {"model": "gcl-mock", "messages": messages},
+                     {"x-portkey-provider": "openai", "x-portkey-custom-host": self._model_base,
+                      "Authorization": "Bearer sk-gcl", "x-portkey-config": json.dumps(self._config)},
+                     timeout_s)
 
 
 # --------------------------------------------------------------------------- LLM judges
@@ -529,4 +629,4 @@ class OpenAIGuardrails(Adapter):
 
 
 ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": OpenAIGuardrails,
-            "reference": ReferenceGateway}
+            "portkey": PortkeyGateway, "reference": ReferenceGateway}

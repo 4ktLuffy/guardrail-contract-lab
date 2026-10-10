@@ -45,10 +45,12 @@ def test_reference_strict_holds_everything(tmp_path):
 def test_reference_naive_is_caught_as_a_deviation_from_its_own_docs(tmp_path):
     run = run_contracts(ReferenceGateway(sys.executable, tmp_path, "naive"), 15)
     for stage in ("input", "output"):
-        for f in ("error", "timeout", "malformed", "empty", "wrong_schema", "unknown_verdict", "refused"):
+        for f in ("error", "timeout", "malformed", "empty", "wrong_schema", "unknown_verdict", "verdict_type",
+                  "refused"):
             r = _by(run, stage, f)
             assert (r["observed"], r["policy"], r["documented"]) == ("passed", "violated", "deviates"), (stage, f)
     # Every control still holds, so the faults are attributable to error handling.
+    assert run["summary"]["documented_deviates"] == 16
     for key in (("input", "allow"), ("input", "block"), ("output", "allow"), ("output", "block")):
         assert _by(run, *key)["policy"] == "held", key
 
@@ -369,8 +371,16 @@ def test_a_check_running_alongside_the_model_is_blocked_after_send(tmp_path):
     assert (r["observed"], r["policy"]) == ("blocked after send", "violated")
 
 
+def test_type_confused_verdicts_keep_meaning_change_type():
+    from gcl.enforce.servers import _type_confuse
+
+    assert _type_confuse({"verdict": False}) == {"verdict": "false"}
+    assert _type_confuse({"action": "BLOCKED", "blocked_reason": "x"}) == {"action": "blocked", "blocked_reason": "x"}
+    assert _type_confuse({"jailbreak": True, "score": 0.99}) == {"jailbreak": "true", "score": 0.99}
+
+
 def test_adapters_registry():
-    assert set(ADAPTERS) == {"litellm", "nemo", "openai-guardrails", "reference"}
+    assert set(ADAPTERS) == {"litellm", "nemo", "openai-guardrails", "portkey", "reference"}
 
 
 # Real integrations: these pin what was observed on litellm 1.104.2 and nemoguardrails
@@ -423,3 +433,19 @@ def test_real_openai_guardrails_pre_flight(tmp_path):
     for stage in ("input", "output"):
         for f in ("judge_refusal", "empty"):
             assert _by(run, stage, f)["observed"] == "passed", (stage, f)
+
+
+NODE_ENV = os.environ.get("GCL_INTEG_NODE_ENV")  # a dir with node_modules/@portkey-ai/gateway
+
+
+@pytest.mark.skipif(not NODE_ENV, reason="set GCL_INTEG_NODE_ENV to run Node integrations")
+def test_real_portkey_fail_on_error(tmp_path):
+    from gcl.enforce.adapters import PortkeyGateway
+
+    run = run_contracts(PortkeyGateway(NODE_ENV, tmp_path, "fail_on_error"), 20)
+    _controls_hold(run)
+    for stage in ("input", "output"):
+        assert _by(run, stage, "error")["observed"] == "stopped"
+        assert _by(run, stage, "modify")["observed"] == "modified"
+        # {"verdict": "false"} — a string — reads as a pass (1.15.2).
+        assert _by(run, stage, "verdict_type")["observed"] == "passed"

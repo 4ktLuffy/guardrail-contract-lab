@@ -45,7 +45,7 @@ On the bundled fixtures (written for the demo; see [NUMBERS.md](NUMBERS.md)):
 | **0** after `gcl fix` | 8 rules rewritten; each agrees with the original under Python on every tested input before it is written |
 | **91.7% → 0.0%** | recall in English vs Arabic for the same, reasonable, English rule set |
 | **6 of 6** scanner faults | still let the tool call run, in a fail-open tool runner (0 of 6 after the fix) |
-| **14 of 20** gateway scenarios | break a gateway's own fail-closed promise, end to end (0 of 20 for the strict build) |
+| **16 of 22** gateway scenarios | break a gateway's own fail-closed promise, end to end (0 of 22 for the strict build) |
 
 ## Commands
 
@@ -145,17 +145,20 @@ gcl enforce reference --python python3 --profile naive        # bundled referenc
 gcl enforce litellm --python /path/to/venv/bin/python --profile default --out report/
 gcl enforce nemo    --python /path/to/venv/bin/python --out report/
 gcl enforce openai-guardrails --python /path/to/venv/bin/python --profile pre_flight
+gcl enforce portkey --env /dir/with/node_modules --profile fail_on_error
 ```
 
 Drives a **real** guardrail integration end to end, offline: LiteLLM's proxy guardrails
 (`generic_guardrail_api`, before and after the model call), NeMo Guardrails' built-in
 jailbreak-detection rail, openai-guardrails' LLM checks (a small driver serves the
-library over HTTP), or the bundled reference gateway. LLM-as-judge guards get a stand-in
+library over HTTP), the Portkey gateway's webhook guardrails (Node: `--env DIR`), or the
+bundled reference gateway. LLM-as-judge guards get a stand-in
 judge on the model's own endpoint, including the case where the judge model *refuses*
 to answer. The integration runs from
 its own environment (`--python`), unmodified. A stand-in scanner answers its real
 protocol with **allow, block or rewrite**, or misbehaves (HTTP 500, timeout, malformed,
-empty, missing verdict field, unknown verdict, refused), one stage at a time. Two
+empty, missing verdict field, unknown verdict, the right verdict in the wrong type
+(`"false"` as a string, `"blocked"` in lower case), refused), one stage at a time. Two
 independent observers record what happened: a mock model (what exactly reached the
 provider, and when?) and the client (what exactly came back?). Payloads are compared
 whole, so a gateway that strips the marker but forwards the text, keeps part of the

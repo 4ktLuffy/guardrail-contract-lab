@@ -287,8 +287,10 @@ def demo(
 @app.command()
 def enforce(
     integration: str = typer.Argument(..., help="litellm | nemo"),
-    python: Path = typer.Option(..., exists=True, help="Python of an environment where the "
-                                "integration is installed (it runs there, not in gcl's env)."),
+    python: Path | None = typer.Option(None, exists=True, help="Python of an environment where the "
+                                       "integration is installed (it runs there, not in gcl's env)."),
+    env: Path | None = typer.Option(None, exists=True, file_okay=False,
+                                    help="For Node integrations: the directory holding its node_modules."),
     profile: str = typer.Option("default", help="Integration profile, e.g. litellm: default | fail_open."),
     timeout: float | None = typer.Option(None, help="Client deadline per scenario, seconds "
                                          "(default: the integration's own, e.g. 45)."),
@@ -317,8 +319,12 @@ def enforce(
     if profile not in cls.documented:
         raise typer.BadParameter(f"{integration} profiles: {', '.join(cls.documented)}",
                                  param_hint="--profile")
+    where = env if cls.runtime == "node" else python
+    if where is None:
+        flag = "--env" if cls.runtime == "node" else "--python"
+        raise typer.BadParameter(f"{integration} needs {flag}", param_hint=flag)
     workdir = Path(tempfile.mkdtemp(prefix="gcl-enforce-"))
-    adapter = cls(str(python), workdir, profile)
+    adapter = cls(str(where), workdir, profile)
     try:
         run = run_contracts(adapter, timeout or adapter.default_timeout_s, progress=_say,
                             only=set(scenario) or None)
@@ -330,7 +336,8 @@ def enforce(
     typer.echo(render_enforce(run))
     if out:
         _write_outputs(doc, out, _formats(format), render_html)
-        replay = (f"gcl enforce {integration} --python {python} --profile {profile} "
+        flag = "--env" if cls.runtime == "node" else "--python"
+        replay = (f"gcl enforce {integration} {flag} {where} --profile {profile} "
                   f"--timeout {run['timeout_s']:g}")
         bundles = write_bundles(run, out, replay)
         typer.echo(f"\nReports: {out}/" + (f"  ({len(bundles)} repro bundle(s) in {out}/repro/)" if bundles else ""))

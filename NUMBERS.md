@@ -19,7 +19,7 @@ from `demo-out/report.json` (python 3.13.15, node v25.8.0, macOS). Regenerate wi
 | The one case node misses | Amharic `የ.env`: `\b` before `.env` exists in Python (Ethiopic letter = word char), not in JS | `…compare` |
 | Fail-open runner: scanner faults that let the call run | 6 of 6 | `sections[3].probe.summary` |
 | Fail-closed runner | 0 of 6; both controls held | `sections[4].probe.summary` |
-| Reference gateway, naive build: scenarios breaking its documented fail-closed contract | 14 of 20 (strict build: 0 of 20) | `sections[5].enforce.summary`, `sections[6]` |
+| Reference gateway, naive build: scenarios breaking its documented fail-closed contract | 16 of 22 (strict build: 0 of 22) | `sections[5].enforce.summary`, `sections[6]` |
 | Wall time | ~95 s (most of it the deliberate hang, timing and timeout drills) | terminal |
 
 The fixtures are written for the demo: `examples/portability/rules.vulnerable.yaml`

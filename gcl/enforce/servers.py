@@ -1,0 +1,350 @@
+"""The two localhost servers every enforcement scenario runs against.
+
+MockModel — an OpenAI-compatible chat-completions endpoint with a scripted reply. It
+records every request it receives: that record is the *provider boundary*. If a blocked
+prompt shows up here, the guardrail did not stop it, whatever the client was told.
+
+StandInScanner — answers the integration's own scanner protocol with a scripted verdict
+per stage (input or output), or fails in a chosen way. It records every request too, so a
+scenario can prove the scanner was actually consulted.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Callable
+
+
+class _Server:
+    """A ThreadingHTTPServer on a free localhost port, run in a daemon thread."""
+
+    handler_factory: Callable
+
+    def __enter__(self):
+        self._stop = threading.Event()
+        self._srv = ThreadingHTTPServer(("127.0.0.1", 0), self.handler_factory())
+        self._srv.daemon_threads = True
+        self.port = self._srv.server_address[1]
+        threading.Thread(target=self._srv.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._srv.shutdown()
+        self._srv.server_close()
+
+    @property
+    def base(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+
+class MockModel(_Server):
+    """OpenAI-compatible /v1/chat/completions with a fixed reply (streamed or not)."""
+
+    def __init__(self, reply: str, model: str = "gcl-mock"):
+        self.reply, self.model = reply, model
+        self.events: list[dict] = []        # append-only: {"t", "body", "reply"}
+        self.unexpected: list[str] = []
+        self.inflight = 0
+        self._lock = threading.Lock()
+
+    @property
+    def requests(self) -> list[dict]:
+        return [e["body"] for e in self.events]
+
+    def last_activity(self) -> float:
+        return self.events[-1]["t"] if self.events else 0.0
+
+    @property
+    def openai_base(self) -> str:
+        return f"{self.base}/v1"
+
+    def received_text(self) -> str:
+        """Everything the model was sent, as one string (debugging aid)."""
+        return json.dumps(self.requests, ensure_ascii=False)
+
+    def reset(self, reply: str | None = None) -> None:
+        """Change the scripted reply. The record is never cleared: scenarios attribute
+        events by sentinel and time window, so a late call is not lost."""
+        if reply is not None:
+            self.reply = reply
+
+    def handler_factory(self):
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _json(self, code: int, obj) -> None:
+                body = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path.rstrip("/").endswith("/models"):
+                    self._json(200, {"object": "list", "data": [{"id": outer.model, "object": "model"}]})
+                else:
+                    outer.unexpected.append(f"GET {self.path}")
+                    self._json(404, {"error": "not found"})
+
+            def do_POST(self):
+                with outer._lock:
+                    outer.inflight += 1
+                try:
+                    self._post()
+                finally:
+                    with outer._lock:
+                        outer.inflight -= 1
+
+            def _post(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(n)
+                if not self.path.rstrip("/").endswith("/chat/completions"):
+                    outer.unexpected.append(f"POST {self.path}")
+                    self._json(404, {"error": "not found"})
+                    return
+                try:
+                    body = json.loads(raw or b"{}")
+                except ValueError:
+                    body = {"_unparseable": raw.decode("utf-8", "replace")}
+                outer.events.append({"t": time.monotonic(), "body": body, "reply": outer.reply})
+                created = int(time.time())
+                if body.get("stream"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+                    words = outer.reply.split(" ")
+                    for k, w in enumerate(words):
+                        chunk = {"id": "gcl-1", "object": "chat.completion.chunk", "created": created,
+                                 "model": outer.model,
+                                 "choices": [{"index": 0, "delta": {"content": w + (" " if k < len(words) - 1 else "")},
+                                              "finish_reason": None}]}
+                        self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                    end = {"id": "gcl-1", "object": "chat.completion.chunk", "created": created, "model": outer.model,
+                           "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                    self.wfile.write(f"data: {json.dumps(end)}\n\ndata: [DONE]\n\n".encode())
+                    return
+                self._json(200, {
+                    "id": "gcl-1", "object": "chat.completion", "created": created, "model": outer.model,
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": outer.reply},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                })
+
+        return H
+
+
+@dataclass
+class Protocol:
+    """How one integration talks to its scanner."""
+
+    name: str
+    verdicts: dict                      # "allow" | "block" | "modify" -> response builder
+    # Which stage a request says it is for; None if it names no stage this protocol
+    # defines (recorded, answered 400, never counted as a consultation).
+    stage_of: Callable[[dict], str | None] = lambda body: "input"
+    path: str = ""                      # path suffix the integration must POST to ("" = any)
+    malformed: bytes = b"<html>upstream error</html>"
+    wrong_schema: dict = field(default_factory=lambda: {"status": "ok"})
+
+
+# Modes a stage can be put in. Verdict modes answer correctly; fault modes misbehave.
+VERDICTS = ("allow", "block", "modify")
+FAULTS = ("error", "timeout", "malformed", "empty", "wrong_schema", "unknown_verdict", "refused")
+
+
+class StandInScanner:
+    """A scanner answering `protocol` with modes[stage] (default "allow").
+
+    One listener per stage, each on a port fixed for the whole run, so the system under
+    test is configured once (adapters point the input hook at `base_for("input")` and the
+    output hook at `base_for("output")`) and a stage's "refused" can be tested without
+    touching the other. `configure()` changes behaviour between scenarios; "refused"
+    closes that stage's listening socket and the next configure reopens it.
+
+    Every request is appended to `events` with the listener it arrived on, what the body
+    claimed, which mode answered and when. Nothing is ever cleared.
+    """
+
+    STAGES = ("input", "output")
+
+    def __init__(self, protocol: Protocol):
+        self.protocol = protocol
+        self.modes: dict[str, str] = {}
+        self.modify_text = ""
+        self.events: list[dict] = []
+        self.inflight = 0
+        self.stalled = 0
+        self._lock = threading.Lock()
+        self._release = threading.Event()
+        self._srv: dict[str, ThreadingHTTPServer | None] = {st: None for st in self.STAGES}
+        self.ports: dict[str, int] = {st: 0 for st in self.STAGES}
+
+    def __enter__(self):
+        for st in self.STAGES:
+            self._open(st)
+        return self
+
+    def __exit__(self, *exc):
+        self._release.set()  # let any stalled "timeout" handler go
+        for st in self.STAGES:
+            self._close(st)
+
+    def _open(self, stage: str) -> None:
+        srv = ThreadingHTTPServer(("127.0.0.1", self.ports[stage]), self.handler_factory(stage))
+        srv.daemon_threads = True
+        self.ports[stage] = srv.server_address[1]
+        self._srv[stage] = srv
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    def _close(self, stage: str) -> None:
+        srv = self._srv[stage]
+        if srv is not None:
+            srv.shutdown()
+            srv.server_close()
+            self._srv[stage] = None
+
+    @property
+    def port(self) -> int:
+        return self.ports["input"]
+
+    @property
+    def base(self) -> str:
+        return self.base_for("input")
+
+    def base_for(self, stage: str) -> str:
+        return f"http://127.0.0.1:{self.ports[stage]}"
+
+    def configure(self, modes: dict[str, str], modify_text: str = "") -> None:
+        self.modes, self.modify_text = dict(modes), modify_text
+        self.release_stalled()
+        for st in self.STAGES:
+            refused = self.modes.get(st) == "refused"
+            if refused and self._srv[st] is not None:
+                self._close(st)
+            elif not refused and self._srv[st] is None:
+                self._open(st)
+
+    def release_stalled(self) -> None:
+        """Free handlers held by a "timeout" mode: they close without an answer."""
+        self._release.set()
+        self._release = threading.Event()
+
+    def last_activity(self) -> float:
+        return self.events[-1]["t"] if self.events else 0.0
+
+    def consulted(self, stage: str | None = None, sentinel: str | None = None,
+                  since: float = 0.0) -> int:
+        """Requests that arrived on `stage`'s listener, claimed that stage, and (if given)
+        carry `sentinel` in their body."""
+        n = 0
+        for e in self.events:
+            if e["t"] < since or not e["valid"] or (stage and e["stage"] != stage):
+                continue
+            if sentinel and sentinel not in e["body_text"]:
+                continue
+            n += 1
+        return n
+
+    def handler_factory(self, listener: str):
+        outer = self
+        proto = self.protocol
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code: int, body: bytes, ctype: str = "application/json"):
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                with outer._lock:
+                    outer.inflight += 1
+                try:
+                    self._post()
+                finally:
+                    with outer._lock:
+                        outer.inflight -= 1
+
+            def _post(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(n)
+                try:
+                    body = json.loads(raw or b"{}")
+                except ValueError:
+                    body = {}
+                claimed = proto.stage_of(body) if isinstance(body, dict) else None
+                path_ok = not proto.path or self.path.rstrip("/").endswith(proto.path)
+                valid = path_ok and claimed == listener
+                mode = outer.modes.get(listener, "allow") if valid else "rejected"
+                ev = {"t": time.monotonic(), "stage": listener, "claimed_stage": claimed,
+                      "path": self.path, "valid": valid, "mode": mode, "body": body,
+                      "body_text": raw.decode("utf-8", "replace"), "answered": None}
+                outer.events.append(ev)
+                if not valid:
+                    ev["answered"] = "400 (wrong path or stage)"
+                    self._send(400, b'{"error": "gcl stand-in: unexpected path or stage"}')
+                    return
+                release = outer._release
+                if mode in VERDICTS:
+                    resp = proto.verdicts[mode](body, outer.modify_text)
+                    ev["answered"] = resp
+                    self._send(200, json.dumps(resp, ensure_ascii=False).encode())
+                elif mode == "error":
+                    ev["answered"] = "500"
+                    self._send(500, b'{"error": "internal"}')
+                elif mode == "timeout":
+                    ev["answered"] = "(held open, no answer)"
+                    with outer._lock:
+                        outer.stalled += 1
+                    try:
+                        release.wait(300)  # never answer while the scenario runs
+                    finally:
+                        with outer._lock:
+                            outer.stalled -= 1
+                elif mode == "malformed":
+                    ev["answered"] = proto.malformed.decode()
+                    self._send(200, proto.malformed, "text/html")
+                elif mode == "empty":
+                    ev["answered"] = ""
+                    self._send(200, b"")
+                elif mode == "wrong_schema":
+                    ev["answered"] = proto.wrong_schema
+                    self._send(200, json.dumps(proto.wrong_schema).encode())
+                elif mode == "unknown_verdict":
+                    resp = _mangle_verdict(proto.verdicts["block"](body, outer.modify_text))
+                    ev["answered"] = resp
+                    self._send(200, json.dumps(resp).encode())
+                else:
+                    ev["answered"] = "500 (unknown gcl mode)"
+                    self._send(500, b'{"error": "unknown gcl mode"}')
+
+        return H
+
+
+def _mangle_verdict(resp: dict) -> dict:
+    """A block verdict with its verdict field set to a value the protocol does not
+    define — what a scanner upgrade or a typo produces. A robust parser must not read
+    an unknown verdict as allow."""
+    out = dict(resp)
+    for key in ("action", "verdict", "decision", "result"):
+        if key in out:
+            out[key] = "DENY_UNKNOWN"
+            return out
+    for key, val in out.items():
+        if isinstance(val, bool):
+            out[key] = "unknown"
+            return out
+    return out

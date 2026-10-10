@@ -208,6 +208,46 @@ def _probe(sec: dict) -> str:
     return "\n".join(out)
 
 
+def _enforce(sec: dict) -> str:
+    i = sec["integration"]
+    versions = ", ".join(f"{k} {v}" for k, v in i["versions"].items() if v)
+    sm = sec["summary"]
+    out = ["<h2>Enforcement contract</h2>",
+           (f'<p class="sub"><b>{e(i["integration"])}</b> ({e(i["profile"])}) · {e(versions)} · '
+           f'config <code>{e(json.dumps(i["config"], ensure_ascii=False))}</code></p>'),
+           '<div class="tiles">'
+           + _tile(sm["policy_violated"], "policy violations", total=sm["scenarios"])
+           + _tile(sm["documented_deviates"], "deviations from its own docs")
+           + _tile(sm["unverified"], "unverified")
+           + _tile(sm["policy_held"], "held", bad_if_nonzero=False)
+           + "</div>",
+           _doc_source(i.get("documented_source") or {}),
+           ("<div class='scroll'><table><tr><th>Stage</th><th>Scanner</th><th>Lang</th>"
+           "<th>Expected</th><th>Observed</th><th>Policy</th><th>Docs</th><th>Evidence</th></tr>")]
+    cls = {"held": "okc", "violated": "error", "unverified": "warning", "conforms": "okc",
+           "deviates": "error", "unspecified": ""}
+    for r in sec["results"]:
+        s, ev = r["scenario"], r["evidence"]
+        notes = "".join(f"<br><small>{e(n)}</small>" for n in r["notes"])
+        evidence = (f"client {e(ev['client_status'])} · model requests {e(ev['model_requests'])} · "
+                    f"scanner calls {e(ev['scanner_consulted_stage'])}")
+        out.append(f"<tr><td>{e(s['stage'])}{' (control)' if s['control'] else ''}</td>"
+                   f"<td><code>{e(s['mode'])}</code></td><td>{e(s['lang'])}</td>"
+                   f"<td>{e(r['policy_expect'])}</td><td><b>{e(r['observed'])}</b></td>"
+                   f'<td class="lv {cls[r["policy"]]}">{e(r["policy"])}</td>'
+                   f'<td class="lv {cls[r["documented"]]}">{e(r["documented"])}</td>'
+                   f"<td><small>{evidence}</small>{notes}</td></tr>")
+    out.append("</table></div>")
+    return "\n".join(out)
+
+
+def _doc_source(src: dict) -> str:
+    if not src:
+        return ""
+    return (f'<p class="sub">Documented expectations from <code>{e(src.get("source", ""))}</code>, '
+            f'read for {e(src.get("read_for", ""))}: “{e(src.get("passage", ""))}”</p>')
+
+
 def _hero(items) -> str:
     if not items:
         return ""
@@ -243,6 +283,8 @@ def render_html(doc: dict) -> str:
         parts.append(_coverage(doc["coverage"]))
     if "probe" in doc:
         parts.append(_probe(doc["probe"]))
+    if "enforce" in doc:
+        parts.append(_enforce(doc["enforce"]))
     for extra in doc.get("sections", []):
         parts.append(f'<section class="part"><h2 class="part-title">{e(extra.get("title", ""))}</h2>')
         if extra.get("lead"):
@@ -253,6 +295,8 @@ def render_html(doc: dict) -> str:
             parts.append(_coverage(extra["coverage"]))
         if "probe" in extra:
             parts.append(_probe(extra["probe"]))
+        if "enforce" in extra:
+            parts.append(_enforce(extra["enforce"]))
         parts.append("</section>")
     meta = {k: doc[k] for k in ("command", "version", "generated_at", "host", "inputs") if k in doc}
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">

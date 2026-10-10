@@ -284,6 +284,72 @@ def demo(
         webbrowser.open((out / "report.html").resolve().as_uri())
 
 
+@app.command()
+def enforce(
+    integration: str = typer.Argument(..., help="litellm | nemo"),
+    python: Path = typer.Option(..., exists=True, help="Python of an environment where the "
+                                "integration is installed (it runs there, not in gcl's env)."),
+    profile: str = typer.Option("default", help="Integration profile, e.g. litellm: default | fail_open."),
+    timeout: float | None = typer.Option(None, help="Client deadline per scenario, seconds "
+                                         "(default: the integration's own, e.g. 45)."),
+    out: Path | None = typer.Option(None, help="Directory for report.json/.html and repro bundles."),
+    format: str = typer.Option("json,html", help="Files to write into --out."),
+    fail_on: str = typer.Option("policy", help="policy (any strict-policy violation) | "
+                                "documented (only deviations from the integration's docs) | never"),
+    allow_incomplete: bool = typer.Option(False, help="Exit 0 even if some scenarios could not be "
+                                          "judged (default: exit 2, the run is incomplete)."),
+    scenario: list[str] = typer.Option([], help="Run only this scenario id (repeatable); the "
+                                       "controls always run. Repro bundles print the command."),
+):
+    """Does a real guardrail integration enforce what its scanner decides?"""
+    import tempfile
+
+    from .enforce.adapters import ADAPTERS
+    from .enforce.contracts import run_contracts, write_bundles
+    from .report.html import render_html
+    from .report.terminal import render_enforce
+
+    if fail_on not in ("policy", "documented", "never"):
+        raise typer.BadParameter("choose policy, documented or never", param_hint="--fail-on")
+    if integration not in ADAPTERS:
+        raise typer.BadParameter(f"choose from {', '.join(ADAPTERS)}", param_hint="integration")
+    cls = ADAPTERS[integration]
+    if profile not in cls.documented:
+        raise typer.BadParameter(f"{integration} profiles: {', '.join(cls.documented)}",
+                                 param_hint="--profile")
+    workdir = Path(tempfile.mkdtemp(prefix="gcl-enforce-"))
+    adapter = cls(str(python), workdir, profile)
+    try:
+        run = run_contracts(adapter, timeout or adapter.default_timeout_s, progress=_say,
+                            only=set(scenario) or None)
+    except RuntimeError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2) from None
+    doc = R.envelope("enforce", {"integration": integration, "profile": profile})
+    doc["enforce"] = run
+    typer.echo(render_enforce(run))
+    if out:
+        _write_outputs(doc, out, _formats(format), render_html)
+        replay = (f"gcl enforce {integration} --python {python} --profile {profile} "
+                  f"--timeout {run['timeout_s']:g}")
+        bundles = write_bundles(run, out, replay)
+        typer.echo(f"\nReports: {out}/" + (f"  ({len(bundles)} repro bundle(s) in {out}/repro/)" if bundles else ""))
+    raise typer.Exit(_enforce_exit(run["summary"], fail_on, allow_incomplete))
+
+
+def _enforce_exit(s: dict, fail_on: str, allow_incomplete: bool) -> int:
+    """1: a violation of the chosen kind. 2: nothing wrong found, but some scenarios
+    could not be judged (an incomplete run is not a pass). 0 otherwise."""
+    if fail_on == "never":
+        return 0
+    bad = s["policy_violated"] if fail_on == "policy" else s["documented_deviates"]
+    if bad:
+        return 1
+    if s["unverified"] and (not allow_incomplete or s["unverified"] == s["scenarios"]):
+        return 2
+    return 0
+
+
 def _fixture_note(cases: list[dict]) -> str:
     reviewed = sum(1 for c in cases if c.get("native_reviewed"))
     if reviewed == len(cases):

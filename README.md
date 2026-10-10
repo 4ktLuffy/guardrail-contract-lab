@@ -13,16 +13,21 @@ config can look complete while the protection is not there:
   drops them without a word — while others compile and quietly stop matching
   non-English text.
 - **Coverage that collapses by language.** A rule set that catches 90%+ of English
-  attacks can catch nothing in Arabic, Amharic or Chinese. One aggregate number hides it.
+  attacks can catch nothing in Arabic, Hebrew or Chinese. One aggregate number hides it.
 - **Scanners that fail open.** When the classifier times out, returns a 500 or
   garbage, the tool call runs anyway.
+- **Decisions that don't control the action.** The scanner says "block" or "redact",
+  but the gateway forwards the original anyway — or treats a verdict it doesn't
+  recognise as "allow".
 
-`gcl` checks all three, against your real rule files and your real system, and hands
-back a concrete reproducer wherever it can: a shrunken witness string for a rule that
-disagrees or over-fires, the input that hangs a rule, the receipt and exit status for a
-probe scenario. Existing tools (garak, promptfoo)
-fire attacks at a *model*; `gcl` tests the *guardrail*: its rules, in every runtime
-that loads them, and its failure contract.
+`gcl` checks whether deployed guardrail policies are loaded, evaluated and enforced
+consistently — against your real rule files, real integrations and real systems — and
+produces reproducible evidence when they are not: a shrunken witness string for a rule
+that disagrees or over-fires, the input that hangs a rule, and for enforcement the exact
+boundary events (what reached the model, what the client got back). Red-teaming tools
+(garak, PyRIT) attack the model or the app, and Promptfoo can also test guardrail
+services directly; `gcl` concentrates on the guardrail's own rules, runtimes and failure
+contract.
 
 ## 60 seconds
 
@@ -40,6 +45,7 @@ On the bundled fixtures (written for the demo; see [NUMBERS.md](NUMBERS.md)):
 | **0** after `gcl fix` | 8 rules rewritten; each agrees with the original under Python on every tested input before it is written |
 | **91.7% → 0.0%** | recall in English vs Arabic for the same, reasonable, English rule set |
 | **6 of 6** scanner faults | still let the tool call run, in a fail-open tool runner (0 of 6 after the fix) |
+| **14 of 20** gateway scenarios | break a gateway's own fail-closed promise, end to end (0 of 20 for the strict build) |
 
 ## Commands
 
@@ -131,6 +137,39 @@ really ran is read from a **receipt** the action writes — not from logs. Two c
 run first (scanner says *malicious* → must block; *clean* → must allow). If the clean
 control leaves no receipt, every fault result is **unverified**, never "held".
 The contract says what each fault must do; the default is fail closed.
+
+### `gcl enforce INTEGRATION` — does the integration enforce what its scanner decides?
+
+```bash
+gcl enforce reference --python python3 --profile naive        # bundled reference gateway
+gcl enforce litellm --python /path/to/venv/bin/python --profile default --out report/
+gcl enforce nemo    --python /path/to/venv/bin/python --out report/
+```
+
+Drives a **real** guardrail integration end to end, offline: LiteLLM's proxy guardrails
+(`generic_guardrail_api`, before and after the model call), NeMo Guardrails' built-in
+jailbreak-detection rail, or the bundled reference gateway. The integration runs from
+its own environment (`--python`), unmodified. A stand-in scanner answers its real
+protocol with **allow, block or rewrite**, or misbehaves (HTTP 500, timeout, malformed,
+empty, missing verdict field, unknown verdict, refused), one stage at a time. Two
+independent observers record what happened: a mock model (what exactly reached the
+provider, and when?) and the client (what exactly came back?). Payloads are compared
+whole, so a gateway that strips the marker but forwards the text, keeps part of the
+original in a rewrite, or forwards a second after rejecting the client is caught. Adapters
+translate protocols only; they never interpret a verdict.
+
+Every scenario gets **two verdicts**: *policy* (strict fail-closed) and *documented*
+(does it match the integration's own docs for this configuration? the report quotes the
+passage and the version it was read for). A fail-open you switched on is reported as a
+configuration choice, not a bug; behaviour the docs don't cover is labelled as such.
+Four controls (allow and block, before and after the model) are judged first, and only
+if the scanner was really consulted with that scenario's text; if a control doesn't
+hold, what depends on it is **unverified**, never "held", and the run exits 2.
+Payloads rotate through Spanish, French, Hebrew, Portuguese, German, Arabic, Russian,
+Chinese, Italian, Japanese and Hindi, so a rewrite that corrupts the text is caught
+too. `--out` writes the report and a reproduction bundle for every scenario that did not
+cleanly hold: every attributed event, the generated config, and the command that reruns
+just that scenario (`--scenario ID`).
 
 ## What the static checks mean
 

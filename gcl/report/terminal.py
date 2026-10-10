@@ -163,3 +163,35 @@ def render_fix(summary: dict) -> str:
                  f"{summary['bundled_texts']} bundled texts. Exact within the scripts named per "
                  "rule; next to letters of other scripts it can differ (widen with --scripts).")
     return "\n".join(lines)
+
+
+def render_enforce(run: dict) -> str:
+    i = run["integration"]
+    v = ", ".join(f"{k} {val}" for k, val in i["versions"].items() if val)
+    lines = [f"Integration: {i['integration']} ({i['profile']})   {v}",
+             f"Config: {i['config']}"]
+    src = i.get("documented_source") or {}
+    if src:
+        lines.append(c(f"Docs: {src.get('source')} (read for {src.get('read_for')})", "dim"))
+    lines.append("")
+    for r in run["results"]:
+        s = r["scenario"]
+        pk = {"held": "ok", "violated": "error", "unverified": "warning"}[r["policy"]]
+        dk = {"conforms": "ok", "deviates": "error", "unspecified": "dim", "unverified": "warning"}[r["documented"]]
+        tag = " (control)" if s["control"] else ""
+        pol = f"{r['policy']:<10}"
+        docv = f"{r['documented']:<11}"
+        lines.append(f"  {c(pol, pk)} {c(docv, dk)} "
+                     f"{s['stage']:<6} {s['mode']:<15} [{s['lang']}]  expected {r['policy_expect']:<8} "
+                     f"observed {r['observed']}{tag}")
+        for n in r["notes"]:
+            lines.append(c(f"             {n}", "dim"))
+    sm = run["summary"]
+    lines.append("")
+    lines.append(f"Policy: {sm['policy_held']} held, {sm['policy_violated']} violated, {sm['unverified']} unverified "
+                 f"of {sm['scenarios']}.  Docs: {sm['documented_deviates']} deviation(s); "
+                 f"{sm['documented_unspecified_violations']} violation(s) in behaviour the docs do not cover.")
+    if run.get("known_issues"):
+        refs = sorted(set(run["known_issues"].values()))
+        lines.append(c("Known public issues for this integration: " + ", ".join(refs), "dim"))
+    return "\n".join(lines)

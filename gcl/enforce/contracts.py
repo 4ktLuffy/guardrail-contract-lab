@@ -1,0 +1,419 @@
+"""Enforcement contracts: scenarios, the run loop, and the two verdicts.
+
+Each scenario fixes one stage (input = before the model, output = after it) and one
+scanner behaviour (a verdict or a fault), sends a message whose text carries unique
+sentinels, and classifies what happened from the independent observers. Payloads are
+compared whole, not by sentinel alone: a gateway that strips the marker but forwards
+the text, or corrupts it on the way, is not "stopped".
+
+  input stage   passed    the model received the exact original user text
+                modified  the model received the stand-in's exact rewrite, and no part
+                          of the original
+                altered   the model received something else: the original changed or
+                          partly kept, or an unlabelled request during the scenario
+                stopped   the model received nothing for this scenario
+  output stage  passed    the client received the model's exact original reply
+                modified  the client received the exact rewrite instead
+                altered   the client received part of the original reply
+                stopped   a complete HTTP response arrived carrying neither
+  both          no answer          no complete response by the client deadline
+                transport failure  the connection failed without an HTTP response
+                                   (neither is ever counted as held)
+
+A provider call that reaches the model is a proven leak even if the client timed out:
+"passed" at the input stage needs no client answer. Events are attributed by sentinel
+over the whole run, and unlabelled ones by time window, so a call that lands after its
+scenario moved on is still charged to it.
+
+Policy expectations are strict: allow → passed, block or any fault → stopped,
+modify → modified. Documented expectations come from the integration's own docs for
+the profile under test (see Adapter.documented_sources); "unspecified" where the docs
+say nothing.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+from .adapters import Adapter
+from .servers import FAULTS, MockModel, StandInScanner
+
+# Widely spoken languages, rotated across scenarios: the plumbing must not depend on the
+# script or on non-ASCII bytes surviving a round trip.
+LANGS = [
+    ("es", "Resume este documento, por favor.", "Aquí tienes el resumen del documento."),
+    ("fr", "Résume ce document, s'il te plaît.", "Voici le résumé du document."),
+    ("he", "בבקשה סכם את המסמך הזה.", "הנה הסיכום של המסמך."),
+    ("pt", "Resuma este documento, por favor.", "Aqui está o resumo do documento."),
+    ("de", "Fasse dieses Dokument bitte zusammen.", "Hier ist die Zusammenfassung des Dokuments."),
+    ("ar", "من فضلك لخّص هذا المستند.", "إليك ملخص المستند."),
+    ("ru", "Пожалуйста, кратко изложи этот документ.", "Вот краткое изложение документа."),
+    ("zh", "请总结这份文件。", "这是文件的摘要。"),
+    ("it", "Riassumi questo documento, per favore.", "Ecco il riassunto del documento."),
+    ("ja", "この文書を要約してください。", "文書の要約はこちらです。"),
+    ("hi", "कृपया इस दस्तावेज़ का सारांश दें।", "यह रहा दस्तावेज़ का सारांश।"),
+]
+REDACTED = {"es": "[contenido retirado por la política]", "fr": "[contenu retiré par la politique]",
+            "he": "[התוכן הוסר על ידי המדיניות]", "pt": "[conteúdo removido pela política]",
+            "de": "[Inhalt durch Richtlinie entfernt]", "ar": "[تمت إزالة المحتوى بموجب السياسة]",
+            "ru": "[содержимое удалено политикой]", "zh": "[内容已按策略删除]",
+            "it": "[contenuto rimosso dalla policy]", "ja": "[ポリシーにより削除されました]",
+            "hi": "[नीति के कारण सामग्री हटाई गई]"}
+
+POLICY = {"allow": "passed", "block": "stopped", "modify": "modified", **{f: "stopped" for f in FAULTS}}
+
+
+@dataclass
+class Scenario:
+    id: str
+    stage: str                 # input | output
+    mode: str                  # allow | block | modify | a fault
+    lang: str
+    user_text: str
+    reply_text: str
+    modify_text: str = ""
+    control: bool = False
+
+    @property
+    def user_sentinel(self) -> str:
+        return f"GCL-U-{self.id}"
+
+    @property
+    def reply_sentinel(self) -> str:
+        return f"GCL-R-{self.id}"
+
+
+@dataclass
+class Result:
+    scenario: Scenario
+    observed: str
+    policy_expect: str
+    documented_expect: str | None
+    policy: str = ""           # held | violated | unverified
+    documented: str = ""       # conforms | deviates | unspecified | unverified
+    evidence: dict = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["scenario"]["user_sentinel"] = self.scenario.user_sentinel
+        d["scenario"]["reply_sentinel"] = self.scenario.reply_sentinel
+        return d
+
+
+def build_scenarios(adapter: Adapter) -> list[Scenario]:
+    caps = adapter.capabilities
+    plan: list[tuple[str, str, bool]] = [("input", "allow", True), ("input", "block", True)]
+    if "output" in caps:
+        plan += [("output", "allow", True), ("output", "block", True)]
+    plan += [("input", f, False) for f in FAULTS]
+    if "modify_input" in caps:
+        plan.append(("input", "modify", False))
+    if "output" in caps:
+        plan += [("output", f, False) for f in FAULTS]
+    if "modify_output" in caps:
+        plan.append(("output", "modify", False))
+    out = []
+    for k, (stage, mode, control) in enumerate(plan):
+        lang, user, reply = LANGS[k % len(LANGS)]
+        sid = f"{stage[0]}{k:02d}"
+        out.append(Scenario(sid, stage, mode, lang, user, reply,
+                            modify_text=f"{REDACTED[lang]} GCL-M-{sid}" if mode == "modify" else "",
+                            control=control))
+    return out
+
+
+_SENT = re.compile(r"GCL-[UMR]-([io]\d{2})\b")
+
+
+def _strings(obj) -> list[str]:
+    """Every string value in a decoded JSON document (keys excluded)."""
+    if isinstance(obj, str):
+        return [obj]
+    if isinstance(obj, dict):
+        return [x for v in obj.values() for x in _strings(v)]
+    if isinstance(obj, list):
+        return [x for v in obj for x in _strings(v)]
+    return []
+
+
+def _client_strings(text: str) -> list[str]:
+    """What the client was actually told: JSON string values (escapes decoded), the
+    concatenated deltas of an event stream, and the raw text as a fallback."""
+    out = [text]
+    try:
+        out += _strings(json.loads(text))
+    except ValueError:
+        deltas = []
+        for line in text.splitlines():
+            if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]"):
+                try:
+                    chunk = json.loads(line[5:])
+                except ValueError:
+                    continue
+                out += _strings(chunk)
+                for ch in chunk.get("choices") or []:
+                    deltas.append(((ch.get("delta") or {}).get("content")) or "")
+        out.append("".join(deltas))
+    return out
+
+
+def classify_input(s: Scenario, bodies: list) -> str | None:
+    """Input-stage outcome from the provider requests attributed to `s`; None when
+    nothing reached the model."""
+    if not bodies:
+        return None
+    texts = [x for b in bodies for x in _strings(b)]
+    exact = f"{s.user_text} {s.user_sentinel}"
+    if any(exact in t for t in texts):
+        return "passed"
+    if any(s.user_text in t or s.user_sentinel in t for t in texts):
+        return "altered"
+    if s.modify_text and any(s.modify_text in t for t in texts):
+        return "modified"
+    return "altered"
+
+
+def classify_output(s: Scenario, obs) -> str | None:
+    texts = _client_strings(obs.text or "")
+    exact = f"{s.reply_text} {s.reply_sentinel}"
+    if any(exact in t for t in texts):
+        return "passed"
+    if any(s.reply_text in t or s.reply_sentinel in t for t in texts):
+        return "altered"
+    if s.modify_text and any(s.modify_text in t for t in texts):
+        return "modified"
+    return None
+
+
+def classify(s: Scenario, bodies: list, obs) -> str:
+    got = classify_input(s, bodies) if s.stage == "input" else classify_output(s, obs)
+    if got:
+        return got
+    if obs.finished:
+        return "stopped"
+    return "transport failure" if obs.transport else "no answer"
+
+
+def _settle(model: MockModel, scanner: StandInScanner, quiet_s: float, max_s: float) -> bool:
+    """Wait until neither observer is serving a request (stalled "timeout" handlers
+    excepted) and both have been quiet for `quiet_s`. False if that never happened."""
+    end = time.monotonic() + max_s
+    while time.monotonic() < end:
+        busy = model.inflight or (scanner.inflight - scanner.stalled) > 0
+        last = max(model.last_activity(), scanner.last_activity())
+        if not busy and time.monotonic() - last >= quiet_s:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _owner_ids(text: str) -> set[str]:
+    return set(_SENT.findall(text))
+
+
+def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
+                  only: set[str] | None = None, settle_s: float = 0.6) -> dict:
+    """Run every scenario (or the controls plus `only`) against `adapter`."""
+    say = progress or (lambda *_: None)
+    scenarios = [s for s in build_scenarios(adapter) if not only or s.control or s.id in only]
+    obs_by: dict[str, object] = {}
+    windows: dict[str, tuple[float, float]] = {}
+    unsettled: set[str] = set()
+    started = time.time()
+    t0 = time.monotonic()
+    with MockModel("…") as model, StandInScanner(adapter.protocol) as scanner:
+        scanner.configure({"input": "allow", "output": "allow"})
+        try:
+            say(f"starting {adapter.name} ({adapter.profile})")
+            adapter.start(model, scanner)
+            for s in scenarios:
+                say(f"{s.id}: {s.stage} {s.mode} [{s.lang}]")
+                scanner.configure({"input": "allow", "output": "allow", s.stage: s.mode}, s.modify_text)
+                model.reset(f"{s.reply_text} {s.reply_sentinel}")
+                msg = [{"role": "user", "content": f"{s.user_text} {s.user_sentinel}"}]
+                begin = time.monotonic()
+                obs_by[s.id] = adapter.call(msg, timeout_s)
+                # Hold the scenario's modes while the integration finishes reacting: a
+                # stalled scan is released (it closes unanswered), then we wait for quiet.
+                scanner.release_stalled()
+                if not _settle(model, scanner, settle_s, max(5.0, min(timeout_s, 15.0))):
+                    unsettled.add(s.id)
+                windows[s.id] = (begin, time.monotonic())
+            scanner.release_stalled()
+            _settle(model, scanner, settle_s, 10.0)  # catch late calls before the run ends
+        finally:
+            adapter.stop()
+        model_events = list(model.events)
+        scanner_events = list(scanner.events)
+        config_files = adapter.config_files()
+
+    starts = sorted((w[0], sid) for sid, w in windows.items())
+    nxt = {sid: (starts[k + 1][0] if k + 1 < len(starts) else float("inf")) for k, (_, sid) in enumerate(starts)}
+
+    def owned(events: list[dict], sid: str, key) -> list[dict]:
+        out = []
+        for e in events:
+            ids = _owner_ids(key(e))
+            if ids:
+                if sid in ids:
+                    out.append(e)
+            elif windows[sid][0] <= e["t"] < nxt[sid]:
+                out.append(e)
+        return out
+
+    results: list[Result] = []
+    docs = adapter.documented.get(adapter.profile, {})
+    for s in scenarios:
+        obs = obs_by[s.id]
+        mev = owned(model_events, s.id, lambda e: json.dumps(e["body"], ensure_ascii=False))
+        sev = owned(scanner_events, s.id, lambda e: e["body_text"])
+        sentinel = s.user_sentinel if s.stage == "input" else s.reply_sentinel
+        consulted = sum(1 for e in sev if e["valid"] and e["stage"] == s.stage and sentinel in e["body_text"])
+        late = [round(e["t"] - windows[s.id][1], 2) for e in mev if e["t"] > windows[s.id][1]]
+        r = Result(s, classify(s, [e["body"] for e in mev], obs), POLICY[s.mode],
+                   docs.get((s.stage, s.mode), docs.get(s.mode)),
+                   evidence={
+                       "client_status": obs.status, "client_finished": obs.finished,
+                       "client_transport_failure": obs.transport,
+                       "client_elapsed_s": round(obs.elapsed_s, 2), "client_error": obs.error,
+                       "client_body": obs.text,
+                       "model_input": classify_input(s, [e["body"] for e in mev]),
+                       "model_requests": len(mev),
+                       "model_events": [{"t": round(e["t"] - t0, 3), "body": e["body"]} for e in mev],
+                       "scanner_consulted_stage": consulted,
+                       "scanner_events": [{"t": round(e["t"] - t0, 3), "listener": e["stage"],
+                                           "claimed_stage": e["claimed_stage"], "path": e["path"],
+                                           "valid": e["valid"], "mode": e["mode"], "body": e["body"],
+                                           "answered": e["answered"]} for e in sev],
+                       "window_s": [round(windows[s.id][0] - t0, 3), round(windows[s.id][1] - t0, 3)],
+                       "late_provider_calls_s": late,
+                       "settled": s.id not in unsettled,
+                   })
+        if late:
+            r.notes.append(f"{len(late)} provider call(s) arrived after the scenario had settled "
+                           f"(+{max(late)} s); counted here")
+        if s.id in unsettled:
+            r.notes.append("the integration was still busy when the settle window ended")
+        results.append(r)
+
+    _judge(results, adapter)
+    return {
+        "integration": adapter.describe(),
+        "timeout_s": timeout_s,
+        "started_at": started,
+        "results": [r.to_dict() for r in results],
+        "summary": _summary(results),
+        "known_issues": getattr(adapter, "known_issues", {}),
+        "config_files": config_files,
+        "unattributed_scanner_events": sum(
+            1 for e in scanner_events
+            if not _owner_ids(e["body_text"]) and not any(w[0] <= e["t"] < nxt[k] for k, w in windows.items())),
+    }
+
+
+def _judge(results: list[Result], adapter: Adapter) -> None:
+    def verdict(r: Result, why_unverified: str | None) -> None:
+        s = r.scenario
+        if why_unverified:
+            r.policy = r.documented = "unverified"
+            r.notes.append(why_unverified)
+            return
+        r.policy = "held" if r.observed == r.policy_expect else "violated"
+        if r.documented_expect is None:
+            r.documented = "unspecified"
+        else:
+            r.documented = "conforms" if r.observed == r.documented_expect else "deviates"
+        if r.policy == "violated" and r.documented == "conforms":
+            r.notes.append("documented behaviour for this configuration (not a bug; a policy choice)")
+        if r.policy == "violated" and r.documented == "unspecified":
+            r.notes.append("not covered by the integration's documentation")
+        ref = getattr(adapter, "known_issues", {}).get(s.mode)
+        if ref and r.policy == "violated":
+            r.notes.append(f"matches public issue {ref}")
+
+    def own_problem(r: Result) -> str | None:
+        """Why this scenario, on its own evidence, cannot be judged."""
+        s, ev = r.scenario, r.evidence
+        if r.observed in ("no answer", "transport failure"):
+            return ("no complete response before the client deadline" if r.observed == "no answer"
+                    else "the connection failed without an HTTP response")
+        if s.stage == "output" and ev["model_input"] != "passed":
+            return "the model never received this scenario's request, so no reply was generated"
+        if s.mode != "refused" and ev["scanner_consulted_stage"] == 0:
+            return "the scanner was never consulted for this stage with this scenario's text"
+        return None
+
+    controls = {(r.scenario.stage, r.scenario.mode): r for r in results if r.scenario.control}
+    allow_in = controls.get(("input", "allow"))
+    # Controls first: each is judged on its own evidence; the others are gated on them.
+    for key in (("input", "allow"), ("input", "block"), ("output", "allow"), ("output", "block")):
+        r = controls.get(key)
+        if r is None:
+            continue
+        why = own_problem(r)
+        if not why and key != ("input", "allow") and (allow_in is None or allow_in.policy != "held"):
+            why = "the input allow control did not hold, so nothing else is observable"
+        verdict(r, why)
+
+    def held(key) -> bool:
+        r = controls.get(key)
+        return r is not None and r.policy == "held"
+
+    for r in results:
+        s = r.scenario
+        if s.control:
+            continue
+        why = None
+        if not held(("input", "allow")):
+            why = "the input allow control did not hold, so nothing else is observable"
+        elif s.stage == "input" and not held(("input", "block")):
+            why = "the input block control did not hold"
+        elif s.stage == "output" and not (held(("output", "allow")) and held(("output", "block"))):
+            why = "an output control did not hold"
+        verdict(r, why or own_problem(r))
+
+
+def _summary(results: list[Result]) -> dict:
+    count = lambda key, val: sum(1 for r in results if getattr(r, key) == val)  # noqa: E731
+    return {
+        "scenarios": len(results),
+        "policy_held": count("policy", "held"),
+        "policy_violated": count("policy", "violated"),
+        "unverified": count("policy", "unverified"),
+        "documented_deviates": count("documented", "deviates"),
+        "documented_unspecified_violations": sum(
+            1 for r in results if r.policy == "violated" and r.documented == "unspecified"),
+    }
+
+
+def write_bundles(run: dict, out: Path, replay: str = "") -> list[Path]:
+    """One self-contained directory per scenario that is not a clean hold — violated,
+    deviating, or unverified: what was configured, every attributed boundary event with
+    the stand-in's answer and a timestamp, the full client body, the generated
+    configuration, and the command that reruns just this scenario."""
+    written = []
+    for r in run["results"]:
+        if r["policy"] == "held" and r["documented"] != "deviates":
+            continue
+        s = r["scenario"]
+        i = run["integration"]
+        d = out / "repro" / f"{i['integration']}-{i['profile']}-{s['id']}-{s['stage']}-{s['mode']}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "finding.json").write_text(json.dumps({
+            "integration": run["integration"], "scenario": s, "observed": r["observed"],
+            "expected_by_policy": r["policy_expect"], "expected_by_docs": r["documented_expect"],
+            "verdicts": {"policy": r["policy"], "documented": r["documented"]}, "notes": r["notes"],
+            "evidence": r["evidence"], "client_timeout_s": run["timeout_s"],
+            "truncated": False,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        for name, text in (run.get("config_files") or {}).items():
+            (d / f"config-{Path(name).name}").write_text(text, encoding="utf-8")
+        if replay:
+            (d / "REPLAY.txt").write_text(f"{replay} --scenario {s['id']}\n", encoding="utf-8")
+        written.append(d)
+    return written

@@ -54,6 +54,29 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   refused). Partial responses, slow-drip bodies and TLS failures are not simulated.
 - A violation shows that one request path fails open. It does not show every path does.
 
+## Enforce
+- Offline by design: a scripted stand-in scanner and a mock model replace the real
+  services. Results show how the integration's own enforcement code handles the scripted
+  inputs — not detector accuracy, production networking, or every configuration.
+- Three targets today: LiteLLM's `generic_guardrail_api` (pre_call + post_call), NeMo
+  Guardrails' `jailbreak detection model` input rail, and the bundled reference gateway.
+  Results are for the versions recorded in the report (gcl records them; it does not pin
+  them) and the configuration printed there.
+- Synchronous, single-turn requests only. Streaming, multi-turn history, policy reload and
+  retry behaviour are not tested yet.
+- The client deadline (default 45 s) is absolute. A scenario with no complete answer by
+  then is "unverified" — unless the original text already reached the model, which is a
+  proven leak and is judged as "passed" whatever the client saw.
+- After each answer gcl waits for both observers to go quiet (0.6 s, at most 15 s) and
+  attributes events by sentinel over the whole run, so a call that lands later is still
+  charged to its scenario. A call that arrives after the run ends is not seen.
+- An input-stage "stopped" means nothing reached the model for that scenario; an
+  output-stage "stopped" means a complete HTTP response arrived without the reply. A
+  dropped connection is "transport failure" and is never counted as held.
+- "Documented" expectations are taken from each project's docs for a stated version; the
+  report prints the source, the version and the passage relied on. When the docs are
+  silent, the verdict says "unspecified".
+
 ## What it cannot see
 - Keyword rules cannot tell "disable the firewall" from "don't disable the firewall".
   `gcl` measures that as hard-negative false positives; it does not fix it.

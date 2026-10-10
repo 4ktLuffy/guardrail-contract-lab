@@ -58,14 +58,21 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
 - Offline by design: a scripted stand-in scanner and a mock model replace the real
   services. Results show how the integration's own enforcement code handles the scripted
   inputs — not detector accuracy, production networking, or every configuration.
-- Thirteen targets today (plus any LiteLLM or NeMo vendor guardrail from a spec file): LiteLLM's `generic_guardrail_api` (pre_call + post_call), NeMo
-  Guardrails' `jailbreak detection model` input rail and self-check input/output rails, openai-guardrails' LLM checks, the
-  Portkey gateway's `default.webhook` hooks, LangChain's `OpenAIModerationMiddleware`,
-  Mastra's PromptInjectionDetector/ModerationProcessor, the OpenAI Agents SDK with
-  `GuardrailAgent`, Pydantic AI's harness guardrails, CrewAI's `LLMGuardrail` (output only), Guardrails AI's `Guard`, Invariant Gateway's MCP
-  proxy (streamable HTTP, JSON responses only; SSE and stdio transports not modelled),
-  and the bundled reference gateway.
-- Where a framework ships no guard of its own (Pydantic AI), the driver supplies the
+- Fourteen built-in targets, plus any LiteLLM or NeMo vendor guardrail described by a
+  spec file:
+  - LiteLLM `generic_guardrail_api` (pre_call + post_call)
+  - NeMo Guardrails: `jailbreak detection model`; self-check input/output
+  - openai-guardrails LLM checks; the OpenAI Agents SDK with `GuardrailAgent`
+  - Portkey gateway `default.webhook` hooks
+  - LangChain `OpenAIModerationMiddleware`
+  - Mastra PromptInjectionDetector / ModerationProcessor
+  - Pydantic AI harness guardrails; CrewAI `LLMGuardrail` (output only)
+  - Guardrails AI `Guard` (Python API and RAIL)
+  - Invariant Gateway MCP proxy (streamable HTTP with JSON responses; SSE and stdio
+    transports are not modelled)
+  - Agno `OpenAIModerationGuardrail` (input only)
+  - the bundled reference gateway
+- Where a framework ships no guard of its own (Pydantic AI, Guardrails AI), the driver supplies the
   strictest guard (allow only on an explicit allow, raise on anything else), so those
   runs test the framework's enforcement, not a vendor's guard.
 - Tool probing uses one harmless tool called once on the first model turn; for the

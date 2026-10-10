@@ -1417,9 +1417,51 @@ class InvariantMCP(Adapter):
         return obs
 
 
+# --------------------------------------------------------------------------- Agno
+class AgnoAgent(Adapter):
+    """An Agno agent with the built-in `OpenAIModerationGuardrail` as a pre-hook (input
+    only); the guardrail's OpenAI client is pointed at the stand-in via OPENAI_BASE_URL."""
+
+    name = "agno"
+    protocol = OPENAI_MODERATION
+    capabilities: ClassVar[set[str]] = {"input"}
+    # Agno's guardrail docs describe raising InputCheckError on a violation; nothing on a
+    # failed moderation call.
+    documented: ClassVar[dict] = {"default": dict(_BASE)}
+    documented_sources: ClassVar[dict] = {"default": {
+        "source": "agno 3.1.2: agno/guardrails/openai.py, agno/agent/_hooks.py; https://docs.agno.com (guardrails)",
+        "read_for": "agno 3.1.2",
+        "passage": "OpenAIModerationGuardrail raises InputCheckError when content is flagged. Failure of the "
+                   "moderation call is not described."}}
+
+    def config_summary(self) -> dict:
+        return {"agent": "agno.agent.Agent(model=OpenAIChat)", "pre_hooks": ["OpenAIModerationGuardrail()"],
+                "call": "agent.run"}
+
+    def versions(self) -> dict:
+        return _versions(self.python, ["agno", "openai"])
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        self.port = _free_port()
+        env = dict(os.environ, NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost",
+                   OPENAI_API_KEY="sk-gcl", OPENAI_BASE_URL=f"{scanner.base_for('input')}/v1",
+                   AGNO_TELEMETRY="false")
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen([self.python, str(_driver_path("agno_driver.py")), "--port", str(self.port),
+                                          "--model-base", model.openai_base], stdout=logf, stderr=subprocess.STDOUT,
+                                         env=env, start_new_session=True, cwd=str(self.workdir))
+        _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 90, self.log)
+
+    def call(self, messages: list[dict], timeout_s: float) -> Observation:
+        return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                     {"model": "gcl-mock", "messages": messages}, None, timeout_s)
+
+
 ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": OpenAIGuardrails,
             "nemo-selfcheck": NemoSelfCheck, "portkey": PortkeyGateway,
             "langchain-moderation": LangChainModeration, "mastra": MastraAgent, "openai-agents": OpenAIAgents,
             "pydantic-ai": PydanticAI, "litellm-vendor": LiteLLMVendor,
             "nemo-vendor": NemoVendor, "crewai": CrewAITask,
-            "guardrails-ai": GuardrailsAI, "invariant-mcp": InvariantMCP, "reference": ReferenceGateway}
+            "guardrails-ai": GuardrailsAI, "invariant-mcp": InvariantMCP,
+            "agno": AgnoAgent, "reference": ReferenceGateway}

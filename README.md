@@ -154,7 +154,8 @@ jailbreak-detection and self-check rails, openai-guardrails' LLM checks (a small
 library over HTTP), the Portkey gateway's webhook guardrails (Node: `--env DIR`), LangChain's
 OpenAI moderation middleware, Mastra's model-backed processors, the OpenAI Agents SDK with openai-guardrails'
 `GuardrailAgent`, Pydantic AI's harness guardrails, CrewAI's `LLMGuardrail`, Guardrails AI's `Guard` (Python API and RAIL), Invariant Gateway's MCP proxy (gcl plays
-the MCP client and a mock MCP server), or the bundled reference gateway. A report notes when one request ran a tool more than once (retries that
+the MCP client and a mock MCP server), Agno's built-in guardrails, or the bundled
+reference gateway. A report notes when one request ran a tool more than once (retries that
 re-execute side effects). Integrations with sessions also get a retry scenario (the same
 blocked request sent twice), and ones that fetch their rules get policy-source faults
 (the policy is missing, or its source errors). Agent integrations run with a

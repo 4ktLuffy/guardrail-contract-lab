@@ -175,6 +175,9 @@ class Protocol:
     judge_model: str = "gcl-judge"
     # Protocol-specific faults: mode name -> full response body (sent with HTTP 200).
     extra_faults: dict = field(default_factory=dict)
+    # Overrides for built-in content faults when verdicts are plain text, not JSON:
+    # mode ("unknown_verdict", "verdict_type") -> the text to answer with.
+    variants: dict = field(default_factory=dict)
 
 
 # Modes a stage can be put in. Verdict modes answer correctly; fault modes misbehave.
@@ -324,7 +327,10 @@ class StandInScanner:
         if mode in VERDICTS:
             resp = proto.verdicts[mode](body, self.modify_text)
             ev["answered"] = resp
-            content(json.dumps(resp, ensure_ascii=False))
+            content(resp if isinstance(resp, str) else json.dumps(resp, ensure_ascii=False))
+        elif mode in proto.variants:
+            ev["answered"] = proto.variants[mode]
+            content(proto.variants[mode])
         elif mode == "error":
             ev["answered"] = "500"
             send(500, b'{"error": "internal"}')

@@ -150,7 +150,7 @@ gcl enforce portkey --env /dir/with/node_modules --profile fail_on_error
 
 Drives a **real** guardrail integration end to end, offline: LiteLLM's proxy guardrails
 (`generic_guardrail_api`, before and after the model call), NeMo Guardrails' built-in
-jailbreak-detection rail, openai-guardrails' LLM checks (a small driver serves the
+jailbreak-detection and self-check rails, openai-guardrails' LLM checks (a small driver serves the
 library over HTTP), the Portkey gateway's webhook guardrails (Node: `--env DIR`), or the
 bundled reference gateway. LLM-as-judge guards get a stand-in
 judge on the model's own endpoint, including the case where the judge model *refuses*

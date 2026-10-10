@@ -379,8 +379,20 @@ def test_type_confused_verdicts_keep_meaning_change_type():
     assert _type_confuse({"jailbreak": True, "score": 0.99}) == {"jailbreak": "true", "score": 0.99}
 
 
+def test_text_verdicts_and_variants_are_served_as_chat_content():
+    from gcl.enforce.adapters import NEMO_SELF_CHECK as P
+
+    with StandInScanner(P) as sc, MockModel("ok", judge=sc) as m:
+        url = m.openai_base + "/chat/completions"
+        ask = {"model": "gcl-judge", "messages": [{"role": "user", "content": "hola GCL-U-i01"}]}
+        for mode, want in (("block", "Yes"), ("allow", "No"), ("verdict_type", "Not safe."),
+                           ("unknown_verdict", "Unclear.")):
+            sc.configure({"input": mode})
+            assert _post_json(url, ask)["choices"][0]["message"]["content"] == want
+
+
 def test_adapters_registry():
-    assert set(ADAPTERS) == {"litellm", "nemo", "openai-guardrails", "portkey", "reference"}
+    assert set(ADAPTERS) == {"litellm", "nemo", "nemo-selfcheck", "openai-guardrails", "portkey", "reference"}
 
 
 # Real integrations: these pin what was observed on litellm 1.104.2 and nemoguardrails
@@ -449,3 +461,15 @@ def test_real_portkey_fail_on_error(tmp_path):
         assert _by(run, stage, "modify")["observed"] == "modified"
         # {"verdict": "false"} — a string — reads as a pass (1.15.2).
         assert _by(run, stage, "verdict_type")["observed"] == "passed"
+
+
+@needs_integ
+def test_real_nemo_self_check_rails(tmp_path):
+    from gcl.enforce.adapters import NemoSelfCheck
+
+    run = run_contracts(NemoSelfCheck(INTEG, tmp_path), 45)
+    _controls_hold(run)
+    for stage in ("input", "output"):
+        for f in ("error", "malformed", "empty", "judge_refusal"):
+            assert _by(run, stage, f)["observed"] == "stopped", (stage, f)
+        assert _by(run, stage, "verdict_type")["observed"] == "passed"  # "Not safe." reads as safe

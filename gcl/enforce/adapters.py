@@ -1670,6 +1670,42 @@ class OpenAIAgentsJS(OpenAIAgents):
         _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 60, self.log)
 
 
+# --------------------------------------------------------------------------- Semantic Kernel
+class SemanticKernel(GoogleADK):
+    """Microsoft Semantic Kernel with gcl's strictest guard in a PROMPT_RENDERING filter
+    (input) and a FUNCTION_INVOCATION filter (output), plus the probe plugin with
+    automatic function calling. SK ships no guard: the run tests SK's enforcement."""
+
+    name = "semantic-kernel"
+    documented_sources: ClassVar[dict] = {"default": {
+        "source": "semantic-kernel 1.45.0: filters (prompt render filter function_result override, function "
+                  "invocation filter result override)",
+        "read_for": "semantic-kernel 1.45.0",
+        "passage": "Setting function_result in a prompt render filter skips the AI service call; a function "
+                   "invocation filter may replace context.result. Exceptions in filters propagate."}}
+
+    def config_summary(self) -> dict:
+        return {"kernel": "semantic_kernel.Kernel + OpenAIChatCompletion", "filters": ["prompt_rendering",
+                "function_invocation"], "guard": "gcl strict HTTP guard", "tools": ["probe.gcl_probe (auto)"]}
+
+    def versions(self) -> dict:
+        return _versions(self.python, ["semantic-kernel", "openai"])
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        self.port = _free_port()
+        path = self.protocol.path
+        cmd = [self.python, str(_driver_path("semantic_kernel_driver.py")), "--port", str(self.port),
+               "--model-base", model.openai_base, "--tool-url", model.tool_url,
+               "--input-guard", f"{scanner.base_for('input')}{path}",
+               "--output-guard", f"{scanner.base_for('output')}{path}"]
+        env = dict(os.environ, NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost", OPENAI_API_KEY="sk-gcl")
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env,
+                                         start_new_session=True, cwd=str(self.workdir))
+        _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 120, self.log)
+
+
 ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": OpenAIGuardrails,
             "nemo-selfcheck": NemoSelfCheck, "portkey": PortkeyGateway,
             "langchain-moderation": LangChainModeration, "mastra": MastraAgent, "openai-agents": OpenAIAgents,
@@ -1678,4 +1714,4 @@ ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": Op
             "guardrails-ai": GuardrailsAI, "invariant-mcp": InvariantMCP,
             "agno": AgnoAgent, "openai-guardrails-js": OpenAIGuardrailsJS,
             "google-adk": GoogleADK, "lasso-mcp-gateway": LassoMCPGateway,
-            "openai-agents-js": OpenAIAgentsJS, "reference": ReferenceGateway}
+            "openai-agents-js": OpenAIAgentsJS, "semantic-kernel": SemanticKernel, "reference": ReferenceGateway}

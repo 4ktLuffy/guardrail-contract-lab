@@ -58,7 +58,7 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
 - Offline by design: a scripted stand-in scanner and a mock model replace the real
   services. Results show how the integration's own enforcement code handles the scripted
   inputs — not detector accuracy, production networking, or every configuration.
-- Eighteen built-in targets, plus any LiteLLM or NeMo vendor guardrail described by a
+- Nineteen built-in targets, plus any LiteLLM or NeMo vendor guardrail described by a
   spec file:
   - LiteLLM `generic_guardrail_api` (pre_call + post_call)
   - NeMo Guardrails: `jailbreak detection model`; self-check input/output
@@ -67,7 +67,8 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   - Portkey gateway `default.webhook` hooks
   - LangChain `OpenAIModerationMiddleware`
   - Mastra PromptInjectionDetector / ModerationProcessor
-  - Pydantic AI harness guardrails; Google ADK model callbacks; CrewAI `LLMGuardrail`
+  - Pydantic AI harness guardrails; Google ADK model callbacks; Semantic Kernel filters;
+    CrewAI `LLMGuardrail`
     (output only)
   - Guardrails AI `Guard` (Python API and RAIL)
   - Invariant Gateway MCP proxy (streamable HTTP with JSON responses; SSE and stdio
@@ -76,7 +77,7 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
     launcher because its plugin manager passes no config)
   - Agno `OpenAIModerationGuardrail` (input only)
   - the bundled reference gateway
-- Where a framework ships no guard of its own (Pydantic AI, Google ADK, Guardrails AI), the driver supplies the
+- Where a framework ships no guard of its own (Pydantic AI, Google ADK, Semantic Kernel, Guardrails AI), the driver supplies the
   strictest guard (allow only on an explicit allow, raise on anything else), so those
   runs test the framework's enforcement, not a vendor's guard.
 - Tool probing uses one harmless tool called once on the first model turn; for the

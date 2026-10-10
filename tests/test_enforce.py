@@ -504,7 +504,7 @@ def test_adapters_registry():
                              "invariant-mcp", "agno",
                              "openai-guardrails-js", "google-adk",
                              "lasso-mcp-gateway", "openai-agents-js",
-                             "reference"}
+                             "semantic-kernel", "reference"}
 
 
 # Real integrations: these pin what was observed on litellm 1.104.2 and nemoguardrails

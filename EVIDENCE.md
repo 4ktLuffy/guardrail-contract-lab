@@ -84,13 +84,22 @@ else is labelled.
   protocol cannot express is unverified; ambiguous judge requests are rejected; the
   deadline worker is stopped — checked.
 
+## Review round 8 (tests/test_review_round8.py)
+- A control that is itself unverified unlocks nothing; specs with no testable stage are
+  refused; unknown/wrong-type faults change only the operative verdict field (fields
+  that differ between allow and block) or report "not exercised"; the block marker
+  counts only in the answer content; a 5xx stays "failed after send" even when it quotes
+  the reply; ECHO_TEXT needs an explicit field; a late retry is answered with its own
+  scenario's behaviour; vendor routes are matched exactly; stage inference needs exactly
+  one scenario identity — checked.
+
 ## Independent review
-- Eight adversarial review rounds by independent models (seven by an OpenAI model, one by a
+- Nine adversarial review rounds by independent models (eight by an OpenAI model, one by a
   separate Claude instance) before release. Every issue they reproduced — wrong verdicts,
   misattributed timeouts, rewrites that changed what a rule matches, unbounded
   subprocesses, overclaims — was fixed and pinned by a regression test
   (`tests/test_review_round*.py` and the suites above).
-- Local runs: 133 tests pass (plus 7 opt-in real-integration tests) on Python 3.11.14 and
+- Local runs: 157 tests pass (plus 10 opt-in real-integration tests) on Python 3.11.14 and
   3.13.15 with Node 25.8.0; the demo runs
   from an installed wheel outside the checkout.
 

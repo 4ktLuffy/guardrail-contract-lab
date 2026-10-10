@@ -64,7 +64,8 @@ class MockModel(_Server):
         return [e["body"] for e in self.events]
 
     def last_activity(self) -> float:
-        return self.events[-1]["t"] if self.events else 0.0
+        """When the model or the probe tool last saw a request."""
+        return max([e["t"] for e in self.events] + [e["t"] for e in self.tool_events] + [0.0])
 
     @property
     def openai_base(self) -> str:
@@ -212,6 +213,12 @@ class Protocol:
     # Stage = the listener the request arrived on, whatever the body says (protocols whose
     # body carries no stage, with one URL per stage).
     trust_listener: bool = False
+    # Several valid routes, or templated ones ("/guards/<name>/validate"); checked exactly
+    # (query string and trailing slash ignored). Empty: `path` (suffix) applies.
+    routes: tuple = ()
+    # The text the guard was asked to check, from a request body (for ECHO_TEXT and for
+    # binding consultation evidence to that text). None: the whole body.
+    scanned: Callable[[dict], str | None] | None = None
     # Protocol-specific faults: mode name -> full response body (sent with HTTP 200).
     extra_faults: dict = field(default_factory=dict)
     # Overrides for built-in content faults when verdicts are plain text, not JSON:
@@ -248,6 +255,7 @@ class StandInScanner:
         self.inflight = 0
         self.stalled = 0
         self.latency_s = 0.0  # delay before every answer: a detector that takes time to decide
+        self.by_sid: dict[str, tuple[dict, str]] = {}
         self._lock = threading.Lock()
         self._release = threading.Event()
         self._srv: dict[str, ThreadingHTTPServer | None] = {st: None for st in self.STAGES}
@@ -288,8 +296,13 @@ class StandInScanner:
     def base_for(self, stage: str) -> str:
         return f"http://127.0.0.1:{self.ports[stage]}"
 
-    def configure(self, modes: dict[str, str], modify_text: str = "") -> None:
+    def configure(self, modes: dict[str, str], modify_text: str = "", sid: str | None = None) -> None:
+        """Set behaviour for the next scenario. With `sid`, the behaviour is also kept for
+        that scenario: a late retry carrying its markers is answered the same way after
+        the run has moved on, instead of with the newer scenario's behaviour."""
         self.modes, self.modify_text = dict(modes), modify_text
+        if sid is not None:
+            self.by_sid[sid] = (dict(modes), modify_text)
         self.release_stalled()
         any_refused = any(m == "refused" for m in self.modes.values())
         for st in self.STAGES:
@@ -307,7 +320,8 @@ class StandInScanner:
         self._release = threading.Event()
 
     def last_activity(self) -> float:
-        return self.events[-1]["t"] if self.events else 0.0
+        """When the scanner last received or finished answering a request."""
+        return max((max(e["t"], e.get("t_done") or 0.0) for e in self.events), default=0.0)
 
     def consulted(self, stage: str | None = None, sentinel: str | None = None,
                   since: float = 0.0) -> int:
@@ -354,29 +368,44 @@ class StandInScanner:
         except ValueError:
             body = {}
         claimed = proto.stage_of(body) if isinstance(body, dict) else None
-        path_ok = not proto.path or h.path.rstrip("/").endswith(proto.path)
+        path_ok = _path_ok(proto, h.path)
         if listener is not None and (by_name or proto.trust_listener):
             valid, stage = path_ok, listener      # the stage is fixed by name or by port
         else:
             by_body = listener is None or proto.single_listener
             valid = path_ok and claimed in self.STAGES and (by_body or claimed == listener)
             stage = claimed if by_body else listener
-        mode = self.modes.get(stage, "allow") if valid else "rejected"
+        # Snapshot everything the answer depends on now: the scenario this request belongs
+        # to (by its markers) if known, else the current configuration.
+        text = raw.decode("utf-8", "replace")
+        ids = set(re.findall(r"GCL-[UMRT]-([io]\d{2})\b", text))
+        modes, modify_text = (self.by_sid[next(iter(ids))] if len(ids) == 1 and next(iter(ids)) in self.by_sid
+                              else (self.modes, self.modify_text))
+        mode = modes.get(stage, "allow") if valid else "rejected"
+        scanned = proto.scanned(body) if (proto.scanned and isinstance(body, dict)) else None
         ev = {"t": time.monotonic(), "stage": stage, "claimed_stage": claimed,
-              "path": h.path, "valid": valid, "mode": mode, "body": body,
-              "body_text": raw.decode("utf-8", "replace"), "answered": None, "fault_expressed": True}
+              "path": h.path, "valid": valid, "mode": mode, "body": body, "scanned": scanned,
+              "body_text": text, "answered": None, "fault_expressed": True, "t_done": None}
         self.events.append(ev)
         if not valid:
             ev["answered"] = "400 (wrong path or stage)"
             send(400, b'{"error": "gcl stand-in: unexpected path or stage"}')
+            ev["t_done"] = time.monotonic()
             return
+        try:
+            self._answer(ev, body, stage, mode, modify_text, send, content)
+        finally:
+            ev["t_done"] = time.monotonic()
+
+    def _answer(self, ev, body, stage, mode, modify_text, send, content) -> None:
+        proto = self.protocol
         release = self._release
         if self.latency_s:
             time.sleep(self.latency_s)
 
         def verdict(name):
             fn = proto.verdicts[name]
-            return fn(body, self.modify_text, stage) if fn.__code__.co_argcount >= 3 else fn(body, self.modify_text)
+            return fn(body, modify_text, stage) if fn.__code__.co_argcount >= 3 else fn(body, modify_text)
 
         if mode in VERDICTS:
             resp = verdict(mode)
@@ -407,12 +436,12 @@ class StandInScanner:
             ev["answered"] = proto.wrong_schema
             content(json.dumps(proto.wrong_schema))
         elif mode in ("unknown_verdict", "verdict_type"):
-            block = verdict("block")
-            resp = (_mangle_verdict if mode == "unknown_verdict" else _type_confuse)(block) \
-                if isinstance(block, dict) else block
-            # A verdict shape the generic rewrite cannot reach would silently send a normal
-            # block; record that, so the scenario is judged unverified, not held.
-            ev["fault_expressed"] = resp != block
+            block, allow = verdict("block"), verdict("allow")
+            # Only the fields that decide the verdict — those that differ between the allow
+            # and the block answer — are rewritten. If none can be, the fault was not
+            # expressed and the scenario is judged unverified, not held.
+            resp, changed = _fault_on_operative(block, allow, mode)
+            ev["fault_expressed"] = changed
             ev["answered"] = resp
             content(resp if isinstance(resp, str) else json.dumps(resp))
         elif mode in proto.extra_faults:
@@ -434,6 +463,69 @@ class StandInScanner:
                 outer.serve(self, listener, self.rfile.read(n))
 
         return H
+
+
+def _path_ok(proto: Protocol, path: str) -> bool:
+    path = path.split("?", 1)[0].rstrip("/") or "/"
+    if proto.routes:
+        return any(re.fullmatch(re.sub(r"<[^>/]+>", "[^/]+", r.rstrip("/")), path) for r in proto.routes)
+    return not proto.path or path.endswith(proto.path.rstrip("/"))
+
+
+def _leaves(obj, prefix=()):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _leaves(v, (*prefix, k))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            yield from _leaves(v, (*prefix, i))
+    else:
+        yield prefix, obj
+
+
+def _get(obj, path):
+    for k in path:
+        try:
+            obj = obj[k]
+        except (KeyError, IndexError, TypeError):
+            return None
+    return obj
+
+
+def _set(obj, path, value):
+    obj = json.loads(json.dumps(obj))
+    cur = obj
+    for k in path[:-1]:
+        cur = cur[k]
+    cur[path[-1]] = value
+    return obj
+
+
+def _fault_on_operative(block, allow, mode: str):
+    """Apply unknown_verdict / verdict_type to the operative verdict fields only: leaves
+    of the block answer whose value differs from the allow answer (or that the allow
+    answer lacks). Returns (answer, changed)."""
+    if not isinstance(block, (dict, list)):
+        return block, False
+    operative = [(p, v) for p, v in _leaves(block)
+                 if not isinstance(allow, (dict, list)) or _get(allow, p) != v]
+    # Named verdict fields first, then booleans, then the rest (a reason string last).
+    operative.sort(key=lambda pv: (not (pv[0] and pv[0][-1] in _VERDICT_KEYS), not isinstance(pv[1], bool)))
+    out, changed = block, False
+    for p, v in operative:
+        if not p:
+            continue
+        if mode == "unknown_verdict":
+            if isinstance(v, bool) or (isinstance(v, str) and v):
+                return _set(out, p, "DENY_UNKNOWN" if isinstance(v, str) else "unknown"), True
+        else:  # verdict_type: the same meaning in the wrong type
+            if isinstance(v, bool):
+                out, changed = _set(out, p, "true" if v else "false"), True
+            elif isinstance(v, str) and v.isupper() and v.lower() != v:
+                out, changed = _set(out, p, v.lower()), True
+            elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                out, changed = _set(out, p, str(v)), True
+    return out, changed
 
 
 _VERDICT_KEYS = ("action", "verdict", "decision", "result", "outcome", "status", "flagged", "blocked",

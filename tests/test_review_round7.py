@@ -52,6 +52,7 @@ def _result(stage, mode, observed, control, **ev):
 
 class _A:
     known_issues: ClassVar[dict] = {}
+    capabilities: ClassVar[set] = {"input", "output"}
 
 
 def _controls():

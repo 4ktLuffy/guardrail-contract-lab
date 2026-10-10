@@ -267,17 +267,26 @@ BLOCK_MARK = "GCL-BLOCKED"  # carried by the stand-in's block reasons, where a p
 def _refused(obs) -> bool:
     """Explicit evidence the client was refused: a 4xx, or an answer carrying the
     stand-in's block reason (integrations that return a refusal as a normal reply)."""
-    return (obs.status is not None and 400 <= obs.status < 500) or BLOCK_MARK in (obs.text or "")
+    if obs.status is not None and 400 <= obs.status < 500:
+        return True
+    try:
+        doc = json.loads(obs.text or "")
+    except ValueError:
+        return False
+    answers = [((c or {}).get("message") or {}).get("content") for c in (doc.get("choices") or [])] \
+        if isinstance(doc, dict) else []
+    return any(isinstance(a, str) and BLOCK_MARK in a for a in answers)
 
 
 def classify(s: Scenario, bodies: list, obs) -> str:
     got = classify_input(s, bodies) if s.stage == "input" else classify_output(s, obs)
     if got == "passed" and s.stage == "input" and obs.finished:
+        # The provider saw the prompt. A server error stays a failure whatever its body
+        # carries (a reply quoted in the error is still recorded in the evidence).
+        if obs.status is not None and obs.status >= 500:
+            return "failed after send"
         reply = f"{s.reply_text} {s.reply_sentinel}"
         if not any(reply in t for t in _client_strings(obs.text or "")):
-            # The provider saw the prompt; what did the client get instead of the reply?
-            if obs.status is not None and obs.status >= 500:
-                return "failed after send"  # a server error, whatever its text says
             if _refused(obs):
                 return "blocked after send"
             return "altered"
@@ -325,7 +334,7 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
             adapter.start(model, scanner)
             for s in scenarios:
                 say(f"{s.id}: {s.stage} {s.mode} [{s.lang}]")
-                scanner.configure({"input": "allow", "output": "allow", s.stage: s.mode}, s.modify_text)
+                scanner.configure({"input": "allow", "output": "allow", s.stage: s.mode}, s.modify_text, sid=s.id)
                 model.reset(f"{s.reply_text} {s.reply_sentinel}")
                 msg = [{"role": "user", "content": f"{s.user_text} {s.user_sentinel}"}]
                 begin = time.monotonic()
@@ -353,7 +362,7 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         for e in events:
             ids = _owner_ids(key(e))
             if ids:
-                if sid in ids:
+                if ids == {sid}:  # markers of several scenarios: ambiguous, charged to none
                     out.append(e)
             elif windows[sid][0] <= e["t"] < nxt[sid]:
                 out.append(e)
@@ -366,7 +375,8 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         mev = owned(model_events, s.id, lambda e: json.dumps(e["body"], ensure_ascii=False))
         sev = owned(scanner_events, s.id, lambda e: e["body_text"])
         sentinel = s.user_sentinel if s.stage == "input" else s.reply_sentinel
-        mine = [e for e in sev if e["valid"] and e["stage"] == s.stage and sentinel in e["body_text"]]
+        mine = [e for e in sev if e["valid"] and e["stage"] == s.stage
+                and sentinel in (e["scanned"] if e.get("scanned") is not None else e["body_text"])]
         # Only answers served with this scenario's own mode count: a late retry answered
         # by the next scenario's configuration is not evidence for this one.
         consulted = sum(1 for e in mine if e["mode"] == s.mode)
@@ -376,7 +386,7 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         expect = docs.get((s.stage, s.mode), docs.get(s.mode))
         if isinstance(expect, (tuple, set, frozenset)):
             expect = sorted(expect)  # several outcomes the docs allow
-        tools_run = [e for e in tool_events if f"GCL-T-{s.id}" in e["body"]]
+        tools_run = owned(tool_events, s.id, lambda e: e["body"])
         observed = classify(s, [e["body"] for e in mev], obs)
         if tools_run and s.stage == "input" and s.mode != "allow":
             observed = "tool executed"  # the strongest evidence: a side effect happened
@@ -454,6 +464,11 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
         if r.observed in ("no answer", "transport failure"):
             return ("no complete response before the client deadline" if r.observed == "no answer"
                     else "the connection failed without an HTTP response")
+        if ev.get("scanner_answered_by_other_mode"):
+            return "a request for this scenario was answered with another scenario's behaviour"
+        if s.control and s.mode == "allow" and s.stage == "input" and "tools" in adapter.capabilities \
+                and not ev.get("tool_runs"):
+            return "the probe tool never ran, so tool enforcement is not observable"
         if ev.get("fault_not_expressible"):
             return "this fault cannot be expressed in this protocol's verdict shape; not exercised"
         if not ev.get("settled", True) and r.observed not in leaks:
@@ -482,7 +497,7 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
         docs say for this configuration (e.g. a block that is documented to arrive after
         the model call). Either way the integration is shown to act on verdicts."""
         r = controls.get(key)
-        if r is not None and r.observed == "retained" and r.scenario.mode == "block":
+        if r is not None and r.observed == "retained" and r.scenario.mode == "block" and r.policy != "unverified":
             return True  # the answer was refused; the leftover is reported on the control itself
         return r is not None and (r.policy == "held" or r.documented == "conforms")
 

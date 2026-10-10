@@ -557,13 +557,11 @@ def _stage_by_sentinel(body: dict) -> str | None:
     reply marker (with or without its user marker) is an output check; a user marker
     alone is an input check. Markers from different scenarios, or none, are rejected."""
     text = json.dumps(body, ensure_ascii=False)
-    u = set(re.findall(r"GCL-U-([io]\d{2})", text))
-    r = set(re.findall(r"GCL-R-([io]\d{2})", text))
-    if r and (not u or r == u):
-        return "output"
-    if u and not r:
-        return "input"
-    return None
+    u = set(re.findall(r"GCL-U-([io]\d{2})\b", text))
+    r = set(re.findall(r"GCL-R-([io]\d{2})\b", text))
+    if len(u | r) != 1:  # exactly one scenario identity, or nothing is inferred
+        return None
+    return "output" if r else "input"
 
 
 def _refusal_envelope() -> dict:
@@ -613,10 +611,10 @@ class OpenAIGuardrails(Adapter):
     # "input: Checks on the user's prompt (may run concurrently with LLM call)";
     # "pre_flight: Checks that run before the LLM request is issued."
     documented: ClassVar[dict] = {
-        "default": {**_BASE, ("input", "block"): "blocked after send",
+        "default": {**_BASE, ("input", "block"): ("blocked after send", "stopped"),
                     **{f: "passed" for f in _ERR}},
-        "raise_errors": {**_BASE, ("input", "block"): "blocked after send",
-                         **{("input", f): "blocked after send" for f in _ERR},
+        "raise_errors": {**_BASE, ("input", "block"): ("blocked after send", "stopped"),
+                         **{("input", f): ("failed after send", "stopped") for f in _ERR},
                          **{("output", f): "stopped" for f in _ERR}},
         "pre_flight": {**_BASE, **{f: "stopped" for f in _ERR}},
     }
@@ -1024,39 +1022,41 @@ def _fill(obj, text: str, echo: str = ""):
     return obj
 
 
-def _scanned_text(body) -> str:
-    """The text a vendor request carries: the longest string value with a gcl marker."""
-    strings = [x for x in _strings_of(body) if "GCL-" in x]
-    return max(strings, key=len) if strings else ""
-
-
-def _strings_of(obj) -> list[str]:
-    if isinstance(obj, str):
-        return [obj]
-    if isinstance(obj, dict):
-        return [x for v in obj.values() for x in _strings_of(v)]
-    if isinstance(obj, list):
-        return [x for v in obj for x in _strings_of(v)]
-    return []
+def _dotted(body, path: str):
+    """Follow a dotted path ("messages.-1.content", "llmOutput") into a JSON body."""
+    cur = body
+    for part in path.split("."):
+        try:
+            cur = cur[int(part)] if isinstance(cur, list) else cur[part]
+        except (KeyError, IndexError, ValueError, TypeError):
+            return None
+    return cur if isinstance(cur, str) else None
 
 
 def vendor_protocol(spec: dict) -> Protocol:
     """A scanner protocol built from a vendor spec file: the vendor's own allow, block and
-    (optionally) rewrite bodies, served on one listener per stage."""
+    (optionally) rewrite bodies, served on one listener per stage, on the vendor's routes
+    only. ECHO_TEXT needs `scanned_path`, the field that carries the checked text."""
     allow, block, modify = spec["allow_response"], spec["block_response"], spec.get("modify_response")
+    scanned_path = spec.get("scanned_path")
+    if "ECHO_TEXT" in json.dumps([allow, block, modify]) and not scanned_path:
+        raise ValueError(f"{spec['vendor']}: ECHO_TEXT needs scanned_path (the field holding the checked text)")
+    scanned = (lambda body: _dotted(body, scanned_path)) if scanned_path else None
+
+    def echo(b) -> str:
+        return (scanned(b) or "") if scanned else ""
+
     # Specs may describe a path in prose ("/v1/jobs (server_endpoint + ...)"): keep the
     # leading path token, drop anything that is not a path.
-    paths = [str(r["path"]).split()[0] for r in spec.get("requests") or []
-             if str(r.get("path") or "").startswith("/")]
+    routes = tuple(str(r["path"]).split()[0] for r in spec.get("requests") or []
+                   if str(r.get("path") or "").startswith("/"))
     return Protocol(
-        name=f"{spec['vendor']} guardrail API (as called by LiteLLM)",
-        verdicts={"allow": lambda b, m: _fill(allow, "", _scanned_text(b)),
-                  "block": lambda b, m: _fill(block, "", _scanned_text(b)),
-                  "modify": (lambda b, m: _fill(modify, m, _scanned_text(b))) if modify
-                  else (lambda b, m: _fill(allow, "", _scanned_text(b)))},
-        stage_of=lambda body: None, trust_listener=True,
-        # One fixed path is checked; several, or a templated one (/guards/<name>/...), are not.
-        path=paths[0] if len(paths) == 1 and "<" not in paths[0] else "")
+        name=f"{spec['vendor']} guardrail API (as called by its integration)",
+        verdicts={"allow": lambda b, m: _fill(allow, "", echo(b)),
+                  "block": lambda b, m: _fill(block, "", echo(b)),
+                  "modify": (lambda b, m: _fill(modify, m, echo(b))) if modify
+                  else (lambda b, m: _fill(allow, "", echo(b)))},
+        stage_of=lambda body: None, trust_listener=True, routes=routes, scanned=scanned)
 
 
 class LiteLLMVendor(Adapter):
@@ -1079,6 +1079,8 @@ class LiteLLMVendor(Adapter):
         self.capabilities = {"input", "output"} | ({"modify_input", "modify_output"} if spec.get("modify_response")
                                                    else set())
         modes = set(spec.get("supported_modes") or ["pre_call", "post_call"])
+        if not modes & {"pre_call", "post_call"}:
+            raise ValueError(f"{spec['vendor']}: no pre_call or post_call mode — nothing gcl can exercise")
         if "post_call" not in modes:
             self.capabilities -= {"output", "modify_output"}
         if "pre_call" not in modes:
@@ -1171,6 +1173,8 @@ class NemoVendor(NemoServer):
         self.protocol = proto
         self.capabilities = ({"input"} if spec.get("input_flow") else set()) | (
             {"output"} if spec.get("output_flow") else set())
+        if not self.capabilities:
+            raise ValueError(f"{spec['vendor']}: no input_flow or output_flow — nothing gcl can exercise")
         self.documented = {"default": {**_BASE, **(spec.get("documented") or {})}}
         self.documented_sources = {"default": {"source": f"vendor spec: {spec['vendor']} (from NeMo source)",
                                                "read_for": "nemoguardrails 0.24.1",

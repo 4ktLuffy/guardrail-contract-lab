@@ -72,10 +72,12 @@ def main() -> None:
             try:
                 r = asyncio.run(Runner.run(agent, body.get("messages", [])))
             except (InputGuardrailTripwireTriggered, OutputGuardrailTripwireTriggered) as e:
-                self._json(400, {"error": {"type": type(e).__name__, "message": str(e), "detail": repr(e)}})
+                self._json(400, {"error": {"type": type(e).__name__, "message": str(e), "detail": repr(e),
+                                           "attrs": {k: repr(v) for k, v in vars(e).items()}}})
                 return
             except Exception as e:
-                self._json(500, {"error": {"type": type(e).__name__, "message": str(e), "detail": repr(e)}})
+                self._json(500, {"error": {"type": type(e).__name__, "message": str(e), "detail": repr(e),
+                                           "attrs": {k: repr(v) for k, v in vars(e).items()}}})
                 return
             answer = {"role": "assistant", "content": str(r.final_output)}
             self._json(200, {"choices": [{"index": 0, "message": answer}],

@@ -170,8 +170,9 @@ whole, so a gateway that strips the marker but forwards the text, keeps part of 
 original in a rewrite, or forwards a second after rejecting the client is caught; a
 check that runs alongside the model call is reported as "blocked after send" — the client
 was refused, but the provider already saw the prompt; and a reply that is refused in the
-answer but still returned in the library's result is "retained". Adapters
-translate protocols only; they never interpret a verdict.
+answer but still returned in the library's result is "retained". Adapters translate protocols only and never interpret a verdict — except where a
+framework ships no guard of its own (Pydantic AI, Guardrails AI): there the driver
+supplies the strictest guard, and the run tests the framework's enforcement.
 
 Every scenario gets **two verdicts**: *policy* (strict fail-closed) and *documented*
 (does it match the integration's own docs for this configuration? the report quotes the
@@ -188,8 +189,8 @@ just that scenario (`--scenario ID`).
 
 #### Vendor guardrails from a spec file
 
-LiteLLM and NeMo Guardrails each ship dozens of vendor guardrail integrations. Instead of
-an adapter per vendor, describe the vendor once:
+LiteLLM and NeMo Guardrails each ship dozens of vendor guardrail integrations. For vendors
+that answer one POST per check, describe the vendor once instead of writing an adapter:
 
 ```json
 {"vendor": "acme", "guardrail": "acme", "litellm_params": {"api_key": "x"},

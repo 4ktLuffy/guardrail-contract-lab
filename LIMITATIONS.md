@@ -67,21 +67,26 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
 - Where a framework ships no guard of its own (Pydantic AI), the driver supplies the
   strictest guard (allow only on an explicit allow, raise on anything else), so those
   runs test the framework's enforcement, not a vendor's guard.
-- Tool probing uses one harmless tool called once on the first model turn; for agent
-  adapters the stand-in judge answers after a fixed delay (1 s) to model a real LLM
-  check, so races between a parallel check and the model are visible. With an instant
+- Tool probing uses one harmless tool called once on the first model turn; for the
+  Agents SDK and Pydantic AI adapters the stand-in answers after a fixed delay (1 s) to
+  model a real LLM check, so races between a parallel check and the model are visible. With an instant
   judge some races are not.
 - When one guard client serves both stages (one URL), refusing it refuses both, so the
   output-stage "refused" scenario is not run for it.
 - Judges are told apart by a per-stage model name or URL where the integration allows
-  it; otherwise by the markers in the request, and a request carrying both or neither
-  is rejected rather than guessed.
+  it; otherwise by the markers in the request: exactly one scenario's markers are
+  required (an output check may carry that scenario's user turn), anything else is
+  rejected rather than guessed.
+- Vendor specs cover vendors that answer one POST per check with a fixed body (plus the
+  checked text via ECHO_TEXT and an explicit `scanned_path`). Multi-step protocols,
+  response headers and websocket streams are not modelled.
 - A guard that calls the same endpoint as the model (LLM-as-judge on a shared client)
   cannot be "refused" without refusing the model too, so that scenario is skipped for it.
   Libraries without a server run behind a small gcl driver: the library's block
   exception becomes HTTP 400, any other exception 500, a return value 200. The driver
-  passes the full exception text and the full return value (every message or field the
-  caller receives) to the client, so the judge sees what an application would see.
+  passes the exception's text, repr and attributes, and the return-value fields the
+  library's docs tell callers to use: close to, not provably, everything a caller
+  could inspect.
 - Leak detection looks for the whole original, its marker, or any fragment of it (two
   consecutive words, or four characters in Chinese/Japanese). A paraphrase of the
   original is not detected.

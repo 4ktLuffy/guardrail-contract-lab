@@ -63,7 +63,8 @@ def main() -> None:
             try:
                 out = Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
             except Exception as e:
-                self._json(500, {"error": {"type": type(e).__name__, "message": str(e), "detail": repr(e)}})
+                self._json(500, {"error": {"type": type(e).__name__, "message": str(e), "detail": repr(e),
+                                           "attrs": {k: repr(v) for k, v in vars(e).items()}}})
                 return
             self._json(200, {"choices": [{"index": 0, "message": {"role": "assistant", "content": str(out.raw)}}],
                              "library_return": repr(out)})

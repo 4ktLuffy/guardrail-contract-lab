@@ -1081,6 +1081,8 @@ class LiteLLMVendor(Adapter):
         modes = set(spec.get("supported_modes") or ["pre_call", "post_call"])
         if "post_call" not in modes:
             self.capabilities -= {"output", "modify_output"}
+        if "pre_call" not in modes:
+            self.capabilities -= {"input", "modify_input"}
         self.documented = {"default": {**_BASE, **(spec.get("documented") or {})}}
         self.documented_sources = {"default": {"source": f"vendor spec: {spec['vendor']} (from LiteLLM source)",
                                                "read_for": "litellm 1.104.2",

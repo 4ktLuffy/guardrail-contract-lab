@@ -437,6 +437,18 @@ def test_vendor_spec_builds_a_protocol_served_per_listener(tmp_path):
         assert [e["stage"] for e in sc.events] == ["input", "output"]  # staged by port, not body
 
 
+def test_an_output_only_integration_gets_output_controls_and_faults(tmp_path):
+    from gcl.enforce.adapters import LiteLLMVendor
+
+    spec = {"vendor": "acme", "guardrail": "acme", "supported_modes": ["post_call"],
+            "allow_response": {"ok": True}, "block_response": {"ok": False}}
+    sc = build_scenarios(LiteLLMVendor(sys.executable, tmp_path, spec=spec))
+    modes = {(s.stage, s.mode) for s in sc}
+    assert ("input", "allow") in modes and ("input", "block") not in modes
+    assert ("output", "block") in modes and ("output", "error") in modes
+    assert not any(s.stage == "input" and not s.control for s in sc)
+
+
 def test_adapters_registry():
     assert set(ADAPTERS) == {"litellm", "nemo", "nemo-selfcheck", "openai-guardrails", "portkey",
                              "langchain-moderation", "mastra", "openai-agents", "pydantic-ai", "litellm-vendor",

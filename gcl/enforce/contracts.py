@@ -125,7 +125,11 @@ class Result:
 
 def build_scenarios(adapter: Adapter) -> list[Scenario]:
     caps = adapter.capabilities
-    plan: list[tuple[str, str, bool]] = [("input", "allow", True), ("input", "block", True)]
+    # The input allow control always runs: it proves requests reach the model at all. An
+    # integration that checks only the output gets no input block control or input faults.
+    plan: list[tuple[str, str, bool]] = [("input", "allow", True)]
+    if "input" in caps:
+        plan.append(("input", "block", True))
     if "output" in caps:
         plan += [("output", "allow", True), ("output", "block", True)]
     # A guard that shares the model's endpoint cannot be refused on its own.
@@ -135,7 +139,8 @@ def build_scenarios(adapter: Adapter) -> list[Scenario]:
     # One URL for both stages: an output "refused" also refuses the input check, so it
     # cannot be told apart from an input failure. Not staged.
     out_faults = [f for f in faults if not (f == "refused" and proto.single_listener)]
-    plan += [("input", f, False) for f in faults]
+    if "input" in caps:
+        plan += [("input", f, False) for f in faults]
     if "modify_input" in caps:
         plan.append(("input", "modify", False))
     if "output" in caps:
@@ -453,7 +458,8 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
             return "the integration was still busy when the scenario ended; a clean result is not proven"
         if s.stage == "output" and ev["model_input"] != "passed":
             return "the model never received this scenario's request, so no reply was generated"
-        if s.mode != "refused" and ev["scanner_consulted_stage"] == 0:
+        unchecked_input = s.stage == "input" and "input" not in adapter.capabilities
+        if s.mode != "refused" and ev["scanner_consulted_stage"] == 0 and not unchecked_input:
             return "the scanner was never consulted for this stage with this scenario's text"
         return None
 

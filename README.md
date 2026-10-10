@@ -153,7 +153,7 @@ Drives a **real** guardrail integration end to end, offline: LiteLLM's proxy gua
 jailbreak-detection and self-check rails, openai-guardrails' LLM checks in Python and JavaScript (a small driver serves the
 library over HTTP), the Portkey gateway's webhook guardrails (Node: `--env DIR`), LangChain's
 OpenAI moderation middleware, Mastra's model-backed processors, the OpenAI Agents SDK with openai-guardrails'
-`GuardrailAgent`, Pydantic AI's harness guardrails, CrewAI's `LLMGuardrail`, Guardrails AI's `Guard` (Python API and RAIL), Invariant Gateway's MCP proxy (gcl plays
+`GuardrailAgent`, Pydantic AI's harness guardrails, Google ADK's model callbacks, CrewAI's `LLMGuardrail`, Guardrails AI's `Guard` (Python API and RAIL), Invariant Gateway's MCP proxy (gcl plays
 the MCP client and a mock MCP server), Agno's built-in guardrails, or the bundled
 reference gateway. A report notes when one request ran a tool more than once (retries that
 re-execute side effects). Integrations with sessions also get a retry scenario (the same
@@ -174,7 +174,7 @@ original in a rewrite, or forwards a second after rejecting the client is caught
 check that runs alongside the model call is reported as "blocked after send" — the client
 was refused, but the provider already saw the prompt; and a reply that is refused in the
 answer but still returned in the library's result is "retained". Adapters translate protocols only and never interpret a verdict — except where a
-framework ships no guard of its own (Pydantic AI, Guardrails AI): there the driver
+framework ships no guard of its own (Pydantic AI, Google ADK, Guardrails AI): there the driver
 supplies the strictest guard, and the run tests the framework's enforcement.
 
 Every scenario gets **two verdicts**: *policy* (strict fail-closed) and *documented*

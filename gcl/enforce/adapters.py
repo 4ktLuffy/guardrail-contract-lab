@@ -1505,10 +1505,55 @@ class OpenAIGuardrailsJS(OpenAIGuardrails):
         _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 60, self.log)
 
 
+# --------------------------------------------------------------------------- Google ADK
+class GoogleADK(PydanticAI):
+    """A Google ADK `LlmAgent` (LiteLlm model) with gcl's strictest guard as
+    `before_model_callback` and `after_model_callback`, plus the probe tool. ADK ships no
+    guard: the run tests ADK's enforcement of callbacks."""
+
+    name = "google-adk"
+    scanner_latency_s = 0.0
+    _F = ("error", "timeout", "malformed", "empty", "wrong_schema", "unknown_verdict", "verdict_type", "refused")
+    documented: ClassVar[dict] = {"default": {**_BASE, **{f: "stopped" for f in _F}}}
+    documented_sources: ClassVar[dict] = {"default": {
+        "source": "google-adk 2.11.0: callbacks docs (before_model_callback / after_model_callback) and "
+                  "plugins/plugin_manager.py",
+        "read_for": "google-adk 2.11.0",
+        "passage": "Returning an LlmResponse from before_model_callback skips the model call; from "
+                   "after_model_callback it replaces the response. An exception raised in a callback "
+                   "propagates."}}
+
+    def __init__(self, python: str, workdir: Path, profile: str = "default"):
+        Adapter.__init__(self, python, workdir, profile)
+
+    def config_summary(self) -> dict:
+        return {"agent": "google.adk LlmAgent(model=LiteLlm)", "callbacks": ["before_model", "after_model"],
+                "guard": "gcl strict HTTP guard", "tools": ["gcl_probe"]}
+
+    def versions(self) -> dict:
+        return _versions(self.python, ["google-adk", "litellm"])
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        self.port = _free_port()
+        path = self.protocol.path
+        cmd = [self.python, str(_driver_path("google_adk_driver.py")), "--port", str(self.port),
+               "--model-base", model.openai_base, "--tool-url", model.tool_url,
+               "--input-guard", f"{scanner.base_for('input')}{path}",
+               "--output-guard", f"{scanner.base_for('output')}{path}"]
+        env = dict(os.environ, NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost",
+                   LITELLM_LOCAL_MODEL_COST_MAP="True", OPENAI_API_KEY="sk-gcl")
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env,
+                                         start_new_session=True, cwd=str(self.workdir))
+        _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 120, self.log)
+
+
 ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": OpenAIGuardrails,
             "nemo-selfcheck": NemoSelfCheck, "portkey": PortkeyGateway,
             "langchain-moderation": LangChainModeration, "mastra": MastraAgent, "openai-agents": OpenAIAgents,
             "pydantic-ai": PydanticAI, "litellm-vendor": LiteLLMVendor,
             "nemo-vendor": NemoVendor, "crewai": CrewAITask,
             "guardrails-ai": GuardrailsAI, "invariant-mcp": InvariantMCP,
-            "agno": AgnoAgent, "openai-guardrails-js": OpenAIGuardrailsJS, "reference": ReferenceGateway}
+            "agno": AgnoAgent, "openai-guardrails-js": OpenAIGuardrailsJS,
+            "google-adk": GoogleADK, "reference": ReferenceGateway}

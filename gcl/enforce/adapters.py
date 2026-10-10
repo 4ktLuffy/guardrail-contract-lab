@@ -1549,6 +1549,75 @@ class GoogleADK(PydanticAI):
         _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 120, self.log)
 
 
+# --------------------------------------------------------------------------- MCP: Lasso mcp-gateway
+LASSO_CLASSIFY = Protocol(
+    name="Lasso guardrail API v3 (POST /gateway/v3/classify), as called by mcp-gateway",
+    verdicts={"allow": lambda b, m: {"violations_detected": False, "deputies": {"jailbreak": False}},
+              "block": lambda b, m: {"violations_detected": True, "deputies": {"jailbreak": True}},
+              "modify": lambda b, m: {"violations_detected": False, "deputies": {"jailbreak": False}}},
+    stage_of=lambda body: {"PROMPT": "input", "COMPLETION": "output"}.get(body.get("messageType")),
+    routes=("/gateway/v3/classify",), single_listener=True,
+)
+
+
+class LassoMCPGateway(Adapter):
+    """Lasso's mcp-gateway (stdio MCP proxy) with its `lasso` guardrail plugin, in front of
+    a stdio mock MCP server. The plugin manager loads plugins with an empty config, so the
+    plugin's API URL is set by a launcher that changes only that default."""
+
+    name = "lasso-mcp-gateway"
+    protocol = LASSO_CLASSIFY
+    capabilities: ClassVar[set[str]] = {"input", "output"}
+    default_timeout_s = 30.0
+    # Plugin docstrings: process_request "Blocks the request by returning None if violations
+    # are found"; the code comments say unexpected errors "let the request through (fail
+    # open)". A missing API key skips the check with a warning.
+    documented: ClassVar[dict] = {"default": dict(_BASE),
+                                  "no_key": {**_BASE, "block": "passed"}}
+    documented_sources: ClassVar[dict] = {"default": {
+        "source": "mcp-gateway 1.2.1: mcp_gateway/plugins/guardrails/lasso.py (docstrings and comments)",
+        "read_for": "mcp-gateway 1.2.1",
+        "passage": "Blocks the request by returning None if violations are found. On unexpected errors, let "
+                   "the request through (fail open). Lasso API key not configured, skipping guardrail check."}}
+    documented_sources["no_key"] = documented_sources["default"]
+
+    def config_summary(self) -> dict:
+        return {"gateway": "mcp-gateway -p lasso (stdio)", "upstream": "stdio mock MCP server",
+                "lasso_api_key": self.profile != "no_key", "change": "plugin api_base default only"}
+
+    def versions(self) -> dict:
+        return _versions(self.python, ["mcp-gateway", "mcp"])
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        upstream = {"command": self.python, "args": [str(_driver_path("stdio_mcp_server.py")), "--mock", model.base]}
+        cfg = {"mcpServers": {"mcp-gateway": {"command": "mcp-gateway", "args": [], "servers": {"gcl": upstream}}}}
+        self._cfg_path = self.workdir / "mcp.json"
+        self._cfg_path.write_text(json.dumps(cfg, indent=2))
+        self.port = _free_port()
+        env = dict(os.environ, NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost",
+                   GCL_LASSO_URL=f"{scanner.base_for('input')}/gateway/v3/classify")
+        if self.profile == "no_key":
+            env.pop("LASSO_API_KEY", None)
+        else:
+            env["LASSO_API_KEY"] = "lasso-gcl"
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen([self.python, str(_driver_path("lasso_mcp_driver.py")),
+                                          "--port", str(self.port), "--config", str(self._cfg_path),
+                                          "--python", self.python],
+                                         stdout=logf, stderr=subprocess.STDOUT, env=env, start_new_session=True,
+                                         cwd=str(self.workdir))
+        _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 60, self.log)
+
+    def config_files(self) -> dict:
+        p = getattr(self, "_cfg_path", None)
+        return {p.name: p.read_text()} if p and p.exists() else {}
+
+    def call(self, messages: list[dict], timeout_s: float) -> Observation:
+        return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                     {"model": "gcl-mock", "messages": messages}, None, timeout_s)
+
+
 ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": OpenAIGuardrails,
             "nemo-selfcheck": NemoSelfCheck, "portkey": PortkeyGateway,
             "langchain-moderation": LangChainModeration, "mastra": MastraAgent, "openai-agents": OpenAIAgents,
@@ -1556,4 +1625,4 @@ ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": Op
             "nemo-vendor": NemoVendor, "crewai": CrewAITask,
             "guardrails-ai": GuardrailsAI, "invariant-mcp": InvariantMCP,
             "agno": AgnoAgent, "openai-guardrails-js": OpenAIGuardrailsJS,
-            "google-adk": GoogleADK, "reference": ReferenceGateway}
+            "google-adk": GoogleADK, "lasso-mcp-gateway": LassoMCPGateway, "reference": ReferenceGateway}

@@ -58,7 +58,7 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
 - Offline by design: a scripted stand-in scanner and a mock model replace the real
   services. Results show how the integration's own enforcement code handles the scripted
   inputs — not detector accuracy, production networking, or every configuration.
-- Sixteen built-in targets, plus any LiteLLM or NeMo vendor guardrail described by a
+- Seventeen built-in targets, plus any LiteLLM or NeMo vendor guardrail described by a
   spec file:
   - LiteLLM `generic_guardrail_api` (pre_call + post_call)
   - NeMo Guardrails: `jailbreak detection model`; self-check input/output
@@ -72,6 +72,8 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   - Guardrails AI `Guard` (Python API and RAIL)
   - Invariant Gateway MCP proxy (streamable HTTP with JSON responses; SSE and stdio
     transports are not modelled)
+  - Lasso mcp-gateway `lasso` plugin (stdio MCP; the plugin's API URL is set by a
+    launcher because its plugin manager passes no config)
   - Agno `OpenAIModerationGuardrail` (input only)
   - the bundled reference gateway
 - Where a framework ships no guard of its own (Pydantic AI, Google ADK, Guardrails AI), the driver supplies the

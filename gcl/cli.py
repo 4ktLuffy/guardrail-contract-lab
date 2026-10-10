@@ -302,6 +302,9 @@ def enforce(
                                           "judged (default: exit 2, the run is incomplete)."),
     scenario: list[str] = typer.Option([], help="Run only this scenario id (repeatable); the "
                                        "controls always run. Repro bundles print the command."),
+    spec: Path | None = typer.Option(None, exists=True, dir_okay=False,
+                                     help="For litellm-vendor: a vendor spec JSON (guardrail type, params, "
+                                          "the vendor's request path and allow/block bodies)."),
 ):
     """Does a real guardrail integration enforce what its scanner decides?"""
     import tempfile
@@ -324,7 +327,14 @@ def enforce(
         flag = "--env" if cls.runtime == "node" else "--python"
         raise typer.BadParameter(f"{integration} needs {flag}", param_hint=flag)
     workdir = Path(tempfile.mkdtemp(prefix="gcl-enforce-"))
-    adapter = cls(str(where), workdir, profile)
+    if integration in ("litellm-vendor", "nemo-vendor"):
+        if spec is None:
+            raise typer.BadParameter(f"{integration} needs --spec FILE", param_hint="--spec")
+        import json
+
+        adapter = cls(str(where), workdir, profile, spec=json.loads(spec.read_text()))
+    else:
+        adapter = cls(str(where), workdir, profile)
     try:
         run = run_contracts(adapter, timeout or adapter.default_timeout_s, progress=_say,
                             only=set(scenario) or None)
@@ -337,7 +347,8 @@ def enforce(
     if out:
         _write_outputs(doc, out, _formats(format), render_html)
         flag = "--env" if cls.runtime == "node" else "--python"
-        replay = (f"gcl enforce {integration} {flag} {where} --profile {profile} "
+        extra = f" --spec {spec}" if spec else ""
+        replay = (f"gcl enforce {integration} {flag} {where} --profile {profile}{extra} "
                   f"--timeout {run['timeout_s']:g}")
         bundles = write_bundles(run, out, replay)
         typer.echo(f"\nReports: {out}/" + (f"  ({len(bundles)} repro bundle(s) in {out}/repro/)" if bundles else ""))

@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -369,8 +370,9 @@ class NemoServer(Adapter):
 
     def _launch(self, cfgdir: Path) -> None:
         self.port = _free_port()
-        env = dict(os.environ, OPENAI_API_KEY="sk-gcl", DEFAULT_CONFIG_ID="gcl",
-                   NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost")
+        env = {**os.environ, "OPENAI_API_KEY": "sk-gcl", "DEFAULT_CONFIG_ID": "gcl",
+               "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost",
+               **getattr(self, "_extra_env", {})}
         exe = str(Path(self.python).with_name("nemoguardrails"))
         with open(self.log, "w") as logf:
             self.proc = subprocess.Popen([exe, "server", "--config", str(cfgdir.parent),
@@ -550,11 +552,18 @@ def _chat_envelope(text: str) -> dict:
 
 def _stage_by_sentinel(body: dict) -> str | None:
     """Fallback stage inference for a guard that shares one URL and one model name
-    across stages: output if the body carries a reply marker and no user marker, input
-    for the reverse, None (rejected, never counted) when it carries both or neither."""
+    across stages. Scenarios are single-turn and their markers unique, so a reply marker
+    can only be present once the model has answered: a body carrying this scenario's
+    reply marker (with or without its user marker) is an output check; a user marker
+    alone is an input check. Markers from different scenarios, or none, are rejected."""
     text = json.dumps(body, ensure_ascii=False)
-    u, r = "GCL-U-" in text, "GCL-R-" in text
-    return "output" if r and not u else "input" if u and not r else None
+    u = set(re.findall(r"GCL-U-([io]\d{2})", text))
+    r = set(re.findall(r"GCL-R-([io]\d{2})", text))
+    if r and (not u or r == u):
+        return "output"
+    if u and not r:
+        return "input"
+    return None
 
 
 def _refusal_envelope() -> dict:
@@ -1002,7 +1011,197 @@ class PydanticAI(Adapter):
                      {"model": "gcl-mock", "messages": messages}, None, timeout_s)
 
 
+# --------------------------------------------------------------------------- LiteLLM vendor hooks
+def _fill(obj, text: str, echo: str = ""):
+    """Replace MODIFY_TEXT (the rewrite) and ECHO_TEXT (the text the vendor was sent)
+    anywhere in a JSON-like value."""
+    if isinstance(obj, str):
+        return obj.replace("MODIFY_TEXT", text).replace("ECHO_TEXT", echo)
+    if isinstance(obj, dict):
+        return {k: _fill(v, text, echo) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_fill(v, text, echo) for v in obj]
+    return obj
+
+
+def _scanned_text(body) -> str:
+    """The text a vendor request carries: the longest string value with a gcl marker."""
+    strings = [x for x in _strings_of(body) if "GCL-" in x]
+    return max(strings, key=len) if strings else ""
+
+
+def _strings_of(obj) -> list[str]:
+    if isinstance(obj, str):
+        return [obj]
+    if isinstance(obj, dict):
+        return [x for v in obj.values() for x in _strings_of(v)]
+    if isinstance(obj, list):
+        return [x for v in obj for x in _strings_of(v)]
+    return []
+
+
+def vendor_protocol(spec: dict) -> Protocol:
+    """A scanner protocol built from a vendor spec file: the vendor's own allow, block and
+    (optionally) rewrite bodies, served on one listener per stage."""
+    allow, block, modify = spec["allow_response"], spec["block_response"], spec.get("modify_response")
+    # Specs may describe a path in prose ("/v1/jobs (server_endpoint + ...)"): keep the
+    # leading path token, drop anything that is not a path.
+    paths = [str(r["path"]).split()[0] for r in spec.get("requests") or []
+             if str(r.get("path") or "").startswith("/")]
+    return Protocol(
+        name=f"{spec['vendor']} guardrail API (as called by LiteLLM)",
+        verdicts={"allow": lambda b, m: _fill(allow, "", _scanned_text(b)),
+                  "block": lambda b, m: _fill(block, "", _scanned_text(b)),
+                  "modify": (lambda b, m: _fill(modify, m, _scanned_text(b))) if modify
+                  else (lambda b, m: _fill(allow, "", _scanned_text(b)))},
+        stage_of=lambda body: None, trust_listener=True,
+        # One fixed path is checked; several, or a templated one (/guards/<name>/...), are not.
+        path=paths[0] if len(paths) == 1 and "<" not in paths[0] else "")
+
+
+class LiteLLMVendor(Adapter):
+    """Any LiteLLM vendor guardrail hook, described by a spec file (`--spec`): the
+    guardrail type, its parameters, the vendor's request path and its allow/block
+    bodies. The hook runs twice — pre_call against the input listener, post_call against
+    the output listener — inside the real LiteLLM proxy."""
+
+    name = "litellm-vendor"
+    capabilities: ClassVar[set[str]] = {"input", "output"}
+    documented: ClassVar[dict] = {"default": dict(_BASE)}
+    default_timeout_s = 45.0
+
+    def __init__(self, python: str, workdir: Path, profile: str = "default", spec: dict | None = None):
+        super().__init__(python, workdir, profile)
+        if spec is None:
+            raise ValueError("litellm-vendor needs --spec FILE")
+        self.spec = spec
+        self.protocol = vendor_protocol(spec)
+        self.capabilities = {"input", "output"} | ({"modify_input", "modify_output"} if spec.get("modify_response")
+                                                   else set())
+        modes = set(spec.get("supported_modes") or ["pre_call", "post_call"])
+        if "post_call" not in modes:
+            self.capabilities -= {"output", "modify_output"}
+        self.documented = {"default": {**_BASE, **(spec.get("documented") or {})}}
+        self.documented_sources = {"default": {"source": f"vendor spec: {spec['vendor']} (from LiteLLM source)",
+                                               "read_for": "litellm 1.104.2",
+                                               "passage": spec.get("docs_claims") or "no failure behaviour documented"}}
+        self.name = f"litellm-{spec['vendor']}"
+        self.log = self.workdir / f"{self.name}-{profile}.log"
+
+    def config_summary(self) -> dict:
+        return {"guardrail": self.spec["guardrail"], "modes": sorted({"pre_call", "post_call"}
+                                                                     & set(self.spec.get("supported_modes") or [])),
+                **{k: v for k, v in (self.spec.get("litellm_params") or {}).items() if "key" not in k.lower()}}
+
+    def versions(self) -> dict:
+        return _versions(self.python, ["litellm"])
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        base_param = (self.spec.get("api_base_param") or "api_base").split()[0]
+        # A spec may write the base URL as http://127.0.0.1:PORT/<suffix>: keep the suffix.
+        given = str((self.spec.get("litellm_params") or {}).get(base_param, ""))
+        m = re.search(r"127\.0\.0\.1:<?PORT>?(.*)$", given)
+        suffix = m.group(1) if m else ""
+        modes = set(self.spec.get("supported_modes") or ["pre_call", "post_call"])
+        guards = []
+        for mode, stage in (("pre_call", "input"), ("post_call", "output")):
+            if mode in modes:
+                guards.append({"guardrail_name": f"gcl-{stage}", "litellm_params": {
+                    **(self.spec.get("litellm_params") or {}), "guardrail": self.spec["guardrail"], "mode": mode,
+                    base_param: scanner.base_for(stage) + suffix, "default_on": True}})
+        cfg = {"model_list": [{"model_name": "gcl-model",
+                               "litellm_params": {"model": f"openai/{model.model}", "api_base": model.openai_base,
+                                                  "api_key": "sk-gcl"}}],
+               "guardrails": guards, "general_settings": {"master_key": LiteLLMProxy.master_key}}
+        self._cfg_path = self.workdir / f"{self.name}.yaml"
+        self._cfg_path.write_text(json.dumps(cfg, indent=2))
+        self.port = _free_port()
+        env = {**os.environ, "LITELLM_LOCAL_MODEL_COST_MAP": "True", "NO_PROXY": "127.0.0.1,localhost",
+               "no_proxy": "127.0.0.1,localhost",
+               **{k: str(v) for k, v in (self.spec.get("env") or {}).items() if not str(v).startswith("(")}}
+        exe = str(Path(self.python).with_name("litellm"))
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen([exe, "--config", str(self._cfg_path), "--host", "127.0.0.1",
+                                          "--port", str(self.port)], stdout=logf, stderr=subprocess.STDOUT,
+                                         env=env, start_new_session=True)
+        _wait_http(f"http://127.0.0.1:{self.port}/health/liveliness", self.proc, 120, self.log)
+
+    def config_files(self) -> dict:
+        p = getattr(self, "_cfg_path", None)
+        return {p.name: p.read_text()} if p and p.exists() else {}
+
+    def call(self, messages: list[dict], timeout_s: float) -> Observation:
+        return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                     {"model": "gcl-model", "messages": messages},
+                     {"Authorization": f"Bearer {LiteLLMProxy.master_key}"}, timeout_s)
+
+
+# --------------------------------------------------------------------------- NeMo vendor rails
+def _replace_url(obj, url: str):
+    if isinstance(obj, str):
+        return obj.replace("STANDIN_URL", url)
+    if isinstance(obj, dict):
+        return {k: _replace_url(v, url) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_replace_url(v, url) for v in obj]
+    return obj
+
+
+class NemoVendor(NemoServer):
+    """Any NeMo Guardrails vendor rail, described by a spec file (`--spec`): the input /
+    output flow names, its rails.config block and env, the vendor path and its allow /
+    block bodies. NeMo configures one endpoint per vendor, so both stages share one
+    listener and are told apart by the text they carry."""
+
+    name = "nemo-vendor"
+    documented: ClassVar[dict] = {"default": dict(_BASE)}
+    known_issues: ClassVar[dict] = {}
+
+    def __init__(self, python: str, workdir: Path, profile: str = "default", spec: dict | None = None):
+        super().__init__(python, workdir, profile)
+        if spec is None:
+            raise ValueError("nemo-vendor needs --spec FILE")
+        self.spec = spec
+        proto = vendor_protocol(spec)
+        proto.trust_listener, proto.single_listener = False, True
+        proto.stage_of = _stage_by_sentinel
+        self.protocol = proto
+        self.capabilities = ({"input"} if spec.get("input_flow") else set()) | (
+            {"output"} if spec.get("output_flow") else set())
+        self.documented = {"default": {**_BASE, **(spec.get("documented") or {})}}
+        self.documented_sources = {"default": {"source": f"vendor spec: {spec['vendor']} (from NeMo source)",
+                                               "read_for": "nemoguardrails 0.24.1",
+                                               "passage": spec.get("docs_claims") or "no failure behaviour documented"}}
+        self.name = f"nemo-{spec['vendor']}"
+        self.log = self.workdir / f"{self.name}-{profile}.log"
+
+    def config_summary(self) -> dict:
+        return {"input_flow": self.spec.get("input_flow"), "output_flow": self.spec.get("output_flow")}
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        cfgdir = self.workdir / "nemo-configs" / "gcl"
+        cfgdir.mkdir(parents=True, exist_ok=True)
+        url = scanner.base_for("input")
+        rails: dict = {"config": _replace_url(self.spec.get("rails_config") or {}, url)}
+        if self.spec.get("input_flow"):
+            rails["input"] = {"flows": [self.spec["input_flow"]]}
+        if self.spec.get("output_flow"):
+            rails["output"] = {"flows": [self.spec["output_flow"]]}
+        cfg = {"models": [{"type": "main", "engine": "openai", "model": model.model,
+                           "parameters": {"base_url": model.openai_base, "api_key": "sk-gcl"}}], "rails": rails}
+        (cfgdir / "config.yml").write_text(json.dumps(cfg, indent=2))
+        # Some vendor flows refuse with bot messages they do not define themselves.
+        (cfgdir / "rails.co").write_text(
+            'define bot refuse to respond\n  "I\'m sorry, I can\'t respond to that."\n\n'
+            'define bot inform answer unknown\n  "I don\'t know the answer to that."\n')
+        self._cfg_path = cfgdir / "config.yml"
+        self._extra_env = {k: str(v).replace("STANDIN_URL", url) for k, v in (self.spec.get("env") or {}).items()}
+        self._launch(cfgdir)
+
+
 ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": OpenAIGuardrails,
             "nemo-selfcheck": NemoSelfCheck, "portkey": PortkeyGateway,
             "langchain-moderation": LangChainModeration, "mastra": MastraAgent, "openai-agents": OpenAIAgents,
-            "pydantic-ai": PydanticAI, "reference": ReferenceGateway}
+            "pydantic-ai": PydanticAI, "litellm-vendor": LiteLLMVendor,
+            "nemo-vendor": NemoVendor, "reference": ReferenceGateway}

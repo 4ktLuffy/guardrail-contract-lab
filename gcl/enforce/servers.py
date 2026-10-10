@@ -436,33 +436,64 @@ class StandInScanner:
         return H
 
 
-def _type_confuse(resp: dict) -> dict:
-    """The block verdict with the right meaning in the wrong type: booleans as strings
-    ("true"/"false"), verdict keywords in lower case. What a scanner written in another
-    language, or a hand-rolled JSON template, sends. A parser that tests truthiness reads
-    the string "false" as true."""
-    out = {}
-    for key, val in resp.items():
-        if isinstance(val, bool):
-            out[key] = "true" if val else "false"
-        elif isinstance(val, str) and key in ("action", "verdict", "decision", "result") and val.isupper():
-            out[key] = val.lower()
-        else:
-            out[key] = val
-    return out
+_VERDICT_KEYS = ("action", "verdict", "decision", "result", "outcome", "status", "flagged", "blocked",
+                 "is_safe", "safe", "jailbreak", "violation", "violations_detected", "required_action")
 
 
-def _mangle_verdict(resp: dict) -> dict:
-    """A block verdict with its verdict field set to a value the protocol does not
-    define — what a scanner upgrade or a typo produces. A robust parser must not read
-    an unknown verdict as allow."""
-    out = dict(resp)
-    for key in ("action", "verdict", "decision", "result"):
-        if key in out:
-            out[key] = "DENY_UNKNOWN"
-            return out
-    for key, val in out.items():
+def _walk(obj, fn):
+    """Apply `fn(key, value) -> (changed, new)` depth-first; returns (changed, copy)."""
+    if isinstance(obj, dict):
+        changed, out = False, {}
+        for k, v in obj.items():
+            hit, nv = fn(k, v)
+            if not hit:
+                hit, nv = _walk(v, fn)
+            changed |= hit
+            out[k] = nv
+        return changed, out
+    if isinstance(obj, list):
+        changed, out = False, []
+        for v in obj:
+            hit, nv = _walk(v, fn)
+            changed |= hit
+            out.append(nv)
+        return changed, out
+    return False, obj
+
+
+def _type_confuse(resp):
+    """The block verdict with the right meaning in the wrong type, at any depth:
+    booleans as strings ("true"/"false"), upper-case verdict keywords in lower case. What
+    a scanner written in another language, or a hand-rolled JSON template, sends. A
+    parser that tests truthiness reads the string "false" as true."""
+    def fn(key, val):
         if isinstance(val, bool):
+            return True, "true" if val else "false"
+        if isinstance(val, str) and key in _VERDICT_KEYS and val.isupper():
+            return True, val.lower()
+        return False, val
+    return _walk(resp, fn)[1]
+
+
+def _mangle_verdict(resp):
+    """The block verdict with its verdict field (at any depth) set to a value the
+    protocol does not define — what a scanner upgrade or a typo produces. A robust parser
+    must not read an unknown verdict as allow. Only the first verdict field is changed."""
+    done = [False]
+
+    def fn(key, val):
+        if done[0]:
+            return False, val
+        if key in _VERDICT_KEYS and isinstance(val, (str, bool)):
+            done[0] = True
+            return True, "DENY_UNKNOWN" if isinstance(val, str) else "unknown"
+        return False, val
+    out = _walk(resp, fn)[1]
+    if done[0]:
+        return out
+    for key, val in out.items() if isinstance(out, dict) else ():
+        if isinstance(val, bool):  # no named verdict field: the first top-level boolean
+            out = dict(out)
             out[key] = "unknown"
             return out
     return out

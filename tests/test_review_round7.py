@@ -90,7 +90,8 @@ def test_documented_sets_accept_any_listed_outcome():
 def test_stage_inference_rejects_ambiguous_bodies():
     assert _stage_by_sentinel({"m": "hola GCL-U-i04"}) == "input"
     assert _stage_by_sentinel({"m": "réponse GCL-R-o02"}) == "output"
-    assert _stage_by_sentinel({"m": "hola GCL-U-i04 history GCL-R-o02"}) is None
+    assert _stage_by_sentinel({"m": "hola GCL-U-i04 history GCL-R-o02"}) is None   # two scenarios
+    assert _stage_by_sentinel({"m": "hola GCL-U-o04 reply GCL-R-o04"}) == "output"  # output check with context
     assert _stage_by_sentinel({"m": "nothing"}) is None
 
 
@@ -139,3 +140,14 @@ def test_the_block_marker_in_a_server_error_is_not_a_refusal():
     assert classify(S, sent, err) == "failed after send"
     ok = Observation(200, '{"choices": [{"message": {"content": "GCL-BLOCKED by the stand-in"}}]}', True, 0.1)
     assert classify(S, sent, ok) == "blocked after send"
+
+
+def test_verdict_faults_reach_nested_shapes():
+    from gcl.enforce.servers import _type_confuse
+
+    nested = {"id": "m", "results": [{"flagged": True, "categories": {"violence": True}}]}
+    assert _mangle_verdict(nested)["results"][0]["flagged"] == "unknown"
+    assert _type_confuse(nested)["results"][0]["flagged"] == "true"
+    # "result" names a verdict but holds a dict: the walk goes inside and changes the action.
+    inner = _mangle_verdict({"result": {"prompt": {"action": "block"}}})
+    assert inner["result"]["prompt"]["action"] == "DENY_UNKNOWN"

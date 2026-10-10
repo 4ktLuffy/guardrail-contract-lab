@@ -421,9 +421,26 @@ def test_mock_model_tool_mode_calls_the_tool_once_then_replies():
         assert len(m.tool_events) == 1
 
 
+def test_vendor_spec_builds_a_protocol_served_per_listener(tmp_path):
+    from gcl.enforce.adapters import LiteLLMVendor
+
+    spec = {"vendor": "acme", "guardrail": "acme", "litellm_params": {"api_key": "x"},
+            "requests": [{"path": "/v1/check"}], "supported_modes": ["pre_call", "post_call"],
+            "allow_response": {"verdict": "ok"}, "block_response": {"verdict": "deny", "why": "GCL-BLOCKED"},
+            "modify_response": {"verdict": "ok", "text": "MODIFY_TEXT"}}
+    a = LiteLLMVendor(sys.executable, tmp_path, spec=spec)
+    assert a.name == "litellm-acme" and "modify_output" in a.capabilities
+    with StandInScanner(a.protocol) as sc:
+        sc.configure({"input": "allow", "output": "modify"}, "nuevo texto")
+        assert _post_json(sc.base_for("input") + "/v1/check", {"anything": 1}) == {"verdict": "ok"}
+        assert _post_json(sc.base_for("output") + "/v1/check", {})["text"] == "nuevo texto"
+        assert [e["stage"] for e in sc.events] == ["input", "output"]  # staged by port, not body
+
+
 def test_adapters_registry():
     assert set(ADAPTERS) == {"litellm", "nemo", "nemo-selfcheck", "openai-guardrails", "portkey",
-                             "langchain-moderation", "mastra", "openai-agents", "pydantic-ai", "reference"}
+                             "langchain-moderation", "mastra", "openai-agents", "pydantic-ai", "litellm-vendor",
+                             "nemo-vendor", "reference"}
 
 
 # Real integrations: these pin what was observed on litellm 1.104.2 and nemoguardrails

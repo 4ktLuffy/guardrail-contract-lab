@@ -184,6 +184,26 @@ too. `--out` writes the report and a reproduction bundle for every scenario that
 cleanly hold: every attributed event, the generated config, and the command that reruns
 just that scenario (`--scenario ID`).
 
+#### Vendor guardrails from a spec file
+
+LiteLLM and NeMo Guardrails each ship dozens of vendor guardrail integrations. Instead of
+an adapter per vendor, describe the vendor once:
+
+```json
+{"vendor": "acme", "guardrail": "acme", "litellm_params": {"api_key": "x"},
+ "requests": [{"path": "/v1/check"}], "supported_modes": ["pre_call", "post_call"],
+ "allow_response": {"flagged": false}, "block_response": {"flagged": true}}
+```
+
+```bash
+gcl enforce litellm-vendor --spec acme.json --python /path/to/venv/bin/python
+gcl enforce nemo-vendor --spec acme-nemo.json --python /path/to/venv/bin/python
+```
+
+The real integration code runs unmodified; only the vendor's API is replaced. NeMo specs
+name the input/output flows and the `rails.config` block, with `STANDIN_URL` where the
+endpoint goes.
+
 ## What the static checks mean
 
 | Code | Level | Hazard |

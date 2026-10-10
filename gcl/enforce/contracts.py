@@ -256,16 +256,25 @@ def _classify_output_texts(s: Scenario, texts: list[str]) -> str | None:
     return None
 
 
+BLOCK_MARK = "GCL-BLOCKED"  # carried by the stand-in's block reasons, where a protocol has one
+
+
+def _refused(obs) -> bool:
+    """Explicit evidence the client was refused: a 4xx, or an answer carrying the
+    stand-in's block reason (integrations that return a refusal as a normal reply)."""
+    return (obs.status is not None and 400 <= obs.status < 500) or BLOCK_MARK in (obs.text or "")
+
+
 def classify(s: Scenario, bodies: list, obs) -> str:
     got = classify_input(s, bodies) if s.stage == "input" else classify_output(s, obs)
     if got == "passed" and s.stage == "input" and obs.finished:
         reply = f"{s.reply_text} {s.reply_sentinel}"
         if not any(reply in t for t in _client_strings(obs.text or "")):
             # The provider saw the prompt; what did the client get instead of the reply?
-            if obs.status is not None and 400 <= obs.status < 500:
-                return "blocked after send"
             if obs.status is not None and obs.status >= 500:
-                return "failed after send"
+                return "failed after send"  # a server error, whatever its text says
+            if _refused(obs):
+                return "blocked after send"
             return "altered"
     if got:
         return got

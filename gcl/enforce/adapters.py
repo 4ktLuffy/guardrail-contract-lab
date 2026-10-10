@@ -203,7 +203,7 @@ LITELLM_GENERIC = Protocol(
     name="litellm generic guardrail API",
     verdicts={
         "allow": lambda body, m: {"action": "NONE"},
-        "block": lambda body, m: {"action": "BLOCKED", "blocked_reason": "gcl stand-in: blocked"},
+        "block": lambda body, m: {"action": "BLOCKED", "blocked_reason": "GCL-BLOCKED by the stand-in"},
         "modify": lambda body, m: {"action": "GUARDRAIL_INTERVENED",
                                    "texts": [m for _ in (body.get("texts") or [""])]},
     },
@@ -586,7 +586,7 @@ def _driver_path(name: str) -> Path:
 OPENAI_GUARDRAILS_JUDGE = judge_protocol(
     "openai-guardrails LLM check (structured JSON)",
     allow={"flagged": False, "confidence": 0.0, "reason": "gcl stand-in: allow"},
-    block={"flagged": True, "confidence": 0.99, "reason": "gcl stand-in: block"})
+    block={"flagged": True, "confidence": 0.99, "reason": "GCL-BLOCKED by the stand-in"})
 
 
 class OpenAIGuardrails(Adapter):
@@ -806,9 +806,9 @@ def _mastra_verdict(flagged: bool):
     def build(body: dict, m: str, stage: str | None = None) -> dict:
         if stage == "output":  # ModerationProcessor schema
             return {"category_scores": [{"category": "violence", "score": 0.95}] if flagged else [],
-                    "reason": "gcl stand-in" if flagged else None}
+                    "reason": "GCL-BLOCKED by the stand-in" if flagged else None}
         return {"categories": [{"type": "injection", "score": 0.95}] if flagged else [],  # PromptInjectionDetector
-                "reason": "gcl stand-in" if flagged else None}
+                "reason": "GCL-BLOCKED by the stand-in" if flagged else None}
     return build
 
 
@@ -940,7 +940,69 @@ class OpenAIAgents(OpenAIGuardrails):
         _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 90, self.log)
 
 
+# --------------------------------------------------------------------------- Pydantic AI
+class PydanticAI(Adapter):
+    """A Pydantic AI agent with pydantic-ai-harness `InputGuardrail` (sequential, or
+    `parallel=True`) and `OutputGuardrail`. The harness has no built-in LLM guard, so the
+    guards are gcl's strictest ones (allow only on NONE, raise on anything unexpected):
+    the run tests what the framework does with a block or an exception. One probe tool."""
+
+    name = "pydantic-ai"
+    protocol = LITELLM_GENERIC
+    capabilities: ClassVar[set[str]] = {"input", "output", "tools"}
+    scanner_latency_s = 1.0
+    _F = ("error", "timeout", "malformed", "empty", "wrong_schema", "unknown_verdict", "verdict_type", "refused")
+    # Harness docs/docstrings: "Any exception raised by the guard propagates as-is".
+    # parallel=True: "The model call is cancelled the moment the guard reports a
+    # violation ... parallel mode has already started it."
+    documented: ClassVar[dict] = {
+        "sequential": {**_BASE, **{f: "stopped" for f in _F}},
+        "parallel": {**_BASE, ("input", "block"): ("blocked after send", "stopped"),
+                     **{("input", f): ("failed after send", "stopped") for f in _F},
+                     **{("output", f): "stopped" for f in _F}},
+    }
+    documented_sources: ClassVar[dict] = {"sequential": {
+        "source": "pydantic-ai-harness 0.55.0, guardrails/_capability.py docstrings; "
+                  "https://pydantic.dev/docs/ai/harness/guardrails/",
+        "read_for": "pydantic-ai-slim 2.55.0, pydantic-ai-harness 0.55.0",
+        "passage": "Any exception raised by the guard propagates as-is. parallel=True: the model call is "
+                   "cancelled the moment the guard reports a violation; sequential mode never calls the model "
+                   "on a blocked prompt, whereas parallel mode has already started it."}}
+    documented_sources["parallel"] = documented_sources["sequential"]
+
+    def __init__(self, python: str, workdir: Path, profile: str = "sequential"):
+        super().__init__(python, workdir, "sequential" if profile == "default" else profile)
+
+    def config_summary(self) -> dict:
+        return {"agent": "pydantic_ai.Agent", "input": f"InputGuardrail(parallel={self.profile == 'parallel'})",
+                "output": "OutputGuardrail", "guards": "gcl strict HTTP guard", "tools": ["gcl_probe"],
+                "scanner_latency_s": 1.0}
+
+    def versions(self) -> dict:
+        return _versions(self.python, ["pydantic-ai-slim", "pydantic-ai-harness", "openai"])
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        self.port = _free_port()
+        path = self.protocol.path
+        cmd = [self.python, str(_driver_path("pydantic_ai_driver.py")), "--port", str(self.port),
+               "--model-base", model.openai_base, "--tool-url", model.tool_url,
+               "--input-guard", f"{scanner.base_for('input')}{path}",
+               "--output-guard", f"{scanner.base_for('output')}{path}"]
+        if self.profile == "parallel":
+            cmd.append("--parallel")
+        env = dict(os.environ, NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost")
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env,
+                                         start_new_session=True, cwd=str(self.workdir))
+        _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 90, self.log)
+
+    def call(self, messages: list[dict], timeout_s: float) -> Observation:
+        return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                     {"model": "gcl-mock", "messages": messages}, None, timeout_s)
+
+
 ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": OpenAIGuardrails,
             "nemo-selfcheck": NemoSelfCheck, "portkey": PortkeyGateway,
             "langchain-moderation": LangChainModeration, "mastra": MastraAgent, "openai-agents": OpenAIAgents,
-            "reference": ReferenceGateway}
+            "pydantic-ai": PydanticAI, "reference": ReferenceGateway}

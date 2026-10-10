@@ -131,3 +131,11 @@ def test_a_blocked_reply_left_in_the_returned_state_is_retained():
     assert classify(o, [], Observation(200, json.dumps(body), True, 0.1)) == "retained"
     clean = {"choices": [{"message": {"content": "Lo siento."}}], "library_return": [{"content": "Lo siento."}]}
     assert classify(o, [], Observation(200, json.dumps(clean), True, 0.1)) == "stopped"
+
+
+def test_the_block_marker_in_a_server_error_is_not_a_refusal():
+    sent = _req(f"{S.user_text} {S.user_sentinel}")
+    err = Observation(500, '{"error": "unrecognised verdict {\'blocked_reason\': \'GCL-BLOCKED\'}"}', True, 0.1)
+    assert classify(S, sent, err) == "failed after send"
+    ok = Observation(200, '{"choices": [{"message": {"content": "GCL-BLOCKED by the stand-in"}}]}', True, 0.1)
+    assert classify(S, sent, ok) == "blocked after send"

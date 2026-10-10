@@ -423,7 +423,7 @@ def test_mock_model_tool_mode_calls_the_tool_once_then_replies():
 
 def test_adapters_registry():
     assert set(ADAPTERS) == {"litellm", "nemo", "nemo-selfcheck", "openai-guardrails", "portkey",
-                             "langchain-moderation", "mastra", "openai-agents", "reference"}
+                             "langchain-moderation", "mastra", "openai-agents", "pydantic-ai", "reference"}
 
 
 # Real integrations: these pin what was observed on litellm 1.104.2 and nemoguardrails
@@ -548,3 +548,18 @@ def test_real_openai_agents_tool_runs_despite_block(tmp_path):
     assert _by(run, "input", "allow")["policy"] == "held"
     # pre_flight Jailbreak flags the input; the agent's tool still runs (judge takes 1 s).
     assert _by(run, "input", "block")["observed"] == "tool executed"
+
+
+PYD_PY = os.environ.get("GCL_INTEG_PYDANTIC_PYTHON")  # an env with pydantic-ai-slim[openai] + harness
+
+
+@pytest.mark.skipif(not PYD_PY, reason="set GCL_INTEG_PYDANTIC_PYTHON")
+def test_real_pydantic_ai_matches_its_docs(tmp_path):
+    from gcl.enforce.adapters import PydanticAI
+
+    seq = run_contracts(PydanticAI(PYD_PY, tmp_path / "s", "sequential"), 30)
+    # Under machine load a timing-sensitive scenario can end unverified; never violated.
+    assert seq["summary"]["policy_violated"] == 0 and seq["summary"]["policy_held"] >= 18
+    par = run_contracts(PydanticAI(PYD_PY, tmp_path / "p", "parallel"), 30)
+    assert par["summary"]["documented_deviates"] == 0
+    assert _by(par, "input", "block")["observed"] == "blocked after send"  # documented; no tool ran

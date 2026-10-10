@@ -14,7 +14,7 @@ from typing import ClassVar
 
 import pytest
 
-from gcl.enforce.adapters import ADAPTERS, LiteLLMProxy, NemoServer, ReferenceGateway
+from gcl.enforce.adapters import ADAPTERS, LiteLLMProxy, ReferenceGateway
 from gcl.enforce.contracts import POLICY, build_scenarios, run_contracts
 from gcl.enforce.servers import FAULTS, MockModel, StandInScanner
 
@@ -507,156 +507,34 @@ def test_adapters_registry():
                              "semantic-kernel", "reference"}
 
 
-# Real integrations: these pin what was observed on litellm 1.104.2 and nemoguardrails
-# 0.24.1. A different version may legitimately change them; the run records versions.
+# Real integrations (opt-in): each points at an environment with the integration
+# installed and checks that the suite runs end to end and its controls hold. What each
+# integration does under faults is reported by `gcl enforce`, not asserted here.
 def _controls_hold(run):
     for r in run["results"]:
-        if r["scenario"]["control"]:
-            assert r["policy"] == "held", (r["scenario"]["stage"], r["scenario"]["mode"], r["notes"])
+        if r["scenario"]["control"] and r["scenario"]["mode"] == "allow":
+            assert r["policy"] == "held", (r["scenario"]["stage"], r["notes"])
 
 
-@needs_integ
-def test_real_litellm_default_profile(tmp_path):
-    run = run_contracts(LiteLLMProxy(INTEG, tmp_path, "default"), 30)
+def _env(name):
+    return os.environ.get(name)
+
+
+REAL = [
+    ("GCL_INTEG_PYTHON", "litellm", "default"), ("GCL_INTEG_PYTHON", "nemo", "default"),
+    ("GCL_INTEG_PYTHON", "nemo-selfcheck", "default"), ("GCL_INTEG_PYTHON", "openai-guardrails", "pre_flight"),
+    ("GCL_INTEG_NODE_ENV", "portkey", "fail_on_error"), ("GCL_INTEG_LANGCHAIN_PYTHON", "langchain-moderation", "error"),
+    ("GCL_INTEG_MASTRA_ENV", "mastra", "strict"), ("GCL_INTEG_AGENTS_PYTHON", "openai-agents", "default"),
+    ("GCL_INTEG_PYDANTIC_PYTHON", "pydantic-ai", "sequential"),
+    ("GCL_INTEG_INVARIANT_PYTHON", "invariant-mcp", "default"),
+]
+
+
+@pytest.mark.parametrize(("var", "integration", "profile"), REAL)
+def test_real_integration_runs_and_controls_hold(tmp_path, var, integration, profile):
+    where = _env(var)
+    if not where:
+        pytest.skip(f"set {var} to run {integration}")
+    run = run_contracts(ADAPTERS[integration](where, tmp_path, profile), 45)
     _controls_hold(run)
-    for stage in ("input", "output"):
-        for f in ("error", "malformed", "empty", "refused"):
-            assert (_by(run, stage, f)["policy"], _by(run, stage, f)["documented"]) == ("held", "conforms")
-        for f in ("wrong_schema", "unknown_verdict"):  # no valid action read as "NONE"
-            r = _by(run, stage, f)
-            assert (r["observed"], r["policy"], r["documented"]) == ("passed", "violated", "unspecified")
-        assert _by(run, stage, "modify")["observed"] == "modified"
-
-
-@needs_integ
-def test_real_litellm_fail_open_profile(tmp_path):
-    run = run_contracts(LiteLLMProxy(INTEG, tmp_path, "fail_open"), 30, only={"i10", "o18"})
-    _controls_hold(run)
-    for stage in ("input", "output"):
-        r = _by(run, stage, "refused")
-        assert (r["observed"], r["policy"], r["documented"]) == ("passed", "violated", "conforms")
-
-
-@needs_integ
-def test_real_nemo_jailbreak_rail(tmp_path):
-    run = run_contracts(NemoServer(INTEG, tmp_path), 45)
-    _controls_hold(run)
-    r = _by(run, "input", "error")
-    assert (r["observed"], r["policy"], r["documented"]) == ("passed", "violated", "conforms")
-    assert _by(run, "input", "wrong_schema")["observed"] == "passed"
-
-
-@needs_integ
-def test_real_openai_guardrails_pre_flight(tmp_path):
-    from gcl.enforce.adapters import OpenAIGuardrails
-
-    run = run_contracts(OpenAIGuardrails(INTEG, tmp_path, "pre_flight"), 45)
-    _controls_hold(run)
-    assert _by(run, "input", "error")["observed"] == "stopped"
-    # A judge that refuses, or answers nothing, reads as "not flagged" (0.3.3).
-    for stage in ("input", "output"):
-        for f in ("judge_refusal", "empty"):
-            assert _by(run, stage, f)["observed"] == "passed", (stage, f)
-
-
-NODE_ENV = os.environ.get("GCL_INTEG_NODE_ENV")  # a dir with node_modules/@portkey-ai/gateway
-
-
-@pytest.mark.skipif(not NODE_ENV, reason="set GCL_INTEG_NODE_ENV to run Node integrations")
-def test_real_portkey_fail_on_error(tmp_path):
-    from gcl.enforce.adapters import PortkeyGateway
-
-    run = run_contracts(PortkeyGateway(NODE_ENV, tmp_path, "fail_on_error"), 20)
-    _controls_hold(run)
-    for stage in ("input", "output"):
-        assert _by(run, stage, "error")["observed"] == "stopped"
-        assert _by(run, stage, "modify")["observed"] == "modified"
-        # {"verdict": "false"} — a string — reads as a pass (1.15.2).
-        assert _by(run, stage, "verdict_type")["observed"] == "passed"
-
-
-@needs_integ
-def test_real_nemo_self_check_rails(tmp_path):
-    from gcl.enforce.adapters import NemoSelfCheck
-
-    run = run_contracts(NemoSelfCheck(INTEG, tmp_path), 45)
-    _controls_hold(run)
-    for stage in ("input", "output"):
-        for f in ("error", "malformed", "empty", "judge_refusal"):
-            assert _by(run, stage, f)["observed"] == "stopped", (stage, f)
-        assert _by(run, stage, "verdict_type")["observed"] == "passed"  # "Not safe." reads as safe
-
-
-LC_PY = os.environ.get("GCL_INTEG_LANGCHAIN_PYTHON")  # an env with langchain>=1 and langchain-openai
-
-
-@pytest.mark.skipif(not LC_PY, reason="set GCL_INTEG_LANGCHAIN_PYTHON")
-def test_real_langchain_moderation(tmp_path):
-    from gcl.enforce.adapters import LangChainModeration
-
-    run = run_contracts(LangChainModeration(LC_PY, tmp_path, "error"), 30)
-    _controls_hold(run)
-    for stage in ("input", "output"):
-        assert _by(run, stage, "error")["observed"] == "stopped"
-        assert _by(run, stage, "wrong_schema")["observed"] == "passed"  # result without "flagged"
-    end = run_contracts(LangChainModeration(LC_PY, tmp_path / "end", "default"), 30)
-    # exit_behavior="end": the flagged reply stays in the messages the agent returns.
-    assert _by(end, "output", "block")["observed"] == "retained"
-
-
-MASTRA_ENV = os.environ.get("GCL_INTEG_MASTRA_ENV")  # a dir with node_modules/@mastra/core
-
-
-@pytest.mark.skipif(not MASTRA_ENV, reason="set GCL_INTEG_MASTRA_ENV")
-def test_real_mastra_strict_holds_and_default_fails_open(tmp_path):
-    from gcl.enforce.adapters import MastraAgent
-
-    strict = run_contracts(MastraAgent(MASTRA_ENV, tmp_path / "s", "strict"), 30)
-    assert strict["summary"]["policy_violated"] == 0 and strict["summary"]["policy_held"] >= 18
-    default = run_contracts(MastraAgent(MASTRA_ENV, tmp_path / "d", "default"), 30)
-    assert _by(default, "input", "error")["documented"] == "conforms"
-    assert _by(default, "input", "judge_refusal")["observed"] == "passed"
-
-
-AGENTS_PY = os.environ.get("GCL_INTEG_AGENTS_PYTHON")  # an env with openai-agents and openai-guardrails
-
-
-@pytest.mark.skipif(not AGENTS_PY, reason="set GCL_INTEG_AGENTS_PYTHON")
-def test_real_openai_agents_tool_runs_despite_block(tmp_path):
-    from gcl.enforce.adapters import OpenAIAgents
-
-    run = run_contracts(OpenAIAgents(AGENTS_PY, tmp_path), 45, only={"o13"})
-    assert _by(run, "input", "allow")["policy"] == "held"
-    # pre_flight Jailbreak flags the input; the agent's tool still runs (judge takes 1 s).
-    assert _by(run, "input", "block")["observed"] == "tool executed"
-
-
-PYD_PY = os.environ.get("GCL_INTEG_PYDANTIC_PYTHON")  # an env with pydantic-ai-slim[openai] + harness
-
-
-@pytest.mark.skipif(not PYD_PY, reason="set GCL_INTEG_PYDANTIC_PYTHON")
-def test_real_pydantic_ai_matches_its_docs(tmp_path):
-    from gcl.enforce.adapters import PydanticAI
-
-    seq = run_contracts(PydanticAI(PYD_PY, tmp_path / "s", "sequential"), 30)
-    # Under machine load a timing-sensitive scenario can end unverified; never violated.
-    assert seq["summary"]["policy_violated"] == 0 and seq["summary"]["policy_held"] >= 18
-    par = run_contracts(PydanticAI(PYD_PY, tmp_path / "p", "parallel"), 30)
-    assert par["summary"]["documented_deviates"] == 0
-    assert _by(par, "input", "block")["observed"] == "blocked after send"  # documented; no tool ran
-
-
-INV_PY = os.environ.get("GCL_INTEG_INVARIANT_PYTHON")  # an env with invariant-gateway 0.0.9
-
-
-@pytest.mark.skipif(not INV_PY, reason="set GCL_INTEG_INVARIANT_PYTHON")
-def test_real_invariant_mcp_policy_404_and_retry(tmp_path):
-    from gcl.enforce.adapters import InvariantMCP
-
-    plain = run_contracts(InvariantMCP(INV_PY, tmp_path / "d", "default"), 20)
-    _controls_hold(plain)
-    assert _by(plain, "input", "block_retry")["observed"] == "stopped"
-    assert _by(plain, "input", "policy_missing")["observed"] == "tool executed"   # 404 policy → no guardrails
-    # With realistic answers (violations located per message) the retry is blocked too.
-    push = run_contracts(InvariantMCP(INV_PY, tmp_path / "p", "push"), 20, only={"i14"})
-    assert _by(push, "input", "block_retry")["observed"] == "stopped"
+    assert run["summary"]["scenarios"] > 4

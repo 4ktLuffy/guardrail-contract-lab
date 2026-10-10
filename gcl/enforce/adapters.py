@@ -677,8 +677,7 @@ NEMO_SELF_CHECK = Protocol(
     wrong_schema={"status": "ok"},
     envelope=_chat_envelope, shared_endpoint=True,
     extra_faults={"judge_refusal": _refusal_envelope()},
-    # The default parser reads only the first two words. "Not safe" means block in
-    # plain English but contains "safe"; "Unclear." contains no keyword at all.
+    # Text-verdict faults: an answer with no Yes/No keyword, and a block said in other words.
     variants={"unknown_verdict": "Unclear.", "verdict_type": "Not safe."},
 )
 

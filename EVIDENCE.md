@@ -103,8 +103,8 @@ else is labelled.
   and tools — checked. Real run: Invariant Gateway 0.0.9 MCP proxy — opt-in.
 
 ## Review round 9 (tests/test_review_round9.py)
-- The Invariant stand-in locates a violation at every matching message (a stale location
-  had manufactured a retry "bypass", now retracted); policy-source faults count only when
+- The Invariant stand-in locates a violation at every matching message, as the real
+  analyzer does (a fixed location gave a misleading retry result); policy-source faults count only when
   the 404/500 was delivered and leave the check endpoint healthy; a retry is judged only
   after a refused first attempt, with every attempt kept; "tool executed" conforms to a
   documented pass only when the client also got its answer; events carrying several

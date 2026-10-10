@@ -58,11 +58,11 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
 - Offline by design: a scripted stand-in scanner and a mock model replace the real
   services. Results show how the integration's own enforcement code handles the scripted
   inputs — not detector accuracy, production networking, or every configuration.
-- Eleven targets today (plus any LiteLLM or NeMo vendor guardrail from a spec file): LiteLLM's `generic_guardrail_api` (pre_call + post_call), NeMo
+- Twelve targets today (plus any LiteLLM or NeMo vendor guardrail from a spec file): LiteLLM's `generic_guardrail_api` (pre_call + post_call), NeMo
   Guardrails' `jailbreak detection model` input rail and self-check input/output rails, openai-guardrails' LLM checks, the
   Portkey gateway's `default.webhook` hooks, LangChain's `OpenAIModerationMiddleware`,
   Mastra's PromptInjectionDetector/ModerationProcessor, the OpenAI Agents SDK with
-  `GuardrailAgent`, Pydantic AI's harness guardrails, CrewAI's `LLMGuardrail` (output only), and the bundled
+  `GuardrailAgent`, Pydantic AI's harness guardrails, CrewAI's `LLMGuardrail` (output only), Guardrails AI's `Guard`, and the bundled
   reference gateway.
 - Where a framework ships no guard of its own (Pydantic AI), the driver supplies the
   strictest guard (allow only on an explicit allow, raise on anything else), so those

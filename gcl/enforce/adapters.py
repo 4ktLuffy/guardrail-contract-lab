@@ -1252,8 +1252,66 @@ class CrewAITask(Adapter):
                      {"model": "gcl-mock", "messages": messages}, None, timeout_s)
 
 
+# --------------------------------------------------------------------------- Guardrails AI
+class GuardrailsAI(Adapter):
+    """Guardrails AI's `Guard` calling the model through its LiteLLM integration, with
+    gcl's strictest validator. Profile `python`: `Guard().use(...)` on the messages and the
+    output (default on_fail). Profile `rail`: the same validator declared in a RAIL spec on
+    the output without an on-fail attribute."""
+
+    name = "guardrails-ai"
+    protocol = LITELLM_GENERIC
+    capabilities: ClassVar[set[str]] = {"input", "output"}
+    _F = ("error", "timeout", "malformed", "empty", "wrong_schema", "unknown_verdict", "verdict_type", "refused")
+    # Validator default (validator_base.py): on_fail=None → OnFailAction.EXCEPTION. RAIL
+    # (schema/rail_schema.py): a validator without on-fail-* gets OnFailAction.NOOP.
+    documented: ClassVar[dict] = {
+        "python": {**_BASE, **{f: "stopped" for f in _F}},
+        "rail": {**_BASE, ("output", "block"): "passed", **{f: "stopped" for f in _F}},
+    }
+    documented_sources: ClassVar[dict] = {"python": {
+        "source": "guardrails-ai 0.11.0: guardrails/validator_base.py (Validator.__init__), "
+                  "guardrails/schema/rail_schema.py",
+        "read_for": "guardrails-ai 0.11.0",
+        "passage": "Validator(on_fail=None) uses OnFailAction.EXCEPTION. In a RAIL spec a validator with no "
+                   "on-fail-* attribute gets OnFailAction.NOOP (log only, value unchanged)."}}
+    documented_sources["rail"] = documented_sources["python"]
+
+    def __init__(self, python: str, workdir: Path, profile: str = "python"):
+        super().__init__(python, workdir, "python" if profile == "default" else profile)
+        if self.profile == "rail":
+            self.capabilities = {"output"}
+
+    def config_summary(self) -> dict:
+        return {"guard": "Guard.for_rail_string (output validator, no on-fail)" if self.profile == "rail"
+                else "Guard().use(check, on='messages').use(check)", "validator": "gcl strict HTTP check"}
+
+    def versions(self) -> dict:
+        return _versions(self.python, ["guardrails-ai", "litellm"])
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        self.port = _free_port()
+        path = self.protocol.path
+        cmd = [self.python, str(_driver_path("guardrails_ai_driver.py")), "--port", str(self.port),
+               "--model-base", model.openai_base, "--input-guard", f"{scanner.base_for('input')}{path}",
+               "--output-guard", f"{scanner.base_for('output')}{path}", "--style", self.profile]
+        env = dict(os.environ, NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost",
+                   OPENAI_API_KEY="sk-gcl", GUARDRAILS_RUN_SYNC="true", LITELLM_LOCAL_MODEL_COST_MAP="True",
+                   OTEL_SDK_DISABLED="true")
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env,
+                                         start_new_session=True, cwd=str(self.workdir))
+        _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 120, self.log)
+
+    def call(self, messages: list[dict], timeout_s: float) -> Observation:
+        return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                     {"model": "gcl-mock", "messages": messages}, None, timeout_s)
+
+
 ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": OpenAIGuardrails,
             "nemo-selfcheck": NemoSelfCheck, "portkey": PortkeyGateway,
             "langchain-moderation": LangChainModeration, "mastra": MastraAgent, "openai-agents": OpenAIAgents,
             "pydantic-ai": PydanticAI, "litellm-vendor": LiteLLMVendor,
-            "nemo-vendor": NemoVendor, "crewai": CrewAITask, "reference": ReferenceGateway}
+            "nemo-vendor": NemoVendor, "crewai": CrewAITask,
+            "guardrails-ai": GuardrailsAI, "reference": ReferenceGateway}

@@ -173,6 +173,9 @@ class Protocol:
     # stage comes from the request body and "refused" cannot be staged for it alone.
     shared_endpoint: bool = False
     judge_model: str = "gcl-judge"
+    # One guard client serves both stages (one URL): adapters point it at the input
+    # listener, the stage comes from the body, and "refused" closes that one listener.
+    single_listener: bool = False
     # Protocol-specific faults: mode name -> full response body (sent with HTTP 200).
     extra_faults: dict = field(default_factory=dict)
     # Overrides for built-in content faults when verdicts are plain text, not JSON:
@@ -251,8 +254,11 @@ class StandInScanner:
     def configure(self, modes: dict[str, str], modify_text: str = "") -> None:
         self.modes, self.modify_text = dict(modes), modify_text
         self.release_stalled()
+        any_refused = any(m == "refused" for m in self.modes.values())
         for st in self.STAGES:
             refused = self.modes.get(st) == "refused"
+            if self.protocol.single_listener and st == "input":
+                refused = any_refused
             if refused and self._srv[st] is not None:
                 self._close(st)
             elif not refused and self._srv[st] is None:
@@ -312,8 +318,9 @@ class StandInScanner:
             body = {}
         claimed = proto.stage_of(body) if isinstance(body, dict) else None
         path_ok = not proto.path or h.path.rstrip("/").endswith(proto.path)
-        valid = path_ok and claimed in self.STAGES and (listener is None or claimed == listener)
-        stage = listener or claimed
+        by_body = listener is None or proto.single_listener
+        valid = path_ok and claimed in self.STAGES and (by_body or claimed == listener)
+        stage = claimed if by_body else listener
         mode = self.modes.get(stage, "allow") if valid else "rejected"
         ev = {"t": time.monotonic(), "stage": stage, "claimed_stage": claimed,
               "path": h.path, "valid": valid, "mode": mode, "body": body,

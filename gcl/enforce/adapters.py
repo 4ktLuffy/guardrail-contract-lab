@@ -709,5 +709,68 @@ class NemoSelfCheck(NemoServer):
         self._launch(cfgdir)
 
 
+# --------------------------------------------------------------------------- moderation API
+def _moderation(flagged) -> dict:
+    return {"id": "modr-gcl", "model": "omni-moderation-latest",
+            "results": [{"flagged": flagged, "categories": {"violence": flagged is True},
+                         "category_scores": {"violence": 0.99 if flagged is True else 0.0}}]}
+
+
+OPENAI_MODERATION = Protocol(
+    name="OpenAI moderation API (POST /v1/moderations)",
+    verdicts={"allow": lambda b, m: _moderation(False), "block": lambda b, m: _moderation(True),
+              "modify": lambda b, m: _moderation(False)},
+    stage_of=_stage_by_sentinel, path="/moderations",
+    wrong_schema={"id": "modr-gcl", "model": "omni-moderation-latest", "results": [{"categories": {}}]},
+    variants={"unknown_verdict": json.dumps(_moderation("DENY_UNKNOWN")),
+              "verdict_type": json.dumps(_moderation("true"))},
+    single_listener=True,
+)
+
+
+class LangChainModeration(Adapter):
+    """A LangChain v1 agent (`create_agent`) with `OpenAIModerationMiddleware` checking
+    input and output; its moderation client points at the stand-in."""
+
+    name = "langchain-moderation"
+    protocol = OPENAI_MODERATION
+    capabilities: ClassVar[set[str]] = {"input", "output"}
+    # The middleware docs describe exit_behavior for *violations* (end: stop with a
+    # message; error: raise) and nothing about a failed moderation call.
+    documented: ClassVar[dict] = {"default": dict(_BASE), "error": dict(_BASE)}
+    documented_sources: ClassVar[dict] = {"default": {
+        "source": "langchain-openai 1.7.0, langchain_openai/middleware/openai_moderation.py docstrings",
+        "read_for": "langchain 1.4.4, langchain-openai 1.7.0",
+        "passage": "exit_behavior: how to handle violations ('error', 'end', or 'replace'). Failure of the "
+                   "moderation call itself is not described."}}
+    documented_sources["error"] = documented_sources["default"]
+
+    def config_summary(self) -> dict:
+        return {"agent": "langchain.agents.create_agent", "middleware": "OpenAIModerationMiddleware",
+                "check_input": True, "check_output": True,
+                "exit_behavior": "end" if self.profile == "default" else "error", "client_timeout_s": 8}
+
+    def versions(self) -> dict:
+        return _versions(self.python, ["langchain", "langchain-openai", "langchain-core", "openai"])
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        self.port = _free_port()
+        cmd = [self.python, str(_driver_path("langchain_moderation_driver.py")), "--port", str(self.port),
+               "--model-base", model.openai_base, "--moderation-base", f"{scanner.base_for('input')}/v1",
+               "--exit-behavior", "end" if self.profile == "default" else "error"]
+        env = dict(os.environ, NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost",
+                   OPENAI_API_KEY="sk-gcl")
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env,
+                                         start_new_session=True, cwd=str(self.workdir))
+        _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 90, self.log)
+
+    def call(self, messages: list[dict], timeout_s: float) -> Observation:
+        return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                     {"model": "gcl-mock", "messages": messages}, None, timeout_s)
+
+
 ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": OpenAIGuardrails,
-            "nemo-selfcheck": NemoSelfCheck, "portkey": PortkeyGateway, "reference": ReferenceGateway}
+            "nemo-selfcheck": NemoSelfCheck, "portkey": PortkeyGateway,
+            "langchain-moderation": LangChainModeration, "reference": ReferenceGateway}

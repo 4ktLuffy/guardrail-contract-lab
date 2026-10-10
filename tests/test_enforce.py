@@ -391,8 +391,23 @@ def test_text_verdicts_and_variants_are_served_as_chat_content():
             assert _post_json(url, ask)["choices"][0]["message"]["content"] == want
 
 
+def test_single_listener_stages_by_body_and_refuses_both():
+    from gcl.enforce.adapters import OPENAI_MODERATION as P
+
+    with StandInScanner(P) as sc:
+        url = sc.base_for("input") + "/v1/moderations"
+        sc.configure({"input": "allow", "output": "block"})
+        assert _post_json(url, {"input": "hola GCL-U-i01"})["results"][0]["flagged"] is False
+        assert _post_json(url, {"input": "réponse GCL-R-o02"})["results"][0]["flagged"] is True
+        assert [e["stage"] for e in sc.events] == ["input", "output"]
+        sc.configure({"input": "allow", "output": "refused"})  # one client: both go down
+        with pytest.raises(OSError):
+            _post_json(url, {"input": "hola GCL-U-i03"})
+
+
 def test_adapters_registry():
-    assert set(ADAPTERS) == {"litellm", "nemo", "nemo-selfcheck", "openai-guardrails", "portkey", "reference"}
+    assert set(ADAPTERS) == {"litellm", "nemo", "nemo-selfcheck", "openai-guardrails", "portkey",
+                             "langchain-moderation", "reference"}
 
 
 # Real integrations: these pin what was observed on litellm 1.104.2 and nemoguardrails
@@ -473,3 +488,17 @@ def test_real_nemo_self_check_rails(tmp_path):
         for f in ("error", "malformed", "empty", "judge_refusal"):
             assert _by(run, stage, f)["observed"] == "stopped", (stage, f)
         assert _by(run, stage, "verdict_type")["observed"] == "passed"  # "Not safe." reads as safe
+
+
+LC_PY = os.environ.get("GCL_INTEG_LANGCHAIN_PYTHON")  # an env with langchain>=1 and langchain-openai
+
+
+@pytest.mark.skipif(not LC_PY, reason="set GCL_INTEG_LANGCHAIN_PYTHON")
+def test_real_langchain_moderation(tmp_path):
+    from gcl.enforce.adapters import LangChainModeration
+
+    run = run_contracts(LangChainModeration(LC_PY, tmp_path, "error"), 30)
+    _controls_hold(run)
+    for stage in ("input", "output"):
+        assert _by(run, stage, "error")["observed"] == "stopped"
+        assert _by(run, stage, "wrong_schema")["observed"] == "passed"  # result without "flagged"

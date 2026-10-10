@@ -82,7 +82,7 @@ else is labelled.
   misattributed timeouts, rewrites that changed what a rule matches, unbounded
   subprocesses, overclaims — was fixed and pinned by a regression test
   (`tests/test_review_round*.py` and the suites above).
-- Local runs: 132 tests pass (plus 6 opt-in real-integration tests) on Python 3.11.14 and
+- Local runs: 133 tests pass (plus 7 opt-in real-integration tests) on Python 3.11.14 and
   3.13.15 with Node 25.8.0; the demo runs
   from an installed wheel outside the checkout.
 

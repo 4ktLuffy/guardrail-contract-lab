@@ -97,16 +97,27 @@ else is labelled.
 - The mock MCP server answers initialize / tools/list / tools/call over streamable HTTP,
   issues one session per client, and records tool calls at the server boundary; static
   POST routes and GET policy routes answer without counting as consultations; policy-
-  source faults return 404 / 500 on policy routes; adapters with sessions get a
-  "block_retry" scenario — checked. Real run: Invariant Gateway 0.0.9 MCP proxy — opt-in.
+  source faults return 404 / 500 on policy routes only (the check endpoint stays healthy)
+  and count only when delivered; the Invariant MCP adapter runs "block_retry", judged only
+  when the first attempt was a clean refusal; the mock MCP server rejects unknown sessions
+  and tools — checked. Real run: Invariant Gateway 0.0.9 MCP proxy — opt-in.
+
+## Review round 9 (tests/test_review_round9.py)
+- The Invariant stand-in locates a violation at every matching message (a stale location
+  had manufactured a retry "bypass", now retracted); policy-source faults count only when
+  the 404/500 was delivered and leave the check endpoint healthy; a retry is judged only
+  after a refused first attempt, with every attempt kept; "tool executed" conforms to a
+  documented pass only when the client also got its answer; events carrying several
+  scenarios' markers prevent a clean hold; the mock MCP server rejects unknown sessions
+  and tools; JS drivers serialise exception state and results — checked.
 
 ## Independent review
-- Nine adversarial review rounds by independent models (eight by an OpenAI model, one by a
+- Ten adversarial review rounds by independent models (nine by an OpenAI model, one by a
   separate Claude instance) before release. Every issue they reproduced — wrong verdicts,
   misattributed timeouts, rewrites that changed what a rule matches, unbounded
   subprocesses, overclaims — was fixed and pinned by a regression test
   (`tests/test_review_round*.py` and the suites above).
-- Local runs: 160 tests pass (plus 11 opt-in real-integration tests) on Python 3.11.14 and
+- Local runs: 167 tests pass (plus 11 opt-in real-integration tests) on Python 3.11.14 and
   3.13.15 with Node 25.8.0; the demo runs
   from an installed wheel outside the checkout.
 

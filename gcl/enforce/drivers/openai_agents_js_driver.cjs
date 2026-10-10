@@ -19,6 +19,20 @@ const { GuardrailAgent } = envRequire("@openai/guardrails");
 const OpenAIMod = envRequire("openai");
 const OpenAI = OpenAIMod.OpenAI || OpenAIMod.default || OpenAIMod;
 
+// Everything the library hands back, serialised recursively (cycles cut, size capped),
+// so nested state or result objects are visible to the judge, not "[object Object]".
+const safe = (v) => {
+  const seen = new WeakSet();
+  try {
+    const s = JSON.stringify(v, (k, x) => {
+      if (typeof x === "object" && x !== null) { if (seen.has(x)) return "[cycle]"; seen.add(x); }
+      if (typeof x === "bigint") return String(x);
+      return x;
+    });
+    return s === undefined ? null : JSON.parse(s.length > 500000 ? JSON.stringify(s.slice(0, 500000)) : s);
+  } catch (err) { return String(v); }
+};
+
 const send = (res, code, obj) => {
   const b = Buffer.from(JSON.stringify(obj));
   res.writeHead(code, { "Content-Type": "application/json", "Content-Length": b.length });
@@ -48,13 +62,16 @@ const send = (res, code, obj) => {
         const body = JSON.parse(raw || "{}");
         const msgs = body.messages || [];
         const r = await agents.run(agent, msgs.length ? msgs[msgs.length - 1].content : "");
-        send(res, 200, { choices: [{ index: 0, message: { role: "assistant", content: String(r.finalOutput) } }] });
+        send(res, 200, { choices: [{ index: 0, message: { role: "assistant", content: String(r.finalOutput) } }],
+                         library_return: { history: safe(r.history), new_items: safe(r.newItems) } });
       } catch (e) {
         const blocked = e instanceof agents.InputGuardrailTripwireTriggered || e instanceof agents.OutputGuardrailTripwireTriggered;
         // The library's own message is what it hands the caller; it is reported as returned
         // data, not as the answer, so a message that embeds content is "retained".
         send(res, blocked ? 400 : 500, { error: { type: e && e.name, message: blocked ? "tripwire" : "error" },
-                                         library_return: { exception_message: String(e && e.message) } });
+                                         library_return: { exception_message: String(e && e.message),
+                                                           exception_state: safe(e && e.state),
+                                                           exception_result: safe(e && e.result) } });
       }
     });
   }).listen(Number(arg("--port")), "127.0.0.1");

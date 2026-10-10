@@ -1316,13 +1316,21 @@ class GuardrailsAI(Adapter):
 # --------------------------------------------------------------------------- MCP: Invariant gateway
 _INV_POLICY = 'raise "gcl" if:\n    (msg: Message)\n    "GCL" in msg.content'
 
+def _invariant_block(body: dict) -> dict:
+    """Like the real analyzer: one error per checked message that matches (here: carries
+    a gcl marker), located at that message. The gateway blocks only on errors that yield
+    a new annotation, so the location must point at what is being checked now."""
+    msgs = body.get("messages") or []
+    errors = [{"args": ["GCL-BLOCKED by the stand-in"], "kwargs": {}, "ranges": [f"messages.{i}"]}
+              for i, m in enumerate(msgs) if "GCL-" in json.dumps(m, ensure_ascii=False)]
+    return {"result": [{"errors": errors or [{"args": ["GCL-BLOCKED by the stand-in"], "kwargs": {},
+                                              "ranges": ["messages.0"]}]}]}
+
+
 INVARIANT_CHECK = Protocol(
     name="Invariant guardrails API (POST /api/v1/policy/check/batch) and Explorer policy source",
     verdicts={"allow": lambda b, m: {"result": [{"errors": []}]},
-              # The real API reports where the violation is; the gateway blocks only on errors
-              # that yield an annotation, i.e. that carry a range.
-              "block": lambda b, m: {"result": [{"errors": [{"args": ["GCL-BLOCKED by the stand-in"],
-                                                             "kwargs": {}, "ranges": ["messages.0"]}]}]},
+              "block": lambda b, m: _invariant_block(b),
               "modify": lambda b, m: {"result": [{"errors": []}]}},
     stage_of=_stage_by_sentinel, routes=("/api/v1/policy/check/batch",), single_listener=True,
     wrong_schema={"status": "ok"},
@@ -1339,10 +1347,10 @@ def _mcp_post(url: str, msg: dict, headers: dict, timeout_s: float) -> tuple[int
                                  headers={"Content-Type": "application/json",
                                           "Accept": "application/json, text/event-stream", **headers})
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as r:
-            return r.status, dict(r.headers.items()), r.read().decode("utf-8", "replace")
+        with urllib.request.urlopen(req, timeout=max(0.1, timeout_s)) as r:
+            return r.status, dict(r.headers.items()), r.read(_MAX_BODY).decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
-        return e.code, dict(e.headers.items()), e.read().decode("utf-8", "replace")
+        return e.code, dict(e.headers.items()), e.read(_MAX_BODY).decode("utf-8", "replace")
 
 
 class InvariantMCP(Adapter):
@@ -1390,30 +1398,43 @@ class InvariantMCP(Adapter):
         _wait_http(f"http://127.0.0.1:{self.port}/api/v1/gateway/health", self.proc, 90, self.log)
 
     def call(self, messages: list[dict], timeout_s: float, repeat: int = 1) -> Observation:
-        """One MCP session; with repeat=2 the same tools/call is sent twice in it and the
-        second answer is returned (a client or agent retrying a blocked call)."""
+        """One MCP session under one absolute deadline. With repeat=2 the same tools/call
+        is sent twice in it (a client or agent retrying); every attempt is kept on the
+        returned observation as `attempts`, and the last one is the observation."""
         url = f"http://127.0.0.1:{self.port}/api/v1/gateway/mcp/streamable"
         h = {"mcp-server-base-url": self._mcp_base, "INVARIANT-PROJECT-NAME": "gcl",
              "INVARIANT-API-KEY": "inv-gcl", "PUSH-INVARIANT-EXPLORER": "true" if self.profile == "push" else "false"}
         t0 = time.perf_counter()
+        deadline = t0 + timeout_s
+
+        def left() -> float:
+            return deadline - time.perf_counter()
+
         try:
             code, hdrs, _ = _mcp_post(url, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
                 "protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "gcl", "version": "1"}}},
-                h, timeout_s)
+                h, left())
             sid = next((v for k, v in hdrs.items() if k.lower() == "mcp-session-id"), None)
             if code >= 400 or not sid:
                 return Observation(code, "", True, time.perf_counter() - t0, f"initialize failed ({code})")
             h = {**h, "mcp-session-id": sid}
-            _mcp_post(url, {"jsonrpc": "2.0", "method": "notifications/initialized"}, h, timeout_s)
+            _mcp_post(url, {"jsonrpc": "2.0", "method": "notifications/initialized"}, h, left())
         except OSError as e:
-            return Observation(None, "", False, time.perf_counter() - t0, f"transport failure: {e}", transport=True)
+            done = left() <= 0
+            return Observation(None, "", False, time.perf_counter() - t0,
+                               "client deadline reached" if done else f"transport failure: {e}", transport=not done)
         text = messages[-1]["content"]
-        obs = None
+        attempts: list[Observation] = []
         for k in range(repeat):
-            left = max(1.0, timeout_s - (time.perf_counter() - t0))
-            obs = _post(url, {"jsonrpc": "2.0", "id": 2 + k, "method": "tools/call",
-                              "params": {"name": "gcl_probe", "arguments": {"note": text}}},
-                        {**h, "Accept": "application/json, text/event-stream"}, left)
+            if left() <= 0:
+                attempts.append(Observation(None, "", False, time.perf_counter() - t0, "client deadline reached"))
+                break
+            attempts.append(_post(url, {"jsonrpc": "2.0", "id": 2 + k, "method": "tools/call",
+                                        "params": {"name": "gcl_probe", "arguments": {"note": text}}},
+                                  {**h, "Accept": "application/json, text/event-stream"}, left()))
+        last = attempts[-1]
+        obs = Observation(last.status, last.text, last.finished, time.perf_counter() - t0, last.error, last.transport)
+        obs.attempts = attempts  # type: ignore[attr-defined]
         return obs
 
 

@@ -650,12 +650,13 @@ INV_PY = os.environ.get("GCL_INTEG_INVARIANT_PYTHON")  # an env with invariant-g
 
 
 @pytest.mark.skipif(not INV_PY, reason="set GCL_INTEG_INVARIANT_PYTHON")
-def test_real_invariant_mcp_retry_bypass_with_push(tmp_path):
+def test_real_invariant_mcp_policy_404_and_retry(tmp_path):
     from gcl.enforce.adapters import InvariantMCP
 
     plain = run_contracts(InvariantMCP(INV_PY, tmp_path / "d", "default"), 20)
     _controls_hold(plain)
     assert _by(plain, "input", "block_retry")["observed"] == "stopped"
     assert _by(plain, "input", "policy_missing")["observed"] == "tool executed"   # 404 policy → no guardrails
+    # With realistic answers (violations located per message) the retry is blocked too.
     push = run_contracts(InvariantMCP(INV_PY, tmp_path / "p", "push"), 20, only={"i14"})
-    assert _by(push, "input", "block_retry")["observed"] == "tool executed"       # retry forwarded
+    assert _by(push, "input", "block_retry")["observed"] == "stopped"

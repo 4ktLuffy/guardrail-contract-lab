@@ -156,9 +156,9 @@ OpenAI moderation middleware, Mastra's model-backed processors, the OpenAI Agent
 openai-guardrails' `GuardrailAgent`, Pydantic AI's harness guardrails, Google ADK's model callbacks, Semantic Kernel's filters, CrewAI's `LLMGuardrail`, Guardrails AI's `Guard` (Python API and RAIL), Invariant Gateway's MCP proxy and Lasso's
 mcp-gateway (gcl plays the MCP client and a mock MCP server, over HTTP or stdio), Agno's built-in guardrails, or the bundled
 reference gateway. A report notes when one request ran a tool more than once (retries that
-re-execute side effects). Integrations with sessions also get a retry scenario (the same
-blocked request sent twice), and ones that fetch their rules get policy-source faults
-(the policy is missing, or its source errors). Agent integrations run with a
+re-execute side effects). The Invariant MCP adapter also runs a retry scenario (the same
+blocked request sent twice in one session), and integrations that fetch their rules get
+policy-source faults (the policy is missing, or its source errors). Agent integrations run with a
 probe tool: the mock model calls it first, so a tool that runs despite a block is
 reported as "tool executed". LLM-as-judge guards get a stand-in
 judge on the model's own endpoint, including the case where the judge model *refuses*

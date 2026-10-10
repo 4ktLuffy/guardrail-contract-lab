@@ -30,7 +30,7 @@ def main() -> None:
         elif method == "tools/call":
             req = urllib.request.Request(mock + "/mcp", data=json.dumps(
                 {"jsonrpc": "2.0", "id": mid, "method": "tools/call", "params": msg.get("params") or {}}).encode(),
-                headers={"Content-Type": "application/json"})
+                headers={"Content-Type": "application/json", "X-GCL-Transport": "stdio"})
             with urllib.request.urlopen(req, timeout=10) as r:
                 result = json.loads(r.read())["result"]
         else:

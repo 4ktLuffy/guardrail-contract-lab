@@ -105,8 +105,8 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   original is not detected.
   Results are for the versions recorded in the report (gcl records them; it does not pin
   them) and the configuration printed there.
-- Synchronous, single-turn requests only. Streaming, multi-turn history, policy reload and
-  retry behaviour are not tested yet.
+- Synchronous, single-turn requests only. Streaming, multi-turn history and policy reload
+  are not tested yet; retry after a block is tested for the Invariant MCP adapter only.
 - The client deadline (default 45 s) is absolute. A scenario with no complete answer by
   then is "unverified" — unless the original text already reached the model, which is a
   proven leak and is judged as "passed" whatever the client saw.

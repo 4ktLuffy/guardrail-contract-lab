@@ -136,13 +136,14 @@ def build_scenarios(adapter: Adapter) -> list[Scenario]:
     proto = adapter.protocol
     faults = [f for f in FAULTS if not (f == "refused" and proto.shared_endpoint)]
     faults += list(proto.extra_faults)
-    if proto.get_routes and any("polic" in r for r in proto.get_routes):
-        faults += list(POLICY_FAULTS)
+    policy_faults = list(POLICY_FAULTS) if proto.get_routes and any("polic" in r for r in proto.get_routes) else []
     # One URL for both stages: an output "refused" also refuses the input check, so it
     # cannot be told apart from an input failure. Not staged.
     out_faults = [f for f in faults if not (f == "refused" and proto.single_listener)]
     if "input" in caps:
-        plan += [("input", f, False) for f in faults]
+        # Policy-source faults hit the integration's rule lookup, which serves both stages:
+        # staged once, on the input side.
+        plan += [("input", f, False) for f in faults + policy_faults]
     if "modify_input" in caps:
         plan.append(("input", "modify", False))
     if "retry" in caps:
@@ -365,13 +366,17 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
     starts = sorted((w[0], sid) for sid, w in windows.items())
     nxt = {sid: (starts[k + 1][0] if k + 1 < len(starts) else float("inf")) for k, (_, sid) in enumerate(starts)}
 
+    ambiguous: dict[str, int] = {}
+
     def owned(events: list[dict], sid: str, key) -> list[dict]:
         out = []
         for e in events:
             ids = _owner_ids(key(e))
             if ids:
-                if ids == {sid}:  # markers of several scenarios: ambiguous, charged to none
+                if ids == {sid}:
                     out.append(e)
+                elif sid in ids:  # markers of several scenarios: not charged, but not forgotten
+                    ambiguous[sid] = ambiguous.get(sid, 0) + 1
             elif windows[sid][0] <= e["t"] < nxt[sid]:
                 out.append(e)
         return out
@@ -396,9 +401,13 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         if isinstance(expect, (tuple, set, frozenset)):
             expect = sorted(expect)  # several outcomes the docs allow
         tools_run = owned(tool_events, s.id, lambda e: e["body"])
-        observed = classify(s, [e["body"] for e in mev], obs)
+        observed = client_outcome = classify(s, [e["body"] for e in mev], obs)
         if tools_run and s.stage == "input" and s.mode != "allow":
             observed = "tool executed"  # the strongest evidence: a side effect happened
+        w0, w1 = windows[s.id][0], nxt[s.id]
+        policy_served = [e["answered"] for e in scanner_events
+                         if e.get("mode") == "GET" and "polic" in e["path"] and w0 <= e["t"] < w1]
+        attempts = getattr(obs, "attempts", None) or [obs]
         r = Result(s, observed, POLICY[s.mode], expect,
                    evidence={
                        "client_status": obs.status, "client_finished": obs.finished,
@@ -407,6 +416,11 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
                        "client_body": obs.text,
                        "model_input": classify_input(s, [e["body"] for e in mev]),
                        "model_requests": len(mev),
+                       "client_outcome": client_outcome,
+                       "policy_answers": policy_served,
+                       "attempts": [{"status": a.status, "finished": a.finished, "error": a.error,
+                                     "body": a.text[:2000]} for a in attempts],
+                       "ambiguous_events": ambiguous.get(s.id, 0),
                        "tool_runs": [{"t": round(e["t"] - t0, 3), "body": e["body"]} for e in tools_run],
                        "model_events": [{"t": round(e["t"] - t0, 3), "body": e["body"]} for e in mev],
                        "scanner_consulted_stage": consulted,
@@ -456,8 +470,8 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
             r.documented = "unspecified"
         else:
             allowed = r.documented_expect if isinstance(r.documented_expect, list) else [r.documented_expect]
-            if "passed" in allowed:
-                allowed = [*allowed, "tool executed"]  # passing through means the agent ran, tools included
+            if "passed" in allowed and r.observed == "tool executed" and r.evidence.get("client_outcome") == "passed":
+                allowed = [*allowed, "tool executed"]  # it passed through, and the agent ran its tool
             r.documented = "conforms" if r.observed in allowed else "deviates"
         if r.policy == "violated" and r.documented == "conforms":
             r.notes.append("documented behaviour for this configuration (not a bug; a policy choice)")
@@ -475,6 +489,19 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
         if r.observed in ("no answer", "transport failure"):
             return ("no complete response before the client deadline" if r.observed == "no answer"
                     else "the connection failed without an HTTP response")
+        if ev.get("ambiguous_events") and r.observed not in leaks:
+            return "events carrying several scenarios' markers touched this scenario; a clean result is not proven"
+        if s.mode in POLICY_FAULTS:
+            want = 404 if s.mode == "policy_missing" else 500
+            if want not in (ev.get("policy_answers") or []):
+                return "the policy-source fault was never delivered to the integration"
+        if s.mode == "block_retry":
+            att = ev.get("attempts") or []
+            first = att[0] if att else {}
+            if len(att) < 2 or not (first.get("status") is not None and 400 <= first["status"] < 500):
+                return "the first attempt was not a clean refusal, so the second is not a retry of a block"
+            if not att[-1].get("finished") and r.observed not in leaks:
+                return "the retry got no complete answer"
         if ev.get("scanner_answered_by_other_mode"):
             return "a request for this scenario was answered with another scenario's behaviour"
         if s.control and s.mode == "allow" and s.stage == "input" and "tools" in adapter.capabilities \

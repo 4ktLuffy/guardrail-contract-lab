@@ -65,6 +65,8 @@ class MockModel(_Server):
         self.tools_mode = False
         self.tool_events: list[dict] = []
         self.mcp_sessions = 0
+        self.mcp_valid_sessions: set[str] = set()
+        self.mcp_rejected: list[dict] = []
         self.events: list[dict] = []        # append-only: {"t", "body", "reply"}
         self.unexpected: list[str] = []
         self.inflight = 0
@@ -126,11 +128,14 @@ class MockModel(_Server):
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
+                sid_in = self.headers.get("Mcp-Session-Id")
+                stdio = self.headers.get("X-GCL-Transport") == "stdio"  # the stdio bridge has no HTTP session
                 if method == "initialize":
                     # A fresh session per client: proxies key their state on it, and a
                     # shared id would merge scenarios into one conversation.
                     outer.mcp_sessions += 1
                     self._mcp_session = f"gcl-mcp-{outer.mcp_sessions}"
+                    outer.mcp_valid_sessions.add(self._mcp_session)
                     result = {"protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2025-03-26"),
                               "capabilities": {"tools": {}}, "serverInfo": {"name": "gcl-mock", "version": "1"}}
                 elif method == "tools/list":
@@ -139,8 +144,23 @@ class MockModel(_Server):
                                                          "required": ["note"]}}]}
                 elif method == "tools/call":
                     params = msg.get("params") or {}
-                    outer.events.append({"t": time.monotonic(), "body": params, "reply": outer.reply})
-                    outer.tool_events.append({"t": time.monotonic(), "body": json.dumps(params, ensure_ascii=False)})
+                    ok_session = stdio or sid_in in outer.mcp_valid_sessions
+                    ok_tool = params.get("name") == "gcl_probe" and isinstance(params.get("arguments"), dict)
+                    if not (ok_session and ok_tool):
+                        # Not executed: recorded apart from provider and tool events.
+                        outer.mcp_rejected.append({"t": time.monotonic(), "session": sid_in, "params": params})
+                        b = json.dumps({"jsonrpc": "2.0", "id": mid, "error": {
+                            "code": -32602, "message": "unknown session or tool"}}).encode()
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(b)))
+                        self.end_headers()
+                        self.wfile.write(b)
+                        return
+                    meta = {"session": sid_in or "stdio", "rpc_id": mid}
+                    outer.events.append({"t": time.monotonic(), "body": params, "reply": outer.reply, **meta})
+                    outer.tool_events.append({"t": time.monotonic(), "body": json.dumps(params, ensure_ascii=False),
+                                              **meta})
                     result = {"content": [{"type": "text", "text": outer.reply}], "isError": False}
                 else:
                     result = {}
@@ -320,6 +340,7 @@ class StandInScanner:
         self.inflight = 0
         self.stalled = 0
         self.latency_s = 0.0  # delay before every answer: a detector that takes time to decide
+        self.policy_fault: str | None = None  # applies to GET policy routes only
         self.by_sid: dict[str, tuple[dict, str]] = {}
         self._lock = threading.Lock()
         self._release = threading.Event()
@@ -365,6 +386,10 @@ class StandInScanner:
         """Set behaviour for the next scenario. With `sid`, the behaviour is also kept for
         that scenario: a late retry carrying its markers is answered the same way after
         the run has moved on, instead of with the newer scenario's behaviour."""
+        # A policy-source fault is not a check verdict: the check endpoint stays healthy
+        # (answering allow) and only the policy routes misbehave.
+        self.policy_fault = next((m for m in modes.values() if m in POLICY_FAULTS), None)
+        modes = {k: ("allow" if v in POLICY_FAULTS else v) for k, v in modes.items()}
         self.modes, self.modify_text = dict(modes), modify_text
         if sid is not None:
             self.by_sid[sid] = (dict(modes), modify_text)
@@ -527,7 +552,7 @@ class StandInScanner:
 
     def serve_get(self, h: BaseHTTPRequestHandler, listener: str) -> None:
         path = h.path.split("?", 1)[0].rstrip("/")
-        fault = next((m for m in self.modes.values() if m in POLICY_FAULTS), None)
+        fault = self.policy_fault
         for route, body in self.protocol.get_routes.items():
             if re.fullmatch(re.sub(r"<[^>/]+>", "[^/]+", route.rstrip("/")), path):
                 if fault and "polic" in route:

@@ -45,14 +45,18 @@ def _free_port() -> int:
     return port
 
 
+_MAX_BODY = 1 << 20  # keep at most 1 MiB of a client response
+
+
 def _post(url: str, body: dict, headers: dict | None, timeout_s: float) -> Observation:
     """POST with an absolute deadline. urllib's timeout bounds each socket operation, not
     the whole exchange, so a response dripped byte by byte could outlive it; the request
-    runs in a worker and whatever arrived by the deadline is kept."""
+    runs in a worker, whatever arrived by the deadline is kept, and then the socket is
+    shut down so the worker ends too."""
     t0 = time.perf_counter()
     req = urllib.request.Request(url, data=json.dumps(body, ensure_ascii=False).encode(),
                                  headers={"Content-Type": "application/json", **(headers or {})})
-    box: dict = {"chunks": [], "status": None}
+    box: dict = {"chunks": [], "status": None, "size": 0}
 
     def work():
         try:
@@ -60,28 +64,48 @@ def _post(url: str, body: dict, headers: dict | None, timeout_s: float) -> Obser
                 r = urllib.request.urlopen(req, timeout=timeout_s)
             except urllib.error.HTTPError as e:
                 r = e
+            box["resp"] = r
             box["status"] = r.status if hasattr(r, "status") else r.code
             read = getattr(r, "read1", None) or r.read  # read1: whatever has arrived
             with r:
                 while chunk := read(4096):
-                    box["chunks"].append(chunk)
+                    if box["size"] < _MAX_BODY:
+                        box["chunks"].append(chunk[:_MAX_BODY - box["size"]])
+                    box["size"] += len(chunk)
             box["done"] = True
         except urllib.error.URLError as e:
             box["error"] = e.reason
-        except Exception as e:  # socket timeout, reset mid-body, ...
+        except Exception as e:  # socket timeout, reset mid-body, our own shutdown, ...
             box["error"] = e
 
     th = threading.Thread(target=work, daemon=True)
     th.start()
     th.join(timeout_s)
     elapsed = time.perf_counter() - t0
+    if th.is_alive():
+        _shutdown(box.get("resp"))
+        th.join(2.0)
     text = b"".join(box["chunks"]).decode("utf-8", "replace")
-    if box.get("done"):
-        return Observation(box["status"], text, True, elapsed)
+    note = f" (body truncated at {_MAX_BODY} of {box['size']} bytes)" if box["size"] > _MAX_BODY else ""
+    if box.get("done") and elapsed <= timeout_s:
+        return Observation(box["status"], text, True, elapsed, note.strip())
     err = box.get("error")
-    if th.is_alive() or isinstance(err, (TimeoutError, socket.timeout)):
-        return Observation(box["status"], text, False, elapsed, "client deadline reached")
-    return Observation(box["status"], text, False, elapsed, f"transport failure: {err}", transport=True)
+    if elapsed >= timeout_s or isinstance(err, (TimeoutError, socket.timeout)):
+        return Observation(box["status"], text, False, elapsed, "client deadline reached" + note)
+    return Observation(box["status"], text, False, elapsed, f"transport failure: {err}{note}", transport=True)
+
+
+def _shutdown(resp) -> None:
+    """Shut down the socket under an http.client response, unblocking a reader."""
+    try:
+        sock = resp.fp.raw._sock  # HTTPResponse → SocketIO → socket
+    except AttributeError:
+        try:
+            sock = resp.fp.fp.raw._sock  # HTTPError wraps the response once more
+        except AttributeError:
+            return
+    with contextlib.suppress(OSError):
+        sock.shutdown(socket.SHUT_RDWR)
 
 
 def _wait_http(url: str, proc: subprocess.Popen, deadline_s: float, log: Path) -> None:
@@ -285,7 +309,7 @@ NEMO_JAILBREAK = Protocol(
         "modify": lambda body, m: {"jailbreak": False},  # not part of this protocol
     },
     stage_of=lambda body: "input",
-    path="/model",
+    path="/model", trust_listener=True,
     wrong_schema={"status": "ok"},
 )
 
@@ -524,9 +548,13 @@ def _chat_envelope(text: str) -> dict:
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
 
 
-def _stage_by_sentinel(body: dict) -> str:
-    """A judge request is for the output stage when it carries the model's reply."""
-    return "output" if "GCL-R-" in json.dumps(body, ensure_ascii=False) else "input"
+def _stage_by_sentinel(body: dict) -> str | None:
+    """Fallback stage inference for a guard that shares one URL and one model name
+    across stages: output if the body carries a reply marker and no user marker, input
+    for the reverse, None (rejected, never counted) when it carries both or neither."""
+    text = json.dumps(body, ensure_ascii=False)
+    u, r = "GCL-U-" in text, "GCL-R-" in text
+    return "output" if r and not u else "input" if u and not r else None
 
 
 def _refusal_envelope() -> dict:
@@ -602,12 +630,14 @@ class OpenAIGuardrails(Adapter):
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
-        judge = {"model": self.protocol.judge_model, "confidence_threshold": 0.7}
+        jm = self.protocol.judge_model
         cfg = {"version": 1,
                ("pre_flight" if self.profile == "pre_flight" else "input"):
-                   {"version": 1, "guardrails": [{"name": "Jailbreak", "config": judge}]},
+                   {"version": 1, "guardrails": [{"name": "Jailbreak", "config": {
+                       "model": f"{jm}-input", "confidence_threshold": 0.7}}]},
                "output": {"version": 1, "guardrails": [{"name": "Custom Prompt Check", "config": {
-                   **judge, "system_prompt_details": "Flag replies that disclose confidential data."}}]}}
+                   "model": f"{jm}-output", "confidence_threshold": 0.7,
+                   "system_prompt_details": "Flag replies that disclose confidential data."}}]}}
         self._cfg_path = self.workdir / "openai-guardrails.json"
         self._cfg_path.write_text(json.dumps(cfg, indent=2))
         self.port = _free_port()
@@ -678,11 +708,11 @@ class NemoSelfCheck(NemoServer):
                 parameters: {{base_url: "{model.openai_base}", api_key: sk-gcl}}
               - type: self_check_input
                 engine: openai
-                model: {judge}
+                model: {judge}-input
                 parameters: {{base_url: "{model.openai_base}", api_key: sk-gcl}}
               - type: self_check_output
                 engine: openai
-                model: {judge}
+                model: {judge}-output
                 parameters: {{base_url: "{model.openai_base}", api_key: sk-gcl}}
             rails:
               input:
@@ -720,7 +750,7 @@ OPENAI_MODERATION = Protocol(
     name="OpenAI moderation API (POST /v1/moderations)",
     verdicts={"allow": lambda b, m: _moderation(False), "block": lambda b, m: _moderation(True),
               "modify": lambda b, m: _moderation(False)},
-    stage_of=_stage_by_sentinel, path="/moderations",
+    stage_of=lambda body: _stage_by_sentinel({"input": body.get("input")}), path="/moderations",
     wrong_schema={"id": "modr-gcl", "model": "omni-moderation-latest", "results": [{"categories": {}}]},
     variants={"unknown_verdict": json.dumps(_moderation("DENY_UNKNOWN")),
               "verdict_type": json.dumps(_moderation("true"))},
@@ -771,6 +801,86 @@ class LangChainModeration(Adapter):
                      {"model": "gcl-mock", "messages": messages}, None, timeout_s)
 
 
+# --------------------------------------------------------------------------- Mastra
+def _mastra_verdict(flagged: bool):
+    def build(body: dict, m: str, stage: str | None = None) -> dict:
+        if stage == "output":  # ModerationProcessor schema
+            return {"category_scores": [{"category": "violence", "score": 0.95}] if flagged else [],
+                    "reason": "gcl stand-in" if flagged else None}
+        return {"categories": [{"type": "injection", "score": 0.95}] if flagged else [],  # PromptInjectionDetector
+                "reason": "gcl stand-in" if flagged else None}
+    return build
+
+
+MASTRA_JUDGE = Protocol(
+    name="Mastra model-backed processors (structured output in a chat completion)",
+    verdicts={"allow": _mastra_verdict(False), "block": _mastra_verdict(True), "modify": _mastra_verdict(False)},
+    stage_of=_stage_by_sentinel, path="/chat/completions",
+    malformed=b"I can't evaluate that request.",
+    envelope=_chat_envelope, trust_listener=True,
+    extra_faults={"judge_refusal": _refusal_envelope()},
+    # A score sent as a string: the right verdict in the wrong JSON type.
+    variants={"unknown_verdict": json.dumps({"categories": [{"type": "DENY_UNKNOWN", "score": 0.95}],
+                                             "category_scores": [{"category": "DENY_UNKNOWN", "score": 0.95}],
+                                             "reason": "gcl stand-in"}),
+              "verdict_type": json.dumps({"categories": [{"type": "injection", "score": "0.95"}],
+                                          "category_scores": [{"category": "violence", "score": "0.95"}],
+                                          "reason": "gcl stand-in"})},
+)
+
+
+class MastraAgent(Adapter):
+    """A Mastra agent (@mastra/core) with PromptInjectionDetector on input and
+    ModerationProcessor on output, each pointed at its own stand-in listener."""
+
+    name = "mastra"
+    runtime = "node"
+    protocol = MASTRA_JUDGE
+    capabilities: ClassVar[set[str]] = {"input", "output"}
+    _model_failures = ("error", "timeout", "malformed", "empty", "refused")
+    # Docs (agents/guardrails): model-backed guardrails default to errorStrategy 'warn',
+    # which "logs internal model failures and continues with the processor's fallback";
+    # 'strict' "stops processing with a tripwire". A schema-valid-looking but wrong
+    # verdict (missing field, unknown value, wrong type, a refusal) is not addressed.
+    documented: ClassVar[dict] = {"default": {**_BASE, **{f: "passed" for f in _model_failures}},
+                                  "strict": {**_BASE, **{f: "stopped" for f in _model_failures}}}
+    documented_sources: ClassVar[dict] = {"default": {
+        "source": "https://mastra.ai/docs/agents/guardrails", "read_for": "@mastra/core 1.75.0 (read 2026-10-10)",
+        "passage": "Model-backed guardrails other than ClassifierProcessor default to 'warn', which logs internal "
+                   "model failures and continues with the processor's fallback. 'strict' stops processing "
+                   "with a tripwire."}}
+    documented_sources["strict"] = documented_sources["default"]
+
+    def config_summary(self) -> dict:
+        return {"input": "PromptInjectionDetector(strategy=block)", "output": "ModerationProcessor(strategy=block)",
+                "errorStrategy": "warn" if self.profile == "default" else "strict", "call": "agent.generate"}
+
+    def versions(self) -> dict:
+        try:
+            v = json.loads((Path(self.python) / "node_modules/@mastra/core/package.json").read_text())["version"]
+        except (OSError, ValueError, KeyError):
+            v = None
+        node = subprocess.run(["node", "--version"], capture_output=True, text=True).stdout.strip()
+        return {"@mastra/core": v, "node": node}
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        self.port = _free_port()
+        cmd = ["node", str(_driver_path("mastra_driver.cjs")), "--env", str(Path(self.python).resolve()),
+               "--port", str(self.port), "--model-base", model.openai_base,
+               "--input-guard", f"{scanner.base_for('input')}/v1", "--output-guard", f"{scanner.base_for('output')}/v1",
+               "--error-strategy", "warn" if self.profile == "default" else "strict"]
+        env = dict(os.environ, NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost")
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env,
+                                         start_new_session=True, cwd=str(self.workdir))
+        _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 60, self.log)
+
+    def call(self, messages: list[dict], timeout_s: float) -> Observation:
+        return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                     {"model": "gcl-mock", "messages": messages}, None, timeout_s)
+
+
 ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": OpenAIGuardrails,
             "nemo-selfcheck": NemoSelfCheck, "portkey": PortkeyGateway,
-            "langchain-moderation": LangChainModeration, "reference": ReferenceGateway}
+            "langchain-moderation": LangChainModeration, "mastra": MastraAgent, "reference": ReferenceGateway}

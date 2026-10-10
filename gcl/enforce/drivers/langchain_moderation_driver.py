@@ -37,7 +37,7 @@ def main() -> None:
             pass
 
         def _json(self, code: int, obj: dict) -> None:
-            b = json.dumps(obj, ensure_ascii=False).encode()
+            b = json.dumps(obj, ensure_ascii=False, default=str).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(b)))
@@ -52,13 +52,15 @@ def main() -> None:
             try:
                 out = agent.invoke({"messages": body.get("messages", [])})
             except OpenAIModerationError as e:
-                self._json(400, {"error": {"type": "moderation", "message": str(e)[:300]}})
+                self._json(400, {"error": {"type": "moderation", "message": str(e), "detail": repr(e)}})
                 return
             except Exception as e:
-                self._json(500, {"error": {"type": type(e).__name__, "message": str(e)[:300]}})
+                self._json(500, {"error": {"type": type(e).__name__, "message": str(e), "detail": repr(e)}})
                 return
             last = out["messages"][-1]
-            self._json(200, {"choices": [{"index": 0, "message": {"role": "assistant", "content": last.content}}]})
+            # Every message the caller gets back, not only the last one.
+            self._json(200, {"choices": [{"index": 0, "message": {"role": "assistant", "content": last.content}}],
+                             "library_return": [m.model_dump() for m in out["messages"]]})
 
     ThreadingHTTPServer(("127.0.0.1", args.port), H).serve_forever()
 

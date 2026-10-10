@@ -62,8 +62,8 @@ else is labelled.
   marker (violated); rejecting the client, then forwarding 1 s later (caught as a late
   provider call, violated); never consulting the scanner (every scenario unverified);
   dropping the connection (transport failure, unverified) — checked.
-- Output "refused" is only judged when the model produced a reply and the input listener
-  stayed up; the client deadline is absolute against a server dripping one byte every
+- Output "refused" is only judged when the model produced a reply and the input check
+  has its own listener (not run where one URL serves both stages); the client deadline is absolute against a server dripping one byte every
   0.2 s; the stand-in rejects wrong paths and unknown stages; `--fail-on` is validated and
   a partly unverified run exits 2 — checked.
 - The reference gateway's strict build blocks rewrites with the wrong number of texts or
@@ -76,8 +76,16 @@ else is labelled.
   end through the same suite —
   checked locally, not in CI.
 
+## Review round 7 (tests/test_review_round7.py)
+- Fragments of the original (cut text, stripped marker, rewrite plus leftovers, marker-
+  only rewrite, Chinese runs) are "altered", not stopped or modified; "blocked after send"
+  needs a 4xx; a scanner answer served with another scenario's mode is not evidence; an
+  unsettled scenario gets no clean verdict while a proven leak still counts; a fault the
+  protocol cannot express is unverified; ambiguous judge requests are rejected; the
+  deadline worker is stopped — checked.
+
 ## Independent review
-- Seven adversarial review rounds by independent models (six by an OpenAI model, one by a
+- Eight adversarial review rounds by independent models (seven by an OpenAI model, one by a
   separate Claude instance) before release. Every issue they reproduced — wrong verdicts,
   misattributed timeouts, rewrites that changed what a rule matches, unbounded
   subprocesses, overclaims — was fixed and pinned by a regression test

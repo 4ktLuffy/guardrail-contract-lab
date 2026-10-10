@@ -152,7 +152,8 @@ Drives a **real** guardrail integration end to end, offline: LiteLLM's proxy gua
 (`generic_guardrail_api`, before and after the model call), NeMo Guardrails' built-in
 jailbreak-detection and self-check rails, openai-guardrails' LLM checks (a small driver serves the
 library over HTTP), the Portkey gateway's webhook guardrails (Node: `--env DIR`), LangChain's
-OpenAI moderation middleware, or the bundled reference gateway. LLM-as-judge guards get a stand-in
+OpenAI moderation middleware, Mastra's model-backed processors, or the bundled
+reference gateway. LLM-as-judge guards get a stand-in
 judge on the model's own endpoint, including the case where the judge model *refuses*
 to answer. The integration runs from
 its own environment (`--python`), unmodified. A stand-in scanner answers its real
@@ -164,7 +165,8 @@ provider, and when?) and the client (what exactly came back?). Payloads are comp
 whole, so a gateway that strips the marker but forwards the text, keeps part of the
 original in a rewrite, or forwards a second after rejecting the client is caught; a
 check that runs alongside the model call is reported as "blocked after send" — the client
-was refused, but the provider already saw the prompt. Adapters
+was refused, but the provider already saw the prompt; and a reply that is refused in the
+answer but still returned in the library's result is "retained". Adapters
 translate protocols only; they never interpret a verdict.
 
 Every scenario gets **two verdicts**: *policy* (strict fail-closed) and *documented*

@@ -407,7 +407,7 @@ def test_single_listener_stages_by_body_and_refuses_both():
 
 def test_adapters_registry():
     assert set(ADAPTERS) == {"litellm", "nemo", "nemo-selfcheck", "openai-guardrails", "portkey",
-                             "langchain-moderation", "reference"}
+                             "langchain-moderation", "mastra", "reference"}
 
 
 # Real integrations: these pin what was observed on litellm 1.104.2 and nemoguardrails
@@ -502,3 +502,20 @@ def test_real_langchain_moderation(tmp_path):
     for stage in ("input", "output"):
         assert _by(run, stage, "error")["observed"] == "stopped"
         assert _by(run, stage, "wrong_schema")["observed"] == "passed"  # result without "flagged"
+    end = run_contracts(LangChainModeration(LC_PY, tmp_path / "end", "default"), 30)
+    # exit_behavior="end": the flagged reply stays in the messages the agent returns.
+    assert _by(end, "output", "block")["observed"] == "retained"
+
+
+MASTRA_ENV = os.environ.get("GCL_INTEG_MASTRA_ENV")  # a dir with node_modules/@mastra/core
+
+
+@pytest.mark.skipif(not MASTRA_ENV, reason="set GCL_INTEG_MASTRA_ENV")
+def test_real_mastra_strict_holds_and_default_fails_open(tmp_path):
+    from gcl.enforce.adapters import MastraAgent
+
+    strict = run_contracts(MastraAgent(MASTRA_ENV, tmp_path / "s", "strict"), 30)
+    assert strict["summary"]["policy_violated"] == 0 and strict["summary"]["policy_held"] >= 18
+    default = run_contracts(MastraAgent(MASTRA_ENV, tmp_path / "d", "default"), 30)
+    assert _by(default, "input", "error")["documented"] == "conforms"
+    assert _by(default, "input", "judge_refusal")["observed"] == "passed"

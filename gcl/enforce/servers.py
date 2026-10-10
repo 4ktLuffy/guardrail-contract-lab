@@ -117,11 +117,15 @@ class MockModel(_Server):
                 except ValueError:
                     body = {"_unparseable": raw.decode("utf-8", "replace")}
                 j = outer.judge
-                if j is not None and isinstance(body, dict) and body.get("model") == j.protocol.judge_model:
+                jm = j.protocol.judge_model if j is not None else None
+                name = body.get("model") if isinstance(body, dict) else None
+                if j is not None and name in (jm, f"{jm}-input", f"{jm}-output"):
+                    # A per-stage judge name fixes the stage; the bare name leaves it to the body.
+                    stage = name.rsplit("-", 1)[1] if name != jm else None
                     with outer._lock:
                         outer.inflight -= 1  # the scanner counts this one
                     try:
-                        j.serve(self, None, raw)
+                        j.serve(self, stage, raw, by_name=stage is not None)
                     finally:
                         with outer._lock:
                             outer.inflight += 1
@@ -176,6 +180,9 @@ class Protocol:
     # One guard client serves both stages (one URL): adapters point it at the input
     # listener, the stage comes from the body, and "refused" closes that one listener.
     single_listener: bool = False
+    # Stage = the listener the request arrived on, whatever the body says (protocols whose
+    # body carries no stage, with one URL per stage).
+    trust_listener: bool = False
     # Protocol-specific faults: mode name -> full response body (sent with HTTP 200).
     extra_faults: dict = field(default_factory=dict)
     # Overrides for built-in content faults when verdicts are plain text, not JSON:
@@ -285,18 +292,18 @@ class StandInScanner:
             n += 1
         return n
 
-    def serve(self, h: BaseHTTPRequestHandler, listener: str | None, raw: bytes) -> None:
+    def serve(self, h: BaseHTTPRequestHandler, listener: str | None, raw: bytes, by_name: bool = False) -> None:
         """Answer one request on handler `h`. `listener` is the stage whose port it came
         in on, or None for a shared endpoint (the body then says which stage)."""
         with self._lock:
             self.inflight += 1
         try:
-            self._serve(h, listener, raw)
+            self._serve(h, listener, raw, by_name)
         finally:
             with self._lock:
                 self.inflight -= 1
 
-    def _serve(self, h: BaseHTTPRequestHandler, listener: str | None, raw: bytes) -> None:
+    def _serve(self, h: BaseHTTPRequestHandler, listener: str | None, raw: bytes, by_name: bool = False) -> None:
         proto = self.protocol
 
         def send(code: int, body: bytes, ctype: str = "application/json"):
@@ -318,21 +325,29 @@ class StandInScanner:
             body = {}
         claimed = proto.stage_of(body) if isinstance(body, dict) else None
         path_ok = not proto.path or h.path.rstrip("/").endswith(proto.path)
-        by_body = listener is None or proto.single_listener
-        valid = path_ok and claimed in self.STAGES and (by_body or claimed == listener)
-        stage = claimed if by_body else listener
+        if listener is not None and (by_name or proto.trust_listener):
+            valid, stage = path_ok, listener      # the stage is fixed by name or by port
+        else:
+            by_body = listener is None or proto.single_listener
+            valid = path_ok and claimed in self.STAGES and (by_body or claimed == listener)
+            stage = claimed if by_body else listener
         mode = self.modes.get(stage, "allow") if valid else "rejected"
         ev = {"t": time.monotonic(), "stage": stage, "claimed_stage": claimed,
               "path": h.path, "valid": valid, "mode": mode, "body": body,
-              "body_text": raw.decode("utf-8", "replace"), "answered": None}
+              "body_text": raw.decode("utf-8", "replace"), "answered": None, "fault_expressed": True}
         self.events.append(ev)
         if not valid:
             ev["answered"] = "400 (wrong path or stage)"
             send(400, b'{"error": "gcl stand-in: unexpected path or stage"}')
             return
         release = self._release
+
+        def verdict(name):
+            fn = proto.verdicts[name]
+            return fn(body, self.modify_text, stage) if fn.__code__.co_argcount >= 3 else fn(body, self.modify_text)
+
         if mode in VERDICTS:
-            resp = proto.verdicts[mode](body, self.modify_text)
+            resp = verdict(mode)
             ev["answered"] = resp
             content(resp if isinstance(resp, str) else json.dumps(resp, ensure_ascii=False))
         elif mode in proto.variants:
@@ -359,14 +374,15 @@ class StandInScanner:
         elif mode == "wrong_schema":
             ev["answered"] = proto.wrong_schema
             content(json.dumps(proto.wrong_schema))
-        elif mode == "unknown_verdict":
-            resp = _mangle_verdict(proto.verdicts["block"](body, self.modify_text))
+        elif mode in ("unknown_verdict", "verdict_type"):
+            block = verdict("block")
+            resp = (_mangle_verdict if mode == "unknown_verdict" else _type_confuse)(block) \
+                if isinstance(block, dict) else block
+            # A verdict shape the generic rewrite cannot reach would silently send a normal
+            # block; record that, so the scenario is judged unverified, not held.
+            ev["fault_expressed"] = resp != block
             ev["answered"] = resp
-            content(json.dumps(resp))
-        elif mode == "verdict_type":
-            resp = _type_confuse(proto.verdicts["block"](body, self.modify_text))
-            ev["answered"] = resp
-            content(json.dumps(resp))
+            content(resp if isinstance(resp, str) else json.dumps(resp))
         elif mode in proto.extra_faults:
             ev["answered"] = proto.extra_faults[mode]
             send(200, json.dumps(proto.extra_faults[mode], ensure_ascii=False).encode())

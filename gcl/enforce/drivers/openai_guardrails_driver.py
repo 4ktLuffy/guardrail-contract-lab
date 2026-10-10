@@ -32,7 +32,7 @@ def main() -> None:
             pass
 
         def _json(self, code: int, obj: dict) -> None:
-            b = json.dumps(obj, ensure_ascii=False).encode()
+            b = json.dumps(obj, ensure_ascii=False, default=str).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(b)))
@@ -47,13 +47,16 @@ def main() -> None:
             try:
                 r = client.chat.completions.create(model=args.model, messages=body.get("messages", []))
             except GuardrailTripwireTriggered as e:
-                self._json(400, {"error": {"type": "guardrail_tripwire", "message": str(e)[:300]}})
+                self._json(400, {"error": {"type": "guardrail_tripwire", "message": str(e),
+                                           "detail": repr(getattr(e, "guardrail_result", None))}})
                 return
             except Exception as e:  # anything else the library raised
-                self._json(500, {"error": {"type": type(e).__name__, "message": str(e)[:300]}})
+                self._json(500, {"error": {"type": type(e).__name__, "message": str(e), "detail": repr(e)}})
                 return
+            # Everything the caller could read, not just the first choice.
+            full = r.llm_response.model_dump() if hasattr(r, "llm_response") else repr(r)
             self._json(200, {"choices": [{"index": 0, "message": {
-                "role": "assistant", "content": r.choices[0].message.content}}]})
+                "role": "assistant", "content": r.choices[0].message.content}}], "library_return": full})
 
     ThreadingHTTPServer(("127.0.0.1", args.port), H).serve_forever()
 

@@ -58,16 +58,24 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
 - Offline by design: a scripted stand-in scanner and a mock model replace the real
   services. Results show how the integration's own enforcement code handles the scripted
   inputs — not detector accuracy, production networking, or every configuration.
-- Seven targets today: LiteLLM's `generic_guardrail_api` (pre_call + post_call), NeMo
+- Eight targets today: LiteLLM's `generic_guardrail_api` (pre_call + post_call), NeMo
   Guardrails' `jailbreak detection model` input rail and self-check input/output rails, openai-guardrails' LLM checks, the
   Portkey gateway's `default.webhook` hooks, LangChain's `OpenAIModerationMiddleware`,
-  and the bundled reference gateway.
-- When one guard client serves both stages (one URL), refusing it refuses both; an
-  output "refused" whose input check also failed closed is reported unverified.
+  Mastra's PromptInjectionDetector/ModerationProcessor, and the bundled reference gateway.
+- When one guard client serves both stages (one URL), refusing it refuses both, so the
+  output-stage "refused" scenario is not run for it.
+- Judges are told apart by a per-stage model name or URL where the integration allows
+  it; otherwise by the markers in the request, and a request carrying both or neither
+  is rejected rather than guessed.
 - A guard that calls the same endpoint as the model (LLM-as-judge on a shared client)
   cannot be "refused" without refusing the model too, so that scenario is skipped for it.
-  Libraries without a server run behind a small gcl driver that only maps the library's
-  block exception to HTTP 400 and other exceptions to 500.
+  Libraries without a server run behind a small gcl driver: the library's block
+  exception becomes HTTP 400, any other exception 500, a return value 200. The driver
+  passes the full exception text and the full return value (every message or field the
+  caller receives) to the client, so the judge sees what an application would see.
+- Leak detection looks for the whole original, its marker, or any fragment of it (two
+  consecutive words, or four characters in Chinese/Japanese). A paraphrase of the
+  original is not detected.
   Results are for the versions recorded in the report (gcl records them; it does not pin
   them) and the configuration printed there.
 - Synchronous, single-turn requests only. Streaming, multi-turn history, policy reload and

@@ -10,16 +10,24 @@ the text, or corrupts it on the way, is not "stopped".
                           client was not refused
                 blocked after send
                           the model received the original, but the client got a refusal
-                          instead of the reply (a check running alongside the model call):
+                          (HTTP 4xx) instead of the reply (a check running alongside the model call):
                           the provider still saw the prompt
                 modified  the model received the stand-in's exact rewrite, and no part
                           of the original
-                altered   the model received something else: the original changed or
-                          partly kept, or an unlabelled request during the scenario
+                altered   the model received something else: any fragment of the original
+                          (two consecutive words, or four characters in unspaced scripts),
+                          a rewrite with extra content, or an unlabelled request
+                failed after send
+                          the model received the original and the client got a server
+                          error (5xx), not a refusal
                 stopped   the model received nothing for this scenario
   output stage  passed    the client received the model's exact original reply
-                modified  the client received the exact rewrite instead
-                altered   the client received part of the original reply
+                modified  the client received exactly the rewrite instead
+                altered   the client received a fragment of the original reply, or the
+                          rewrite with extra content
+                retained  the client's answer did not carry the reply, but the library
+                          still returned it to the caller (e.g. in the message list a
+                          driver passes through as `library_return`)
                 stopped   a complete HTTP response arrived carrying neither
   both          no answer          no complete response by the client deadline
                 transport failure  the connection failed without an HTTP response
@@ -38,6 +46,7 @@ say nothing.
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import time
@@ -98,7 +107,7 @@ class Result:
     scenario: Scenario
     observed: str
     policy_expect: str
-    documented_expect: str | None
+    documented_expect: str | list[str] | None
     policy: str = ""           # held | violated | unverified
     documented: str = ""       # conforms | deviates | unspecified | unverified
     evidence: dict = field(default_factory=dict)
@@ -117,13 +126,17 @@ def build_scenarios(adapter: Adapter) -> list[Scenario]:
     if "output" in caps:
         plan += [("output", "allow", True), ("output", "block", True)]
     # A guard that shares the model's endpoint cannot be refused on its own.
-    faults = [f for f in FAULTS if not (f == "refused" and adapter.protocol.shared_endpoint)]
-    faults += list(adapter.protocol.extra_faults)
+    proto = adapter.protocol
+    faults = [f for f in FAULTS if not (f == "refused" and proto.shared_endpoint)]
+    faults += list(proto.extra_faults)
+    # One URL for both stages: an output "refused" also refuses the input check, so it
+    # cannot be told apart from an input failure. Not staged.
+    out_faults = [f for f in faults if not (f == "refused" and proto.single_listener)]
     plan += [("input", f, False) for f in faults]
     if "modify_input" in caps:
         plan.append(("input", "modify", False))
     if "output" in caps:
-        plan += [("output", f, False) for f in faults]
+        plan += [("output", f, False) for f in out_faults]
     if "modify_output" in caps:
         plan.append(("output", "modify", False))
     out = []
@@ -150,25 +163,58 @@ def _strings(obj) -> list[str]:
     return []
 
 
-def _client_strings(text: str) -> list[str]:
-    """What the client was actually told: JSON string values (escapes decoded), the
-    concatenated deltas of an event stream, and the raw text as a fallback."""
-    out = [text]
+def _client_strings(text: str, view: str = "answer") -> list[str]:
+    """What the client was told. view="answer": the response proper — JSON string values
+    (escapes decoded) except a driver's `library_return`, or the concatenated deltas of
+    an event stream, or the raw text. view="returned": only `library_return`, everything
+    else the library handed its caller."""
     try:
-        out += _strings(json.loads(text))
+        doc = json.loads(text)
     except ValueError:
-        deltas = []
-        for line in text.splitlines():
-            if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]"):
-                try:
-                    chunk = json.loads(line[5:])
-                except ValueError:
-                    continue
-                out += _strings(chunk)
-                for ch in chunk.get("choices") or []:
-                    deltas.append(((ch.get("delta") or {}).get("content")) or "")
-        out.append("".join(deltas))
+        doc = None
+    if isinstance(doc, dict):
+        if view == "returned":
+            return _strings(doc.get("library_return"))
+        return _strings({k: v for k, v in doc.items() if k != "library_return"})
+    if view == "returned":
+        return []
+    if doc is not None:
+        return _strings(doc)
+    out, deltas = [text], []
+    for line in text.splitlines():
+        if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]"):
+            try:
+                chunk = json.loads(line[5:])
+            except ValueError:
+                continue
+            out += _strings(chunk)
+            for ch in chunk.get("choices") or []:
+                deltas.append(((ch.get("delta") or {}).get("content")) or "")
+    out.append("".join(deltas))
     return out
+
+
+def _norm_words(text: str) -> list[str]:
+    return re.findall(r"\w+", text.lower())
+
+
+def _fragments(text: str) -> set[str]:
+    """Distinctive pieces of `text`: consecutive word pairs (at least 8 characters with
+    the space) for spaced scripts, 4-character runs for unspaced ones (Chinese,
+    Japanese)."""
+    words = _norm_words(text)
+    if len(words) >= 3:
+        return {f"{a} {b}" for a, b in itertools.pairwise(words) if len(a) + len(b) >= 7}
+    flat = "".join(words)
+    return {flat[i:i + 4] for i in range(max(0, len(flat) - 3))}
+
+
+def _leaks(original: str, texts: list[str], exclude: str = "") -> bool:
+    """Does any fragment of `original` (and not of `exclude`) appear in `texts`?"""
+    frags = _fragments(original) - _fragments(exclude)
+    spaced = " ".join(" ".join(_norm_words(t)) for t in texts)
+    flat = "".join("".join(_norm_words(t)) for t in texts)
+    return any((f in spaced) if " " in f else (f in flat) for f in frags)
 
 
 def classify_input(s: Scenario, bodies: list) -> str | None:
@@ -177,25 +223,33 @@ def classify_input(s: Scenario, bodies: list) -> str | None:
     if not bodies:
         return None
     texts = [x for b in bodies for x in _strings(b)]
-    exact = f"{s.user_text} {s.user_sentinel}"
-    if any(exact in t for t in texts):
+    if any(f"{s.user_text} {s.user_sentinel}" in t for t in texts):
         return "passed"
-    if any(s.user_text in t or s.user_sentinel in t for t in texts):
+    if any(s.user_sentinel in t for t in texts) or _leaks(s.user_text, texts, s.modify_text):
         return "altered"
-    if s.modify_text and any(s.modify_text in t for t in texts):
+    if s.modify_text and any(t.strip() == s.modify_text for t in texts):
         return "modified"
-    return "altered"
+    return "altered"  # a rewrite with extra content, or something unlabelled
 
 
 def classify_output(s: Scenario, obs) -> str | None:
-    texts = _client_strings(obs.text or "")
-    exact = f"{s.reply_text} {s.reply_sentinel}"
-    if any(exact in t for t in texts):
+    got = _classify_output_texts(s, _client_strings(obs.text or ""))
+    if got in (None, "modified"):
+        returned = _client_strings(obs.text or "", "returned")
+        if any(s.reply_sentinel in t for t in returned) or _leaks(s.reply_text, returned, s.modify_text):
+            return "retained"
+    return got
+
+
+def _classify_output_texts(s: Scenario, texts: list[str]) -> str | None:
+    if any(f"{s.reply_text} {s.reply_sentinel}" in t for t in texts):
         return "passed"
-    if any(s.reply_text in t or s.reply_sentinel in t for t in texts):
+    if any(s.reply_sentinel in t for t in texts) or _leaks(s.reply_text, texts, s.modify_text):
         return "altered"
-    if s.modify_text and any(s.modify_text in t for t in texts):
+    if s.modify_text and any(t.strip() == s.modify_text for t in texts):
         return "modified"
+    if s.modify_text and any(s.modify_text in t for t in texts):
+        return "altered"
     return None
 
 
@@ -204,7 +258,12 @@ def classify(s: Scenario, bodies: list, obs) -> str:
     if got == "passed" and s.stage == "input" and obs.finished:
         reply = f"{s.reply_text} {s.reply_sentinel}"
         if not any(reply in t for t in _client_strings(obs.text or "")):
-            return "blocked after send"
+            # The provider saw the prompt; what did the client get instead of the reply?
+            if obs.status is not None and 400 <= obs.status < 500:
+                return "blocked after send"
+            if obs.status is not None and obs.status >= 500:
+                return "failed after send"
+            return "altered"
     if got:
         return got
     if obs.finished:
@@ -287,10 +346,17 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         mev = owned(model_events, s.id, lambda e: json.dumps(e["body"], ensure_ascii=False))
         sev = owned(scanner_events, s.id, lambda e: e["body_text"])
         sentinel = s.user_sentinel if s.stage == "input" else s.reply_sentinel
-        consulted = sum(1 for e in sev if e["valid"] and e["stage"] == s.stage and sentinel in e["body_text"])
+        mine = [e for e in sev if e["valid"] and e["stage"] == s.stage and sentinel in e["body_text"]]
+        # Only answers served with this scenario's own mode count: a late retry answered
+        # by the next scenario's configuration is not evidence for this one.
+        consulted = sum(1 for e in mine if e["mode"] == s.mode)
+        foreign = sum(1 for e in mine if e["mode"] != s.mode)
+        unexpressed = any(not e.get("fault_expressed", True) for e in mine if e["mode"] == s.mode)
         late = [round(e["t"] - windows[s.id][1], 2) for e in mev if e["t"] > windows[s.id][1]]
-        r = Result(s, classify(s, [e["body"] for e in mev], obs), POLICY[s.mode],
-                   docs.get((s.stage, s.mode), docs.get(s.mode)),
+        expect = docs.get((s.stage, s.mode), docs.get(s.mode))
+        if isinstance(expect, (tuple, set, frozenset)):
+            expect = sorted(expect)  # several outcomes the docs allow
+        r = Result(s, classify(s, [e["body"] for e in mev], obs), POLICY[s.mode], expect,
                    evidence={
                        "client_status": obs.status, "client_finished": obs.finished,
                        "client_transport_failure": obs.transport,
@@ -300,6 +366,8 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
                        "model_requests": len(mev),
                        "model_events": [{"t": round(e["t"] - t0, 3), "body": e["body"]} for e in mev],
                        "scanner_consulted_stage": consulted,
+                       "scanner_answered_by_other_mode": foreign,
+                       "fault_not_expressible": unexpressed,
                        "scanner_events": [{"t": round(e["t"] - t0, 3), "listener": e["stage"],
                                            "claimed_stage": e["claimed_stage"], "path": e["path"],
                                            "valid": e["valid"], "mode": e["mode"], "body": e["body"],
@@ -341,7 +409,8 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
         if r.documented_expect is None:
             r.documented = "unspecified"
         else:
-            r.documented = "conforms" if r.observed == r.documented_expect else "deviates"
+            allowed = r.documented_expect if isinstance(r.documented_expect, list) else [r.documented_expect]
+            r.documented = "conforms" if r.observed in allowed else "deviates"
         if r.policy == "violated" and r.documented == "conforms":
             r.notes.append("documented behaviour for this configuration (not a bug; a policy choice)")
         if r.policy == "violated" and r.documented == "unspecified":
@@ -350,12 +419,18 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
         if ref and r.policy == "violated":
             r.notes.append(f"matches public issue {ref}")
 
+    leaks = ("passed", "altered", "blocked after send", "failed after send")
+
     def own_problem(r: Result) -> str | None:
         """Why this scenario, on its own evidence, cannot be judged."""
         s, ev = r.scenario, r.evidence
         if r.observed in ("no answer", "transport failure"):
             return ("no complete response before the client deadline" if r.observed == "no answer"
                     else "the connection failed without an HTTP response")
+        if ev.get("fault_not_expressible"):
+            return "this fault cannot be expressed in this protocol's verdict shape; not exercised"
+        if not ev.get("settled", True) and r.observed not in leaks:
+            return "the integration was still busy when the scenario ended; a clean result is not proven"
         if s.stage == "output" and ev["model_input"] != "passed":
             return "the model never received this scenario's request, so no reply was generated"
         if s.mode != "refused" and ev["scanner_consulted_stage"] == 0:
@@ -379,6 +454,8 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
         docs say for this configuration (e.g. a block that is documented to arrive after
         the model call). Either way the integration is shown to act on verdicts."""
         r = controls.get(key)
+        if r is not None and r.observed == "retained" and r.scenario.mode == "block":
+            return True  # the answer was refused; the leftover is reported on the control itself
         return r is not None and (r.policy == "held" or r.documented == "conforms")
 
     for r in results:

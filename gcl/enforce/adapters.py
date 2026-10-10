@@ -1202,8 +1202,58 @@ class NemoVendor(NemoServer):
         self._launch(cfgdir)
 
 
+# --------------------------------------------------------------------------- CrewAI
+CREWAI_JUDGE = judge_protocol(
+    "CrewAI LLMGuardrail (structured LLMGuardrailResult)",
+    allow={"valid": True, "feedback": None},
+    block={"valid": False, "feedback": "GCL-BLOCKED by the stand-in"})
+
+
+class CrewAITask(Adapter):
+    """A CrewAI crew: one agent with the probe tool, one task whose guardrail is
+    `LLMGuardrail` judged by the stand-in (model name `gcl-judge-output`). CrewAI checks
+    task output only. A failed or negative check re-runs the task, up to
+    `guardrail_max_retries` (3), then raises."""
+
+    name = "crewai"
+    protocol = CREWAI_JUDGE
+    capabilities: ClassVar[set[str]] = {"output", "tools"}
+    # LLMGuardrail.__call__ docstring: returns (False, error message) when validation
+    # raises; Task: "Maximum number of retries when guardrail fails" then an exception.
+    documented: ClassVar[dict] = {"default": {**_BASE, **{f: "stopped" for f in
+                                                          ("error", "timeout", "malformed", "empty")}}}
+    documented_sources: ClassVar[dict] = {"default": {
+        "source": "crewai 1.15.27: crewai/tasks/llm_guardrail.py and crewai/task.py",
+        "read_for": "crewai 1.15.27",
+        "passage": "LLMGuardrail returns (False, 'Error while validating the task output: ...') when the check "
+                   "fails; the task retries up to guardrail_max_retries and then raises."}}
+
+    def config_summary(self) -> dict:
+        return {"crew": "1 agent, 1 task", "guardrail": "LLMGuardrail(llm=gcl-judge-output)",
+                "guardrail_max_retries": 3, "tools": ["gcl_probe"]}
+
+    def versions(self) -> dict:
+        return _versions(self.python, ["crewai", "litellm", "openai"])
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        self.port = _free_port()
+        cmd = [self.python, str(_driver_path("crewai_driver.py")), "--port", str(self.port),
+               "--model-base", model.openai_base, "--tool-url", model.tool_url]
+        env = dict(os.environ, NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost",
+                   OPENAI_API_KEY="sk-gcl", CREWAI_DISABLE_TELEMETRY="true", OTEL_SDK_DISABLED="true")
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env,
+                                         start_new_session=True, cwd=str(self.workdir))
+        _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 120, self.log)
+
+    def call(self, messages: list[dict], timeout_s: float) -> Observation:
+        return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                     {"model": "gcl-mock", "messages": messages}, None, timeout_s)
+
+
 ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": OpenAIGuardrails,
             "nemo-selfcheck": NemoSelfCheck, "portkey": PortkeyGateway,
             "langchain-moderation": LangChainModeration, "mastra": MastraAgent, "openai-agents": OpenAIAgents,
             "pydantic-ai": PydanticAI, "litellm-vendor": LiteLLMVendor,
-            "nemo-vendor": NemoVendor, "reference": ReferenceGateway}
+            "nemo-vendor": NemoVendor, "crewai": CrewAITask, "reference": ReferenceGateway}

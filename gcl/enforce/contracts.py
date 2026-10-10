@@ -404,6 +404,8 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         if late:
             r.notes.append(f"{len(late)} provider call(s) arrived after the scenario had settled "
                            f"(+{max(late)} s); counted here")
+        if len(tools_run) > 1:
+            r.notes.append(f"the tool ran {len(tools_run)} times for one request")
         if s.id in unsettled:
             r.notes.append("the integration was still busy when the settle window ended")
         results.append(r)

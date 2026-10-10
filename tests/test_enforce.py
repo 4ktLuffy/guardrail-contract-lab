@@ -452,7 +452,7 @@ def test_an_output_only_integration_gets_output_controls_and_faults(tmp_path):
 def test_adapters_registry():
     assert set(ADAPTERS) == {"litellm", "nemo", "nemo-selfcheck", "openai-guardrails", "portkey",
                              "langchain-moderation", "mastra", "openai-agents", "pydantic-ai", "litellm-vendor",
-                             "nemo-vendor", "reference"}
+                             "nemo-vendor", "crewai", "reference"}
 
 
 # Real integrations: these pin what was observed on litellm 1.104.2 and nemoguardrails

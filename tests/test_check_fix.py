@@ -144,8 +144,12 @@ def test_fix_is_verified_and_check_comes_back_clean(tmp_path):
     res = run_check(load_rules(out), ["python", "node"], deadline_s=1.5, redos=False)
     split = {f.rule_id for f in res.findings if f.kind in ("compile_split", "match_split")}
     assert not (split & fixed_ids)  # every rewritten rule now agrees across engines
-    # The rule fix refused to touch (it hangs) still disagrees on Cyrillic \w: reported.
-    assert split <= {"repeated-noise"}
+    # Left alone and still reported: the rule that hangs (Cyrillic \w), and — on engines
+    # without ES2025 modifiers (Node < 23) — the rule using (?-i:…), which fix cannot rewrite.
+    from gcl.engines import get_engine
+
+    modern = get_engine("node").run(["(?-i:a)"], ["a"])[0].compiled
+    assert split <= ({"repeated-noise"} if modern else {"repeated-noise", "dan-strict"})
     # Comments in the original file survive the rewrite.
     assert out.read_text().startswith("# A small, deliberately flawed rule set")
 

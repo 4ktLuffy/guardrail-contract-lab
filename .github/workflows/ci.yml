@@ -4,6 +4,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false  # one engine version failing must not hide the others' results
       matrix:
         python: ["3.11", "3.12", "3.13"]
         node: ["20", "22"]

@@ -319,12 +319,16 @@ def test_reference_strict_rejects_malformed_rewrites():
 
 
 def test_cli_rejects_unknown_fail_on_and_reports_incomplete_runs():
+    import re
+
     from typer.testing import CliRunner
 
     from gcl.cli import _enforce_exit, app
 
-    res = CliRunner().invoke(app, ["enforce", "reference", "--python", sys.executable, "--fail-on", "polcy"])
-    assert res.exit_code == 2 and "fail-on" in res.output.lower()
+    res = CliRunner(env={"COLUMNS": "200", "NO_COLOR": "1", "TERM": "dumb"}).invoke(
+        app, ["enforce", "reference", "--python", sys.executable, "--fail-on", "polcy"])
+    plain = re.sub(r"\x1b\[[0-9;]*m|[│╭╮╰╯─\s]", "", res.output.lower())  # colour, box, wrapping
+    assert res.exit_code == 2 and "fail-on" in plain
     s = {"scenarios": 10, "policy_held": 8, "policy_violated": 0, "unverified": 2, "documented_deviates": 0}
     assert _enforce_exit(s, "policy", allow_incomplete=False) == 2
     assert _enforce_exit(s, "policy", allow_incomplete=True) == 0

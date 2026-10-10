@@ -6,7 +6,12 @@ sentinels, and classifies what happened from the independent observers. Payloads
 compared whole, not by sentinel alone: a gateway that strips the marker but forwards
 the text, or corrupts it on the way, is not "stopped".
 
-  input stage   passed    the model received the exact original user text
+  input stage   passed    the model received the exact original user text, and the
+                          client was not refused
+                blocked after send
+                          the model received the original, but the client got a refusal
+                          instead of the reply (a check running alongside the model call):
+                          the provider still saw the prompt
                 modified  the model received the stand-in's exact rewrite, and no part
                           of the original
                 altered   the model received something else: the original changed or
@@ -64,7 +69,8 @@ REDACTED = {"es": "[contenido retirado por la política]", "fr": "[contenu retir
             "it": "[contenuto rimosso dalla policy]", "ja": "[ポリシーにより削除されました]",
             "hi": "[नीति के कारण सामग्री हटाई गई]"}
 
-POLICY = {"allow": "passed", "block": "stopped", "modify": "modified", **{f: "stopped" for f in FAULTS}}
+POLICY = {"allow": "passed", "block": "stopped", "modify": "modified", **{f: "stopped" for f in FAULTS},
+          "judge_refusal": "stopped"}
 
 
 @dataclass
@@ -110,11 +116,14 @@ def build_scenarios(adapter: Adapter) -> list[Scenario]:
     plan: list[tuple[str, str, bool]] = [("input", "allow", True), ("input", "block", True)]
     if "output" in caps:
         plan += [("output", "allow", True), ("output", "block", True)]
-    plan += [("input", f, False) for f in FAULTS]
+    # A guard that shares the model's endpoint cannot be refused on its own.
+    faults = [f for f in FAULTS if not (f == "refused" and adapter.protocol.shared_endpoint)]
+    faults += list(adapter.protocol.extra_faults)
+    plan += [("input", f, False) for f in faults]
     if "modify_input" in caps:
         plan.append(("input", "modify", False))
     if "output" in caps:
-        plan += [("output", f, False) for f in FAULTS]
+        plan += [("output", f, False) for f in faults]
     if "modify_output" in caps:
         plan.append(("output", "modify", False))
     out = []
@@ -192,6 +201,10 @@ def classify_output(s: Scenario, obs) -> str | None:
 
 def classify(s: Scenario, bodies: list, obs) -> str:
     got = classify_input(s, bodies) if s.stage == "input" else classify_output(s, obs)
+    if got == "passed" and s.stage == "input" and obs.finished:
+        reply = f"{s.reply_text} {s.reply_sentinel}"
+        if not any(reply in t for t in _client_strings(obs.text or "")):
+            return "blocked after send"
     if got:
         return got
     if obs.finished:
@@ -226,7 +239,8 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
     unsettled: set[str] = set()
     started = time.time()
     t0 = time.monotonic()
-    with MockModel("…") as model, StandInScanner(adapter.protocol) as scanner:
+    with StandInScanner(adapter.protocol) as scanner, \
+            MockModel("…", judge=scanner if adapter.protocol.shared_endpoint else None) as model:
         scanner.configure({"input": "allow", "output": "allow"})
         try:
             say(f"starting {adapter.name} ({adapter.profile})")
@@ -361,8 +375,11 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
         verdict(r, why)
 
     def held(key) -> bool:
+        """Usable as a control: it held the strict policy, or it did exactly what the
+        docs say for this configuration (e.g. a block that is documented to arrive after
+        the model call). Either way the integration is shown to act on verdicts."""
         r = controls.get(key)
-        return r is not None and r.policy == "held"
+        return r is not None and (r.policy == "held" or r.documented == "conforms")
 
     for r in results:
         s = r.scenario

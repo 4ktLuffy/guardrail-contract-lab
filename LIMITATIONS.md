@@ -58,8 +58,13 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
 - Offline by design: a scripted stand-in scanner and a mock model replace the real
   services. Results show how the integration's own enforcement code handles the scripted
   inputs — not detector accuracy, production networking, or every configuration.
-- Three targets today: LiteLLM's `generic_guardrail_api` (pre_call + post_call), NeMo
-  Guardrails' `jailbreak detection model` input rail, and the bundled reference gateway.
+- Four targets today: LiteLLM's `generic_guardrail_api` (pre_call + post_call), NeMo
+  Guardrails' `jailbreak detection model` input rail, openai-guardrails' LLM checks, and
+  the bundled reference gateway.
+- A guard that calls the same endpoint as the model (LLM-as-judge on a shared client)
+  cannot be "refused" without refusing the model too, so that scenario is skipped for it.
+  Libraries without a server run behind a small gcl driver that only maps the library's
+  block exception to HTTP 400 and other exceptions to 500.
   Results are for the versions recorded in the report (gcl records them; it does not pin
   them) and the configuration printed there.
 - Synchronous, single-turn requests only. Streaming, multi-turn history, policy reload and

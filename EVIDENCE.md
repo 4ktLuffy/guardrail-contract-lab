@@ -68,8 +68,12 @@ else is labelled.
   a partly unverified run exits 2 — checked.
 - The reference gateway's strict build blocks rewrites with the wrong number of texts or
   non-string texts — checked.
-- Real integrations (opt-in, `GCL_INTEG_PYTHON`): LiteLLM 1.104.2 proxy and NeMo Guardrails
-  0.24.1 server run end to end through the same suite — checked locally, not in CI.
+- A check that runs alongside the model call is classified "blocked after send"; judge
+  calls on the model's endpoint are routed to the stand-in, staged by content, and never
+  counted as provider calls; a judge refusal is answered as OpenAI does — checked.
+- Real integrations (opt-in, `GCL_INTEG_PYTHON`): LiteLLM 1.104.2 proxy, NeMo Guardrails
+  0.24.1 server and openai-guardrails 0.3.3 run end to end through the same suite —
+  checked locally, not in CI.
 
 ## Independent review
 - Seven adversarial review rounds by independent models (six by an OpenAI model, one by a
@@ -77,7 +81,7 @@ else is labelled.
   misattributed timeouts, rewrites that changed what a rule matches, unbounded
   subprocesses, overclaims — was fixed and pinned by a regression test
   (`tests/test_review_round*.py` and the suites above).
-- Local runs: 127 tests pass (plus 2 opt-in real-integration tests) on Python 3.11.14 and
+- Local runs: 133 tests pass (plus 2 opt-in real-integration tests) on Python 3.11.14 and
   3.13.15 with Node 25.8.0; the demo runs
   from an installed wheel outside the checkout.
 

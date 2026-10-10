@@ -412,4 +412,121 @@ class ReferenceGateway(Adapter):
                      {"model": "gcl-mock", "messages": messages}, None, timeout_s)
 
 
-ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "reference": ReferenceGateway}
+# --------------------------------------------------------------------------- LLM judges
+def _chat_envelope(text: str) -> dict:
+    return {"id": "gcl-judge", "object": "chat.completion", "created": int(time.time()),
+            "model": "gcl-judge",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+
+
+def _stage_by_sentinel(body: dict) -> str:
+    """A judge request is for the output stage when it carries the model's reply."""
+    return "output" if "GCL-R-" in json.dumps(body, ensure_ascii=False) else "input"
+
+
+def _refusal_envelope() -> dict:
+    """What an OpenAI model returns when it refuses under structured outputs: no
+    content, a `refusal` string. A prompt that makes the judge refuse produces this."""
+    env = _chat_envelope("")
+    env["choices"][0]["message"] = {"role": "assistant", "content": None,
+                                    "refusal": "I'm sorry, I can't assist with that request."}
+    return env
+
+
+def judge_protocol(name: str, allow: dict, block: dict, wrong_schema: dict | None = None) -> Protocol:
+    """An LLM-as-judge guard: verdict JSON inside a chat completion, served on the
+    model's own endpoint under model name `gcl-judge`. Adds the fault `judge_refusal`."""
+    return Protocol(name=name,
+                    verdicts={"allow": lambda b, m: dict(allow), "block": lambda b, m: dict(block),
+                              "modify": lambda b, m: dict(allow)},
+                    stage_of=_stage_by_sentinel, path="/chat/completions",
+                    malformed=b"I can't evaluate that request.",
+                    wrong_schema=wrong_schema or {"status": "ok"},
+                    envelope=_chat_envelope, shared_endpoint=True,
+                    extra_faults={"judge_refusal": _refusal_envelope()})
+
+
+def _driver_path(name: str) -> Path:
+    return Path(__file__).resolve().parent / "drivers" / name
+
+
+OPENAI_GUARDRAILS_JUDGE = judge_protocol(
+    "openai-guardrails LLM check (structured JSON)",
+    allow={"flagged": False, "confidence": 0.0, "reason": "gcl stand-in: allow"},
+    block={"flagged": True, "confidence": 0.99, "reason": "gcl stand-in: block"})
+
+
+class OpenAIGuardrails(Adapter):
+    """openai-guardrails' `GuardrailsOpenAI` client with an LLM `Jailbreak` check on input
+    and an LLM `Custom Prompt Check` on output, both judged by the stand-in."""
+
+    name = "openai-guardrails"
+    protocol = OPENAI_GUARDRAILS_JUDGE
+    capabilities: ClassVar[set[str]] = {"input", "output"}
+    _ERR = ("error", "timeout", "malformed")
+    # The client docstring: raise_guardrail_errors "If False (default), treat guardrail
+    # execution errors as safe and continue." An error, a timeout and an unparseable
+    # verdict are execution errors; an empty verdict, a judge refusal, a verdict without
+    # `flagged` or with an unknown value are not addressed. The runtime docstring:
+    # "input: Checks on the user's prompt (may run concurrently with LLM call)";
+    # "pre_flight: Checks that run before the LLM request is issued."
+    documented: ClassVar[dict] = {
+        "default": {**_BASE, ("input", "block"): "blocked after send",
+                    **{f: "passed" for f in _ERR}},
+        "raise_errors": {**_BASE, ("input", "block"): "blocked after send",
+                         **{("input", f): "blocked after send" for f in _ERR},
+                         **{("output", f): "stopped" for f in _ERR}},
+        "pre_flight": {**_BASE, **{f: "stopped" for f in _ERR}},
+    }
+    _src = "openai-guardrails 0.3.3: guardrails/client.py (GuardrailsOpenAI) and guardrails/runtime.py docstrings"
+    _p_err = ("raise_guardrail_errors: If True, raise exceptions when guardrails fail to execute. If False "
+              "(default), treat guardrail execution errors as safe and continue.")
+    _p_stage = ("input: Checks on the user's prompt (may run concurrently with LLM call). pre_flight: Checks "
+                "that run before the LLM request is issued.")
+    documented_sources: ClassVar[dict] = {
+        "default": {"source": _src, "read_for": "openai-guardrails 0.3.3", "passage": f"{_p_err} {_p_stage}"}}
+    documented_sources["raise_errors"] = documented_sources["pre_flight"] = documented_sources["default"]
+
+    def config_summary(self) -> dict:
+        stage = "pre_flight" if self.profile == "pre_flight" else "input"
+        return {"client": "GuardrailsOpenAI", stage: "Jailbreak (LLM)", "output": "Custom Prompt Check (LLM)",
+                "raise_guardrail_errors": self.profile != "default", "client_timeout_s": 8}
+
+    def versions(self) -> dict:
+        return _versions(self.python, ["openai-guardrails", "openai"])
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        judge = {"model": self.protocol.judge_model, "confidence_threshold": 0.7}
+        cfg = {"version": 1,
+               ("pre_flight" if self.profile == "pre_flight" else "input"):
+                   {"version": 1, "guardrails": [{"name": "Jailbreak", "config": judge}]},
+               "output": {"version": 1, "guardrails": [{"name": "Custom Prompt Check", "config": {
+                   **judge, "system_prompt_details": "Flag replies that disclose confidential data."}}]}}
+        self._cfg_path = self.workdir / "openai-guardrails.json"
+        self._cfg_path.write_text(json.dumps(cfg, indent=2))
+        self.port = _free_port()
+        cmd = [self.python, str(_driver_path("openai_guardrails_driver.py")), "--port", str(self.port),
+               "--base-url", model.openai_base, "--config", str(self._cfg_path), "--timeout", "8"]
+        if self.profile != "default":
+            cmd.append("--raise-guardrail-errors")
+        env = dict(os.environ, NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost",
+                   OPENAI_API_KEY="sk-gcl")
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env,
+                                         start_new_session=True, cwd=str(self.workdir))
+        _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 60, self.log)
+
+    def config_files(self) -> dict:
+        p = getattr(self, "_cfg_path", None)
+        return {p.name: p.read_text()} if p and p.exists() else {}
+
+    def call(self, messages: list[dict], timeout_s: float) -> Observation:
+        return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                     {"model": "gcl-mock", "messages": messages}, None, timeout_s)
+
+
+ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": OpenAIGuardrails,
+            "reference": ReferenceGateway}

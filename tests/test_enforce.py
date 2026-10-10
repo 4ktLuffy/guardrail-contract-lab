@@ -238,7 +238,8 @@ def test_a_delayed_forward_after_the_rejection_is_caught(tmp_path):
 
     run = run_contracts(_Fake(tmp_path, late), 5, settle_s=0.3)
     r = _by(run, "input", "block")
-    assert (r["observed"], r["policy"]) == ("passed", "violated")
+    # The client was refused, but the provider got the prompt a second later.
+    assert (r["observed"], r["policy"]) == ("blocked after send", "violated")
     assert r["evidence"]["late_provider_calls_s"]
     assert any("after the scenario had settled" in n for n in r["notes"])
 
@@ -328,8 +329,48 @@ def test_cli_rejects_unknown_fail_on_and_reports_incomplete_runs():
     assert _enforce_exit({**s, "policy_violated": 1}, "never", allow_incomplete=False) == 0
 
 
+def test_judge_requests_are_routed_to_the_standin_and_staged_by_content():
+    from gcl.enforce.adapters import OPENAI_GUARDRAILS_JUDGE as P
+
+    with StandInScanner(P) as sc, MockModel("ok", judge=sc) as m:
+        sc.configure({"input": "block", "output": "judge_refusal"})
+        url = m.openai_base + "/chat/completions"
+        r = _post_json(url, {"model": "gcl-judge", "messages": [{"role": "user", "content": "hola GCL-U-i01"}]})
+        assert '"flagged": true' in r["choices"][0]["message"]["content"]
+        r = _post_json(url, {"model": "gcl-judge", "messages": [{"role": "user", "content": "réponse GCL-R-o02"}]})
+        assert r["choices"][0]["message"]["content"] is None and r["choices"][0]["message"]["refusal"]
+        _post_json(url, {"model": "gcl-mock", "messages": [{"role": "user", "content": "x"}]})
+        assert [e["stage"] for e in sc.events] == ["input", "output"]
+        assert len(m.events) == 1  # judge calls are not provider calls
+
+
+def test_shared_endpoint_guards_skip_refused_and_add_judge_faults(tmp_path):
+    from gcl.enforce.adapters import OpenAIGuardrails
+
+    sc = build_scenarios(OpenAIGuardrails(sys.executable, tmp_path))
+    modes = {(s.stage, s.mode) for s in sc}
+    assert ("input", "refused") not in modes and ("input", "judge_refusal") in modes
+    assert POLICY["judge_refusal"] == "stopped"
+
+
+def test_a_check_running_alongside_the_model_is_blocked_after_send(tmp_path):
+    def parallel(g, m):
+        reply = g.forward(m)                       # the model call is already out
+        v = g.scan("input", [m[0]["content"]]) or {}
+        if v.get("action") != "NONE":
+            return 400, {"error": "blocked"}
+        o = g.scan("output", [reply]) or {}
+        if o.get("action") != "NONE":
+            return 400, {"error": "blocked"}
+        return 200, {"choices": [{"message": {"content": reply}}]}
+
+    run = run_contracts(_Fake(tmp_path, parallel), 5, settle_s=0.3)
+    r = _by(run, "input", "block")
+    assert (r["observed"], r["policy"]) == ("blocked after send", "violated")
+
+
 def test_adapters_registry():
-    assert set(ADAPTERS) == {"litellm", "nemo", "reference"}
+    assert set(ADAPTERS) == {"litellm", "nemo", "openai-guardrails", "reference"}
 
 
 # Real integrations: these pin what was observed on litellm 1.104.2 and nemoguardrails
@@ -369,3 +410,16 @@ def test_real_nemo_jailbreak_rail(tmp_path):
     r = _by(run, "input", "error")
     assert (r["observed"], r["policy"], r["documented"]) == ("passed", "violated", "conforms")
     assert _by(run, "input", "wrong_schema")["observed"] == "passed"
+
+
+@needs_integ
+def test_real_openai_guardrails_pre_flight(tmp_path):
+    from gcl.enforce.adapters import OpenAIGuardrails
+
+    run = run_contracts(OpenAIGuardrails(INTEG, tmp_path, "pre_flight"), 45)
+    _controls_hold(run)
+    assert _by(run, "input", "error")["observed"] == "stopped"
+    # A judge that refuses, or answers nothing, reads as "not flagged" (0.3.3).
+    for stage in ("input", "output"):
+        for f in ("judge_refusal", "empty"):
+            assert _by(run, stage, f)["observed"] == "passed", (stage, f)

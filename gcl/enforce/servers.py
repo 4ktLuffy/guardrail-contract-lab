@@ -45,8 +45,9 @@ class _Server:
 class MockModel(_Server):
     """OpenAI-compatible /v1/chat/completions with a fixed reply (streamed or not)."""
 
-    def __init__(self, reply: str, model: str = "gcl-mock"):
+    def __init__(self, reply: str, model: str = "gcl-mock", judge: StandInScanner | None = None):
         self.reply, self.model = reply, model
+        self.judge = judge  # requests for judge.protocol.judge_model are the guard's, not the model's
         self.events: list[dict] = []        # append-only: {"t", "body", "reply"}
         self.unexpected: list[str] = []
         self.inflight = 0
@@ -115,6 +116,16 @@ class MockModel(_Server):
                     body = json.loads(raw or b"{}")
                 except ValueError:
                     body = {"_unparseable": raw.decode("utf-8", "replace")}
+                j = outer.judge
+                if j is not None and isinstance(body, dict) and body.get("model") == j.protocol.judge_model:
+                    with outer._lock:
+                        outer.inflight -= 1  # the scanner counts this one
+                    try:
+                        j.serve(self, None, raw)
+                    finally:
+                        with outer._lock:
+                            outer.inflight += 1
+                    return
                 outer.events.append({"t": time.monotonic(), "body": body, "reply": outer.reply})
                 created = int(time.time())
                 if body.get("stream"):
@@ -154,6 +165,16 @@ class Protocol:
     path: str = ""                      # path suffix the integration must POST to ("" = any)
     malformed: bytes = b"<html>upstream error</html>"
     wrong_schema: dict = field(default_factory=lambda: {"status": "ok"})
+    # LLM-as-judge guards: the verdict is the *content* of a chat completion. When set,
+    # every answer that has a body (verdicts and content faults) is wrapped by it; an
+    # HTTP-level "error" stays a 500.
+    envelope: Callable[[str], dict] | None = None
+    # The guard calls the same endpoint as the model (routed by model name), so the
+    # stage comes from the request body and "refused" cannot be staged for it alone.
+    shared_endpoint: bool = False
+    judge_model: str = "gcl-judge"
+    # Protocol-specific faults: mode name -> full response body (sent with HTTP 200).
+    extra_faults: dict = field(default_factory=dict)
 
 
 # Modes a stage can be put in. Verdict modes answer correctly; fault modes misbehave.
@@ -254,82 +275,97 @@ class StandInScanner:
             n += 1
         return n
 
+    def serve(self, h: BaseHTTPRequestHandler, listener: str | None, raw: bytes) -> None:
+        """Answer one request on handler `h`. `listener` is the stage whose port it came
+        in on, or None for a shared endpoint (the body then says which stage)."""
+        with self._lock:
+            self.inflight += 1
+        try:
+            self._serve(h, listener, raw)
+        finally:
+            with self._lock:
+                self.inflight -= 1
+
+    def _serve(self, h: BaseHTTPRequestHandler, listener: str | None, raw: bytes) -> None:
+        proto = self.protocol
+
+        def send(code: int, body: bytes, ctype: str = "application/json"):
+            h.send_response(code)
+            h.send_header("Content-Type", ctype)
+            h.send_header("Content-Length", str(len(body)))
+            h.end_headers()
+            h.wfile.write(body)
+
+        def content(text: str, code: int = 200, ctype: str = "application/json"):
+            if proto.envelope is not None:
+                send(code, json.dumps(proto.envelope(text), ensure_ascii=False).encode())
+            else:
+                send(code, text.encode(), ctype)
+
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError:
+            body = {}
+        claimed = proto.stage_of(body) if isinstance(body, dict) else None
+        path_ok = not proto.path or h.path.rstrip("/").endswith(proto.path)
+        valid = path_ok and claimed in self.STAGES and (listener is None or claimed == listener)
+        stage = listener or claimed
+        mode = self.modes.get(stage, "allow") if valid else "rejected"
+        ev = {"t": time.monotonic(), "stage": stage, "claimed_stage": claimed,
+              "path": h.path, "valid": valid, "mode": mode, "body": body,
+              "body_text": raw.decode("utf-8", "replace"), "answered": None}
+        self.events.append(ev)
+        if not valid:
+            ev["answered"] = "400 (wrong path or stage)"
+            send(400, b'{"error": "gcl stand-in: unexpected path or stage"}')
+            return
+        release = self._release
+        if mode in VERDICTS:
+            resp = proto.verdicts[mode](body, self.modify_text)
+            ev["answered"] = resp
+            content(json.dumps(resp, ensure_ascii=False))
+        elif mode == "error":
+            ev["answered"] = "500"
+            send(500, b'{"error": "internal"}')
+        elif mode == "timeout":
+            ev["answered"] = "(held open, no answer)"
+            with self._lock:
+                self.stalled += 1
+            try:
+                release.wait(300)  # never answer while the scenario runs
+            finally:
+                with self._lock:
+                    self.stalled -= 1
+        elif mode == "malformed":
+            ev["answered"] = proto.malformed.decode()
+            content(proto.malformed.decode(), ctype="text/html")
+        elif mode == "empty":
+            ev["answered"] = ""
+            content("")
+        elif mode == "wrong_schema":
+            ev["answered"] = proto.wrong_schema
+            content(json.dumps(proto.wrong_schema))
+        elif mode == "unknown_verdict":
+            resp = _mangle_verdict(proto.verdicts["block"](body, self.modify_text))
+            ev["answered"] = resp
+            content(json.dumps(resp))
+        elif mode in proto.extra_faults:
+            ev["answered"] = proto.extra_faults[mode]
+            send(200, json.dumps(proto.extra_faults[mode], ensure_ascii=False).encode())
+        else:
+            ev["answered"] = "500 (unknown gcl mode)"
+            send(500, b'{"error": "unknown gcl mode"}')
+
     def handler_factory(self, listener: str):
         outer = self
-        proto = self.protocol
 
         class H(BaseHTTPRequestHandler):
             def log_message(self, *a):
                 pass
 
-            def _send(self, code: int, body: bytes, ctype: str = "application/json"):
-                self.send_response(code)
-                self.send_header("Content-Type", ctype)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
             def do_POST(self):
-                with outer._lock:
-                    outer.inflight += 1
-                try:
-                    self._post()
-                finally:
-                    with outer._lock:
-                        outer.inflight -= 1
-
-            def _post(self):
                 n = int(self.headers.get("Content-Length") or 0)
-                raw = self.rfile.read(n)
-                try:
-                    body = json.loads(raw or b"{}")
-                except ValueError:
-                    body = {}
-                claimed = proto.stage_of(body) if isinstance(body, dict) else None
-                path_ok = not proto.path or self.path.rstrip("/").endswith(proto.path)
-                valid = path_ok and claimed == listener
-                mode = outer.modes.get(listener, "allow") if valid else "rejected"
-                ev = {"t": time.monotonic(), "stage": listener, "claimed_stage": claimed,
-                      "path": self.path, "valid": valid, "mode": mode, "body": body,
-                      "body_text": raw.decode("utf-8", "replace"), "answered": None}
-                outer.events.append(ev)
-                if not valid:
-                    ev["answered"] = "400 (wrong path or stage)"
-                    self._send(400, b'{"error": "gcl stand-in: unexpected path or stage"}')
-                    return
-                release = outer._release
-                if mode in VERDICTS:
-                    resp = proto.verdicts[mode](body, outer.modify_text)
-                    ev["answered"] = resp
-                    self._send(200, json.dumps(resp, ensure_ascii=False).encode())
-                elif mode == "error":
-                    ev["answered"] = "500"
-                    self._send(500, b'{"error": "internal"}')
-                elif mode == "timeout":
-                    ev["answered"] = "(held open, no answer)"
-                    with outer._lock:
-                        outer.stalled += 1
-                    try:
-                        release.wait(300)  # never answer while the scenario runs
-                    finally:
-                        with outer._lock:
-                            outer.stalled -= 1
-                elif mode == "malformed":
-                    ev["answered"] = proto.malformed.decode()
-                    self._send(200, proto.malformed, "text/html")
-                elif mode == "empty":
-                    ev["answered"] = ""
-                    self._send(200, b"")
-                elif mode == "wrong_schema":
-                    ev["answered"] = proto.wrong_schema
-                    self._send(200, json.dumps(proto.wrong_schema).encode())
-                elif mode == "unknown_verdict":
-                    resp = _mangle_verdict(proto.verdicts["block"](body, outer.modify_text))
-                    ev["answered"] = resp
-                    self._send(200, json.dumps(resp).encode())
-                else:
-                    ev["answered"] = "500 (unknown gcl mode)"
-                    self._send(500, b'{"error": "unknown gcl mode"}')
+                outer.serve(self, listener, self.rfile.read(n))
 
         return H
 

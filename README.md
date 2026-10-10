@@ -144,18 +144,24 @@ The contract says what each fault must do; the default is fail closed.
 gcl enforce reference --python python3 --profile naive        # bundled reference gateway
 gcl enforce litellm --python /path/to/venv/bin/python --profile default --out report/
 gcl enforce nemo    --python /path/to/venv/bin/python --out report/
+gcl enforce openai-guardrails --python /path/to/venv/bin/python --profile pre_flight
 ```
 
 Drives a **real** guardrail integration end to end, offline: LiteLLM's proxy guardrails
 (`generic_guardrail_api`, before and after the model call), NeMo Guardrails' built-in
-jailbreak-detection rail, or the bundled reference gateway. The integration runs from
+jailbreak-detection rail, openai-guardrails' LLM checks (a small driver serves the
+library over HTTP), or the bundled reference gateway. LLM-as-judge guards get a stand-in
+judge on the model's own endpoint, including the case where the judge model *refuses*
+to answer. The integration runs from
 its own environment (`--python`), unmodified. A stand-in scanner answers its real
 protocol with **allow, block or rewrite**, or misbehaves (HTTP 500, timeout, malformed,
 empty, missing verdict field, unknown verdict, refused), one stage at a time. Two
 independent observers record what happened: a mock model (what exactly reached the
 provider, and when?) and the client (what exactly came back?). Payloads are compared
 whole, so a gateway that strips the marker but forwards the text, keeps part of the
-original in a rewrite, or forwards a second after rejecting the client is caught. Adapters
+original in a rewrite, or forwards a second after rejecting the client is caught; a
+check that runs alongside the model call is reported as "blocked after send" — the client
+was refused, but the provider already saw the prompt. Adapters
 translate protocols only; they never interpret a verdict.
 
 Every scenario gets **two verdicts**: *policy* (strict fail-closed) and *documented*

@@ -503,7 +503,8 @@ def test_adapters_registry():
                              "nemo-vendor", "crewai", "guardrails-ai",
                              "invariant-mcp", "agno",
                              "openai-guardrails-js", "google-adk",
-                             "lasso-mcp-gateway", "reference"}
+                             "lasso-mcp-gateway", "openai-agents-js",
+                             "reference"}
 
 
 # Real integrations: these pin what was observed on litellm 1.104.2 and nemoguardrails

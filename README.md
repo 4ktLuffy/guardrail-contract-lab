@@ -152,8 +152,8 @@ Drives a **real** guardrail integration end to end, offline: LiteLLM's proxy gua
 (`generic_guardrail_api`, before and after the model call), NeMo Guardrails' built-in
 jailbreak-detection and self-check rails, openai-guardrails' LLM checks in Python and JavaScript (a small driver serves the
 library over HTTP), the Portkey gateway's webhook guardrails (Node: `--env DIR`), LangChain's
-OpenAI moderation middleware, Mastra's model-backed processors, the OpenAI Agents SDK with openai-guardrails'
-`GuardrailAgent`, Pydantic AI's harness guardrails, Google ADK's model callbacks, CrewAI's `LLMGuardrail`, Guardrails AI's `Guard` (Python API and RAIL), Invariant Gateway's MCP proxy and Lasso's
+OpenAI moderation middleware, Mastra's model-backed processors, the OpenAI Agents SDK (Python and JavaScript) with
+openai-guardrails' `GuardrailAgent`, Pydantic AI's harness guardrails, Google ADK's model callbacks, CrewAI's `LLMGuardrail`, Guardrails AI's `Guard` (Python API and RAIL), Invariant Gateway's MCP proxy and Lasso's
 mcp-gateway (gcl plays the MCP client and a mock MCP server, over HTTP or stdio), Agno's built-in guardrails, or the bundled
 reference gateway. A report notes when one request ran a tool more than once (retries that
 re-execute side effects). Integrations with sessions also get a retry scenario (the same

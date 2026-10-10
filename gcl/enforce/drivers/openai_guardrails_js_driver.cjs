@@ -40,8 +40,8 @@ const send = (res, code, obj) => {
                          library_return: r.guardrail_results || null });
       } catch (e) {
         const blocked = e instanceof GuardrailTripwireTriggered;
-        send(res, blocked ? 400 : 500, { error: { type: e && e.name, message: String(e && e.message) },
-                                         library_return: { exception_attrs: Object.fromEntries(Object.entries(e || {}).map(([k, v]) => [k, String(v)])) } });
+        send(res, blocked ? 400 : 500, { error: { type: e && e.name, message: blocked ? "tripwire" : "error" },
+                                         library_return: { exception_message: String(e && e.message), exception_attrs: Object.fromEntries(Object.entries(e || {}).map(([k, v]) => [k, String(v)])) } });
       }
     });
   }).listen(Number(arg("--port")), "127.0.0.1");

@@ -456,6 +456,8 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
             r.documented = "unspecified"
         else:
             allowed = r.documented_expect if isinstance(r.documented_expect, list) else [r.documented_expect]
+            if "passed" in allowed:
+                allowed = [*allowed, "tool executed"]  # passing through means the agent ran, tools included
             r.documented = "conforms" if r.observed in allowed else "deviates"
         if r.policy == "violated" and r.documented == "conforms":
             r.notes.append("documented behaviour for this configuration (not a bug; a policy choice)")

@@ -1458,10 +1458,57 @@ class AgnoAgent(Adapter):
                      {"model": "gcl-mock", "messages": messages}, None, timeout_s)
 
 
+# --------------------------------------------------------------------------- openai-guardrails JS
+class OpenAIGuardrailsJS(OpenAIGuardrails):
+    """openai-guardrails for JavaScript (`@openai/guardrails`) — a separate code base from
+    the Python package — with the same checks and profiles, run under Node."""
+
+    name = "openai-guardrails-js"
+    runtime = "node"
+    _src_js = "@openai/guardrails 0.3.0: dist/client.js (GuardrailsOpenAI.create) and README"
+    documented_sources: ClassVar[dict] = {"default": {
+        "source": _src_js, "read_for": "@openai/guardrails 0.3.0",
+        "passage": "raiseGuardrailErrors: If true, raise exceptions when guardrails fail to execute (default "
+                   "false). Stages: preflight, input (may run concurrently with the LLM call), output."}}
+    documented_sources["raise_errors"] = documented_sources["pre_flight"] = documented_sources["default"]
+
+    def versions(self) -> dict:
+        try:
+            v = json.loads((Path(self.python) / "node_modules/@openai/guardrails/package.json").read_text())["version"]
+        except (OSError, ValueError, KeyError):
+            v = None
+        node = subprocess.run(["node", "--version"], capture_output=True, text=True).stdout.strip()
+        return {"@openai/guardrails": v, "node": node}
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        jm = self.protocol.judge_model
+        cfg = {"version": 1,
+               ("pre_flight" if self.profile == "pre_flight" else "input"):
+                   {"version": 1, "guardrails": [{"name": "Jailbreak", "config": {
+                       "model": f"{jm}-input", "confidence_threshold": 0.7}}]},
+               "output": {"version": 1, "guardrails": [{"name": "Custom Prompt Check", "config": {
+                   "model": f"{jm}-output", "confidence_threshold": 0.7,
+                   "system_prompt_details": "Flag replies that disclose confidential data."}}]}}
+        self._cfg_path = self.workdir / "openai-guardrails-js.json"
+        self._cfg_path.write_text(json.dumps(cfg, indent=2))
+        self.port = _free_port()
+        cmd = ["node", str(_driver_path("openai_guardrails_js_driver.cjs")), "--env", str(Path(self.python).resolve()),
+               "--port", str(self.port), "--base-url", model.openai_base, "--config", str(self._cfg_path),
+               "--timeout", "8000"]
+        if self.profile != "default":
+            cmd.append("--raise-guardrail-errors")
+        env = dict(os.environ, NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost", OPENAI_API_KEY="sk-gcl")
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env,
+                                         start_new_session=True, cwd=str(self.workdir))
+        _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 60, self.log)
+
+
 ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": OpenAIGuardrails,
             "nemo-selfcheck": NemoSelfCheck, "portkey": PortkeyGateway,
             "langchain-moderation": LangChainModeration, "mastra": MastraAgent, "openai-agents": OpenAIAgents,
             "pydantic-ai": PydanticAI, "litellm-vendor": LiteLLMVendor,
             "nemo-vendor": NemoVendor, "crewai": CrewAITask,
             "guardrails-ai": GuardrailsAI, "invariant-mcp": InvariantMCP,
-            "agno": AgnoAgent, "reference": ReferenceGateway}
+            "agno": AgnoAgent, "openai-guardrails-js": OpenAIGuardrailsJS, "reference": ReferenceGateway}

@@ -58,11 +58,12 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
 - Offline by design: a scripted stand-in scanner and a mock model replace the real
   services. Results show how the integration's own enforcement code handles the scripted
   inputs — not detector accuracy, production networking, or every configuration.
-- Fourteen built-in targets, plus any LiteLLM or NeMo vendor guardrail described by a
+- Fifteen built-in targets, plus any LiteLLM or NeMo vendor guardrail described by a
   spec file:
   - LiteLLM `generic_guardrail_api` (pre_call + post_call)
   - NeMo Guardrails: `jailbreak detection model`; self-check input/output
-  - openai-guardrails LLM checks; the OpenAI Agents SDK with `GuardrailAgent`
+  - openai-guardrails LLM checks (Python and JavaScript); the OpenAI Agents SDK with
+    `GuardrailAgent`
   - Portkey gateway `default.webhook` hooks
   - LangChain `OpenAIModerationMiddleware`
   - Mastra PromptInjectionDetector / ModerationProcessor

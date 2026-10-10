@@ -501,7 +501,8 @@ def test_adapters_registry():
     assert set(ADAPTERS) == {"litellm", "nemo", "nemo-selfcheck", "openai-guardrails", "portkey",
                              "langchain-moderation", "mastra", "openai-agents", "pydantic-ai", "litellm-vendor",
                              "nemo-vendor", "crewai", "guardrails-ai",
-                             "invariant-mcp", "agno", "reference"}
+                             "invariant-mcp", "agno",
+                             "openai-guardrails-js", "reference"}
 
 
 # Real integrations: these pin what was observed on litellm 1.104.2 and nemoguardrails

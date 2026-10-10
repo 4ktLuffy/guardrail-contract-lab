@@ -881,6 +881,66 @@ class MastraAgent(Adapter):
                      {"model": "gcl-mock", "messages": messages}, None, timeout_s)
 
 
+# --------------------------------------------------------------------------- OpenAI Agents SDK
+class OpenAIAgents(OpenAIGuardrails):
+    """The OpenAI Agents SDK running openai-guardrails' `GuardrailAgent`: an LLM Jailbreak
+    check in `pre_flight` and an LLM Custom Prompt Check on output. The agent has one
+    tool; the mock model calls it first, so gcl sees whether a tool ran despite a block.
+    The stand-in judge takes 1 s to answer, like a real LLM check."""
+
+    name = "openai-agents"
+    capabilities: ClassVar[set[str]] = {"input", "output", "tools"}
+    scanner_latency_s = 1.0
+    _ERR = ("error", "timeout", "malformed")
+    # openai-guardrails' runtime docstring: "pre_flight: Checks that run before the LLM
+    # request is issued." Errors pass unless raise_guardrail_errors=True (client docstring).
+    documented: ClassVar[dict] = {
+        "default": {**_BASE, **{f: "passed" for f in _ERR}},
+        "raise_errors": {**_BASE, **{f: "stopped" for f in _ERR}},
+    }
+    documented_sources: ClassVar[dict] = {"default": {
+        "source": "openai-guardrails 0.3.3: guardrails/runtime.py and guardrails/agents.py (GuardrailAgent) "
+                  "docstrings",
+        "read_for": "openai-guardrails 0.3.3, openai-agents 0.23.1",
+        "passage": "pre_flight: Checks that run before the LLM request is issued. GuardrailAgent maps "
+                   "pre_flight + input stages to agent input guardrails. raise_guardrail_errors: If False "
+                   "(default), treat guardrail execution errors as safe and continue."}}
+    documented_sources["raise_errors"] = documented_sources["default"]
+
+    def config_summary(self) -> dict:
+        return {"agent": "guardrails.GuardrailAgent (openai-agents Runner.run)", "pre_flight": "Jailbreak (LLM)",
+                "output": "Custom Prompt Check (LLM)", "tools": ["gcl_probe"], "judge_latency_s": 1.0,
+                "raise_guardrail_errors": self.profile == "raise_errors"}
+
+    def versions(self) -> dict:
+        return _versions(self.python, ["openai-agents", "openai-guardrails", "openai"])
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        jm = self.protocol.judge_model
+        cfg = {"version": 1,
+               "pre_flight": {"version": 1, "guardrails": [{"name": "Jailbreak", "config": {
+                   "model": f"{jm}-input", "confidence_threshold": 0.7}}]},
+               "output": {"version": 1, "guardrails": [{"name": "Custom Prompt Check", "config": {
+                   "model": f"{jm}-output", "confidence_threshold": 0.7,
+                   "system_prompt_details": "Flag replies that disclose confidential data."}}]}}
+        self._cfg_path = self.workdir / "openai-guardrails.json"
+        self._cfg_path.write_text(json.dumps(cfg, indent=2))
+        self.port = _free_port()
+        cmd = [self.python, str(_driver_path("openai_agents_driver.py")), "--port", str(self.port),
+               "--model-base", model.openai_base, "--tool-url", model.tool_url, "--config", str(self._cfg_path)]
+        if self.profile == "raise_errors":
+            cmd.append("--raise-guardrail-errors")
+        # GuardrailAgent's judge client is a bare AsyncOpenAI(): it reads these.
+        env = dict(os.environ, NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost",
+                   OPENAI_API_KEY="sk-gcl", OPENAI_BASE_URL=model.openai_base)
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env,
+                                         start_new_session=True, cwd=str(self.workdir))
+        _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 90, self.log)
+
+
 ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": OpenAIGuardrails,
             "nemo-selfcheck": NemoSelfCheck, "portkey": PortkeyGateway,
-            "langchain-moderation": LangChainModeration, "mastra": MastraAgent, "reference": ReferenceGateway}
+            "langchain-moderation": LangChainModeration, "mastra": MastraAgent, "openai-agents": OpenAIAgents,
+            "reference": ReferenceGateway}

@@ -12,6 +12,7 @@ scenario can prove the scanner was actually consulted.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -48,6 +49,11 @@ class MockModel(_Server):
     def __init__(self, reply: str, model: str = "gcl-mock", judge: StandInScanner | None = None):
         self.reply, self.model = reply, model
         self.judge = judge  # requests for judge.protocol.judge_model are the guard's, not the model's
+        # Tool mode: when a request offers tools and carries no tool result yet, answer with
+        # a call to the first tool, its argument the scenario's tool marker (GCL-T-<id>).
+        # The tool's only effect is a POST to /gcl/tool, recorded in tool_events.
+        self.tools_mode = False
+        self.tool_events: list[dict] = []
         self.events: list[dict] = []        # append-only: {"t", "body", "reply"}
         self.unexpected: list[str] = []
         self.inflight = 0
@@ -63,6 +69,10 @@ class MockModel(_Server):
     @property
     def openai_base(self) -> str:
         return f"{self.base}/v1"
+
+    @property
+    def tool_url(self) -> str:
+        return f"{self.base}/gcl/tool"
 
     def received_text(self) -> str:
         """Everything the model was sent, as one string (debugging aid)."""
@@ -108,6 +118,10 @@ class MockModel(_Server):
             def _post(self):
                 n = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(n)
+                if self.path.rstrip("/").endswith("/gcl/tool"):
+                    outer.tool_events.append({"t": time.monotonic(), "body": raw.decode("utf-8", "replace")})
+                    self._json(200, {"ok": True})
+                    return
                 if not self.path.rstrip("/").endswith("/chat/completions"):
                     outer.unexpected.append(f"POST {self.path}")
                     self._json(404, {"error": "not found"})
@@ -132,6 +146,21 @@ class MockModel(_Server):
                     return
                 outer.events.append({"t": time.monotonic(), "body": body, "reply": outer.reply})
                 created = int(time.time())
+                msgs = body.get("messages") or []
+                if (outer.tools_mode and body.get("tools") and not body.get("stream")
+                        and not any(isinstance(m, dict) and m.get("role") == "tool" for m in msgs)):
+                    ids = re.findall(r"GCL-U-([io]\d{2})", json.dumps(msgs, ensure_ascii=False))
+                    fn = (body["tools"][0].get("function") or {}).get("name", "gcl_probe")
+                    sid = ids[-1] if ids else "x"
+                    call = {"id": f"call_gcl_{sid}", "type": "function",
+                            "function": {"name": fn, "arguments": json.dumps({"note": f"GCL-T-{sid}"})}}
+                    self._json(200, {"id": "gcl-1", "object": "chat.completion", "created": created,
+                                     "model": outer.model,
+                                     "choices": [{"index": 0, "message": {"role": "assistant", "content": None,
+                                                                          "tool_calls": [call]},
+                                                  "finish_reason": "tool_calls"}],
+                                     "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+                    return
                 if body.get("stream"):
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
@@ -218,6 +247,7 @@ class StandInScanner:
         self.events: list[dict] = []
         self.inflight = 0
         self.stalled = 0
+        self.latency_s = 0.0  # delay before every answer: a detector that takes time to decide
         self._lock = threading.Lock()
         self._release = threading.Event()
         self._srv: dict[str, ThreadingHTTPServer | None] = {st: None for st in self.STAGES}
@@ -341,6 +371,8 @@ class StandInScanner:
             send(400, b'{"error": "gcl stand-in: unexpected path or stage"}')
             return
         release = self._release
+        if self.latency_s:
+            time.sleep(self.latency_s)
 
         def verdict(name):
             fn = proto.verdicts[name]

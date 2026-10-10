@@ -152,8 +152,10 @@ Drives a **real** guardrail integration end to end, offline: LiteLLM's proxy gua
 (`generic_guardrail_api`, before and after the model call), NeMo Guardrails' built-in
 jailbreak-detection and self-check rails, openai-guardrails' LLM checks (a small driver serves the
 library over HTTP), the Portkey gateway's webhook guardrails (Node: `--env DIR`), LangChain's
-OpenAI moderation middleware, Mastra's model-backed processors, or the bundled
-reference gateway. LLM-as-judge guards get a stand-in
+OpenAI moderation middleware, Mastra's model-backed processors, the OpenAI Agents SDK with openai-guardrails'
+`GuardrailAgent`, or the bundled reference gateway. Agent integrations run with a
+probe tool: the mock model calls it first, so a tool that runs despite a block is
+reported as "tool executed". LLM-as-judge guards get a stand-in
 judge on the model's own endpoint, including the case where the judge model *refuses*
 to answer. The integration runs from
 its own environment (`--python`), unmodified. A stand-in scanner answers its real

@@ -405,9 +405,25 @@ def test_single_listener_stages_by_body_and_refuses_both():
             _post_json(url, {"input": "hola GCL-U-i03"})
 
 
+def test_mock_model_tool_mode_calls_the_tool_once_then_replies():
+    with MockModel("final GCL-R-i05") as m:
+        m.tools_mode = True
+        url = m.openai_base + "/chat/completions"
+        tools = [{"type": "function", "function": {"name": "send_email", "parameters": {}}}]
+        r = _post_json(url, {"model": "x", "tools": tools,
+                             "messages": [{"role": "user", "content": "hola GCL-U-i05"}]})
+        call = r["choices"][0]["message"]["tool_calls"][0]
+        assert call["function"]["name"] == "send_email" and "GCL-T-i05" in call["function"]["arguments"]
+        _post_json(m.tool_url, {"note": "GCL-T-i05"})
+        r = _post_json(url, {"model": "x", "tools": tools, "messages": [
+            {"role": "user", "content": "hola GCL-U-i05"}, {"role": "tool", "content": "ok", "tool_call_id": "c"}]})
+        assert r["choices"][0]["message"]["content"] == "final GCL-R-i05"
+        assert len(m.tool_events) == 1
+
+
 def test_adapters_registry():
     assert set(ADAPTERS) == {"litellm", "nemo", "nemo-selfcheck", "openai-guardrails", "portkey",
-                             "langchain-moderation", "mastra", "reference"}
+                             "langchain-moderation", "mastra", "openai-agents", "reference"}
 
 
 # Real integrations: these pin what was observed on litellm 1.104.2 and nemoguardrails
@@ -519,3 +535,16 @@ def test_real_mastra_strict_holds_and_default_fails_open(tmp_path):
     default = run_contracts(MastraAgent(MASTRA_ENV, tmp_path / "d", "default"), 30)
     assert _by(default, "input", "error")["documented"] == "conforms"
     assert _by(default, "input", "judge_refusal")["observed"] == "passed"
+
+
+AGENTS_PY = os.environ.get("GCL_INTEG_AGENTS_PYTHON")  # an env with openai-agents and openai-guardrails
+
+
+@pytest.mark.skipif(not AGENTS_PY, reason="set GCL_INTEG_AGENTS_PYTHON")
+def test_real_openai_agents_tool_runs_despite_block(tmp_path):
+    from gcl.enforce.adapters import OpenAIAgents
+
+    run = run_contracts(OpenAIAgents(AGENTS_PY, tmp_path), 45, only={"o13"})
+    assert _by(run, "input", "allow")["policy"] == "held"
+    # pre_flight Jailbreak flags the input; the agent's tool still runs (judge takes 1 s).
+    assert _by(run, "input", "block")["observed"] == "tool executed"

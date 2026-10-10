@@ -20,6 +20,9 @@ the text, or corrupts it on the way, is not "stopped".
                 failed after send
                           the model received the original and the client got a server
                           error (5xx), not a refusal
+                tool executed
+                          (integrations run with tools) the model's tool call was carried
+                          out although this scenario should have stopped the request
                 stopped   the model received nothing for this scenario
   output stage  passed    the client received the model's exact original reply
                 modified  the client received exactly the rewrite instead
@@ -149,7 +152,7 @@ def build_scenarios(adapter: Adapter) -> list[Scenario]:
     return out
 
 
-_SENT = re.compile(r"GCL-[UMR]-([io]\d{2})\b")
+_SENT = re.compile(r"GCL-[UMRT]-([io]\d{2})\b")
 
 
 def _strings(obj) -> list[str]:
@@ -301,6 +304,8 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
     with StandInScanner(adapter.protocol) as scanner, \
             MockModel("…", judge=scanner if adapter.protocol.shared_endpoint else None) as model:
         scanner.configure({"input": "allow", "output": "allow"})
+        model.tools_mode = "tools" in adapter.capabilities
+        scanner.latency_s = getattr(adapter, "scanner_latency_s", 0.0)
         try:
             say(f"starting {adapter.name} ({adapter.profile})")
             adapter.start(model, scanner)
@@ -322,6 +327,7 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         finally:
             adapter.stop()
         model_events = list(model.events)
+        tool_events = list(model.tool_events)
         scanner_events = list(scanner.events)
         config_files = adapter.config_files()
 
@@ -356,7 +362,11 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         expect = docs.get((s.stage, s.mode), docs.get(s.mode))
         if isinstance(expect, (tuple, set, frozenset)):
             expect = sorted(expect)  # several outcomes the docs allow
-        r = Result(s, classify(s, [e["body"] for e in mev], obs), POLICY[s.mode], expect,
+        tools_run = [e for e in tool_events if f"GCL-T-{s.id}" in e["body"]]
+        observed = classify(s, [e["body"] for e in mev], obs)
+        if tools_run and s.stage == "input" and s.mode != "allow":
+            observed = "tool executed"  # the strongest evidence: a side effect happened
+        r = Result(s, observed, POLICY[s.mode], expect,
                    evidence={
                        "client_status": obs.status, "client_finished": obs.finished,
                        "client_transport_failure": obs.transport,
@@ -364,6 +374,7 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
                        "client_body": obs.text,
                        "model_input": classify_input(s, [e["body"] for e in mev]),
                        "model_requests": len(mev),
+                       "tool_runs": [{"t": round(e["t"] - t0, 3), "body": e["body"]} for e in tools_run],
                        "model_events": [{"t": round(e["t"] - t0, 3), "body": e["body"]} for e in mev],
                        "scanner_consulted_stage": consulted,
                        "scanner_answered_by_other_mode": foreign,
@@ -419,7 +430,7 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
         if ref and r.policy == "violated":
             r.notes.append(f"matches public issue {ref}")
 
-    leaks = ("passed", "altered", "blocked after send", "failed after send")
+    leaks = ("passed", "altered", "blocked after send", "failed after send", "tool executed", "retained")
 
     def own_problem(r: Result) -> str | None:
         """Why this scenario, on its own evidence, cannot be judged."""

@@ -1,6 +1,6 @@
 [project]
 name = "guardrail-contract-lab"
-version = "0.2.0"
+version = "0.3.0"
 description = "Prove a guardrail does what its config says: rules that run in every runtime, coverage in every language, and a failure contract that holds."
 readme = "README.md"
 license = { text = "MIT" }

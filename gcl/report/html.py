@@ -159,6 +159,13 @@ def _coverage(sec: dict) -> str:
     out.append(_compare(sec))
     if sec.get("fixtures_note"):
         out.append(f'<p class="sub">{e(sec["fixtures_note"])}</p>')
+    ho = sec.get("heldout") or {}
+    if ho.get("heldout", {}).get("attacks"):
+        out.append(f'<p class="sub">Held-out cases only: recall {e(ho["heldout"]["recall_pct"])}% '
+                   f'({ho["heldout"]["caught"]}/{ho["heldout"]["attacks"]}); fit cases '
+                   f'{e(ho["fit"]["recall_pct"])}% ({ho["fit"]["caught"]}/{ho["fit"]["attacks"]})</p>')
+    if ho.get("note"):
+        out.append(f'<p class="warning">{e(ho["note"])}</p>')
     intents = sec.get("matrix", {})
     if intents:
         langs = list(sec["by_lang"])
@@ -244,6 +251,7 @@ def _enforce(sec: dict) -> str:
            + _tile(sm["documented_deviates"], "deviations from its own docs")
            + _tile(sm["unverified"], "unverified")
            + _tile(sm["policy_held"], "held", bad_if_nonzero=False)
+           + _tile(sm.get("guessed", 0), "rest on a guessed stand-in")
            + "</div>",
            _doc_source(i.get("documented_source") or {}),
            _receipt(sec.get("receipt") or {}),
@@ -260,7 +268,8 @@ def _enforce(sec: dict) -> str:
         out.append(f"<tr><td>{e(s['stage'])}{' (control)' if s['control'] else ''}</td>"
                    f"<td><code>{e(s['mode'])}</code></td><td>{e(s['lang'])}</td>"
                    f"<td>{e(r['policy_expect'])}</td><td><b>{e(r['observed'])}</b></td>"
-                   f'<td class="lv {cls[r["policy"]]}">{e(r["policy"])}</td>'
+                   f'<td class="lv {cls[r["policy"]]}">{e(r["policy"])}'
+                   f'{"<br><small>guessed stand-in</small>" if ev.get("confidence") == "guessed" else ""}</td>'
                    f'<td class="lv {cls[r["documented"]]}">{e(r["documented"])}</td>'
                    f"<td><small>{evidence}</small>{notes}</td></tr>")
     out.append("</table></div>")

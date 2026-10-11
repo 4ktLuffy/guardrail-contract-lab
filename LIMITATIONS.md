@@ -41,6 +41,9 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
 - 12 attacks per language: a 0/12 has a 95% interval up to 24%. The report prints
   intervals for that reason; don't drop them when quoting.
 - Recall on a fixed set measures the set. Rules tuned against it will score high on it.
+  Rows marked `"heldout": true` are reported separately; with none, the report says every
+  number is fit. gcl cannot check that a row marked held out really was written
+  independently and before the rules: that is the author's declaration.
 
 ## Trust
 - Manifests are executable: `gcl` runs the commands they name. Process groups,
@@ -153,8 +156,32 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   results that change as unstable (a race); the report shows the slowest run in full, the
   JSON keeps every run, and repro bundles go to one folder per latency. Each latency is a
   full run, so the time multiplies.
+- Every stand-in says how its answers were built: defined by the integration under test
+  (an LLM judge's format, its own webhook or guardrail API), a third party's published
+  schema, recorded real replies, rebuilt from the integration's client code, or guessed.
+  A result that rests on the exact shape of an answer (allow, block, rewrite, retry, and
+  the unknown / wrong-type / null verdict faults) on a rebuilt or guessed stand-in is
+  labelled "guessed", held or violated alike: it shows what the integration did with that
+  answer, not with the real vendor's. The Invariant and Lasso stand-ins and every vendor
+  spec without recorded replies are rebuilt from client code. A spec may carry recorded
+  real replies (`"recorded": {"block": ..., "request_shape": {"messages": 1}}`); each
+  counts only for its own verdict (a fault built from allow and block needs both) and only
+  when the request positively shows the recorded message count — a retry, another count,
+  or a request without a message list is still guessed. Whether a label is right is a
+  human judgement; gcl only carries it.
 - `null_verdict` sets the verdict field to null (unknown and falsy) where the protocol's
   block answer is JSON; plain-text judges do not get it.
+
+## Findings ledger
+- Severity is a fixed, published rule over a few fields, not a CVSS score. "Documented"
+  comes from gcl's own map of each integration's docs (quoted in every report); "default
+  configuration" is read from the profile name unless a person sets it. Both can be wrong;
+  `findings set` records a correction and its reason.
+- "Repeated" is a second gcl run: it rules out flakiness, not a wrong stand-in. Only a
+  confirmation with recorded or live vendor answers rules that out, and gcl cannot verify
+  what a reproduction file actually did — it checks the declaration and that gcl's own
+  stand-in answers are not reused verbatim.
+- `check` compares newer runs only when they are in the folder it is given.
 
 ## What it cannot see
 - Keyword rules cannot tell "disable the firewall" from "don't disable the firewall".

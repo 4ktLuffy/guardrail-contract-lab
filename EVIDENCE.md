@@ -132,6 +132,40 @@ else is labelled.
   timeline and flagged; a gateway that races a parallel check against the model call holds
   at 0 s guard latency and leaks at 0.6 s, and the sweep reports it unstable — checked.
 
+## Stand-in provenance (tests/test_tester_provenance.py)
+- Every built-in stand-in declares how it was built; results on a stand-in rebuilt from
+  client code are "guessed" whether they hold or not, while a transport fault on the same
+  stand-in stays verified; the same scenarios on an integration-defined stand-in are
+  verified; vendor specs default to client code, recorded replies replace the rebuilt
+  bodies and count only for their request shape (a retry or another message count is
+  guessed); a guard supplied by gcl's own driver is labelled "harness" — checked.
+
+## Held-out cases (tests/test_tester_heldout.py)
+- Coverage without held-out rows says its recall is fit; with them, held-out and fit
+  recall are reported apart and a large gap is called out; unanswered held-out rows are not counted as
+  misses — checked.
+
+## Findings ledger and severity (tests/test_tester_findings.py, test_tester_severity.py)
+- A finding comes only from a violated or deviating result in a stored run with a clean
+  receipt; a repeat needs another run id; a different outcome contradicts it; confirmation
+  needs a declared answer source, refuses a reproduction that reuses the stand-in's
+  answers, and for a guessed stand-in needs recorded or live answers; a retraction keeps
+  the record; `check` catches an edited or missing report, a newer disagreeing run on the
+  same versions, a run on another gcl source, and a hand-edited rating; the ledger is
+  refused inside gcl's checkout; the severity rule gives the same number for the same
+  evidence, and human inputs need a reason — checked.
+
+## Review round 11 (tests/test_review_round11.py)
+- A second independent review, of provenance, the ledger and severity, found nine
+  defects; each is fixed and pinned: `check` now re-derives every field of a finding from
+  the report it names (status, runs, run ids, guessed, versions) and its history; rating
+  inputs a person may not set are ignored and flagged; receipts are required for add,
+  repeat and check; a confirmation needs a non-empty reproduction that must stay in place;
+  "recorded" applies per verdict and needs a positive request-shape match; allow answers
+  rest on the stand-in too; a finding from a latency sweep is checked against its own run;
+  language controls are separate findings — checked (the tests pass; the reviewer showed
+  each defect on the code before the fix in memory, the tests were not re-run against it).
+
 ## Review round 10 (tests/test_review_round10.py)
 - An independent adversarial review of the checks above found eight defects, each
   reproduced and fixed: a 5xx block control that leaked was hidden as unverified; another
@@ -157,8 +191,8 @@ else is labelled.
   misattributed timeouts, rewrites that changed what a rule matches, unbounded
   subprocesses, overclaims — was fixed and pinned by a regression test
   (`tests/test_review_round*.py` and the suites above).
-- Local runs: 167 tests pass (plus 11 opt-in real-integration tests) on Python 3.11.14 and
-  3.13.15 with Node 25.8.0; the demo runs
+- Local runs: 242 tests pass (plus 10 opt-in real-integration tests, run separately against
+  ten installed integrations) on Python 3.13.15 with Node 25.8.0; the demo runs
   from an installed wheel outside the checkout.
 
 ## Not yet verified

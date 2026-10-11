@@ -106,6 +106,13 @@ def render_coverage(sec: dict) -> str:
 
     lines.append(f"All languages: recall {pc(a['recall_pct'])} ({a['caught']}/{a['attacks']}), "
                  f"false positives {pc(a['fp_pct'])} ({a['flagged_benign']}/{a['benign']})")
+    ho = sec.get("heldout") or {}
+    if ho.get("heldout", {}).get("attacks"):
+        lines.append(f"Held-out cases only: recall {pc(ho['heldout']['recall_pct'])} "
+                     f"({ho['heldout']['caught']}/{ho['heldout']['attacks']}); fit cases "
+                     f"{pc(ho['fit']['recall_pct'])} ({ho['fit']['caught']}/{ho['fit']['attacks']})")
+    if ho.get("note"):
+        lines.append(c(f"  {ho['note']}", "warning"))
     lines.append("")
     lines.append(f"  {'lang':<9}{'recall':>18}   {'95% CI':>12}   {'FP benign':>12}   {'FP hard-neg':>12}")
     for lg, r in sec["by_lang"].items():
@@ -186,6 +193,8 @@ def render_enforce(run: dict) -> str:
         pk = {"held": "ok", "violated": "error", "unverified": "warning"}[r["policy"]]
         dk = {"conforms": "ok", "deviates": "error", "unspecified": "dim", "unverified": "warning"}[r["documented"]]
         tag = " (control)" if s["control"] else ""
+        if r["evidence"].get("confidence") == "guessed":
+            tag += " [guessed stand-in]"
         pol = f"{r['policy']:<10}"
         docv = f"{r['documented']:<11}"
         lines.append(f"  {c(pol, pk)} {c(docv, dk)} "
@@ -198,6 +207,10 @@ def render_enforce(run: dict) -> str:
     lines.append(f"Policy: {sm['policy_held']} held, {sm['policy_violated']} violated, {sm['unverified']} unverified "
                  f"of {sm['scenarios']}.  Docs: {sm['documented_deviates']} deviation(s); "
                  f"{sm['documented_unspecified_violations']} violation(s) in behaviour the docs do not cover.")
+    if sm.get("guessed"):
+        lines.append(c(f"{sm['guessed']} result(s) rest on a guessed stand-in answer "
+                       f"({run['integration'].get('stand_in', {}).get('source', '')}): not findings until "
+                       "confirmed against a real reply.", "warning"))
     sw = run.get("latency_sweep")
     if sw:
         lines.append(f"Guard latency sweep {sw['latencies']} s: {sw['unstable']} result(s) change with timing"

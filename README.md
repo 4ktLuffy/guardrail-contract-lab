@@ -191,7 +191,9 @@ reached the integration, and every report carries a run receipt: a run id in eve
 sentinel, gcl's commit and uncommitted files, and the integration's installed versions
 with a check that the installed files match the release. Each result has an ordered
 timeline of its boundary events; `--judge-latency 0,0.2,1` re-runs the contract at several
-guard latencies and reports results that change with timing (races) as unstable.
+guard latencies and reports results that change with timing (races) as unstable. Every
+stand-in says how it was built; a result that rests on the shape of a stand-in answer
+rebuilt from client code or guessed is labelled "guessed" (it still counts for the exit code).
 Payloads rotate through Spanish, French, Hebrew, Portuguese, German, Arabic, Russian,
 Chinese, Italian, Japanese and Hindi, so a rewrite that corrupts the text is caught
 too. `--out` writes the report and a reproduction bundle for every scenario that did not
@@ -217,6 +219,30 @@ gcl enforce nemo-vendor --spec acme-nemo.json --python /path/to/venv/bin/python
 The real integration code runs unmodified; only the vendor's API is replaced. NeMo specs
 name the input/output flows and the `rails.config` block, with `STANDIN_URL` where the
 endpoint goes.
+
+### `gcl findings` — a ledger that only holds what runs can back
+
+```bash
+gcl findings add    ledger.json --report out/report.json --scenario i04 --title "500 from the guard passes"
+gcl findings repeat ledger.json F-1a2b3c4d --report out2/report.json
+gcl findings confirm ledger.json F-1a2b3c4d --repro repro.py --answer-source recorded --note "..."
+gcl findings retract ledger.json F-1a2b3c4d --reason "..."
+gcl findings check  ledger.json --runs out/        # exit 1 on any problem
+gcl findings render ledger.json                    # Markdown table, every qualifier a column
+```
+
+A finding is created from a stored run, never typed by hand; a run whose receipt lists
+problems (uncommitted gcl, a patched install) is refused. A second run with its own run id
+makes it *repeated* (same stand-in: not independent); *confirmed* needs a hand reproduction
+that says where its guard answers came from and does not reuse gcl's stand-in answers, and
+for a result on a guessed stand-in, real recorded or live vendor answers. `check` re-reads
+every report a finding names (present, unchanged, same outcome), flags newer runs of the
+same scenario and versions that disagree (*contradicted*) or used another gcl source or
+spec (*stale*), and recomputes the severity. Severity comes from fields — what leaked, who
+has to misbehave, default configuration, documented — by a fixed rule
+([gcl/severity.py](gcl/severity.py)); inputs only a person can know (`findings set`) and a
+person's own number (`findings override`) are kept with their reasons. The ledger may not
+live inside gcl's own checkout.
 
 ## What the static checks mean
 

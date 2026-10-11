@@ -638,6 +638,7 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         results.append(r)
 
     _judge(results, adapter)
+    _stand_in_confidence(results, adapter)
     integration = adapter.describe()
     return {
         "integration": integration,
@@ -826,6 +827,59 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
         verdict(r, why or own_problem(r))
 
 
+# Modes whose result depends on the exact shape of the stand-in's answer: a correct verdict
+# the integration mishandled (or handled), or a verdict field the fault was aimed at. The
+# transport faults (error, timeout, malformed, empty, refused), wrong_schema (the whole
+# body replaced) and policy-source faults do not depend on it.
+SHAPE_DEPENDENT = ("allow", "block", "modify", "block_retry", "unknown_verdict", "verdict_type", "null_verdict")
+# Which verdict answers each shape-dependent mode is built from.
+_BUILT_FROM = {"allow": ("allow",), "block": ("block",), "modify": ("modify",), "block_retry": ("block",),
+               "unknown_verdict": ("allow", "block"), "verdict_type": ("allow", "block"),
+               "null_verdict": ("allow", "block")}
+
+
+def _stand_in_confidence(results: list[Result], adapter: Adapter) -> None:
+    """Label every judged result "verified" or "guessed". A result resting on a stand-in
+    answer that was rebuilt from client code or guessed — or recorded for a request of
+    another shape, or without a request that positively shows the recorded shape — is
+    "guessed", held or violated alike: it says what this integration did with that
+    answer, not what it does with the real vendor's."""
+    proto = adapter.protocol
+    harness = getattr(adapter, "harness_supplies_guard", False)
+    base = "harness" if harness else proto.provenance
+    shape = proto.recorded_shape or {}
+    for r in results:
+        s, ev = r.scenario, r.evidence
+        dependent = s.mode in SHAPE_DEPENDENT or s.mode in proto.extra_faults
+        recorded = (not harness and dependent and s.mode in _BUILT_FROM
+                    and all(m in proto.recorded_modes for m in _BUILT_FROM[s.mode]))
+        ev["stand_in"] = "recorded" if recorded else base
+        if r.policy == "unverified":
+            ev["confidence"] = None
+            continue
+        why = None
+        if recorded:
+            served = "block" if s.mode == "block_retry" else s.mode
+            bodies = [e.get("body") for e in ev.get("scanner_events") or [] if e.get("mode") == served]
+            seen = {len(b["messages"]) for b in bodies if isinstance(b, dict) and isinstance(b.get("messages"), list)}
+            unsupported = sorted(set(shape) - {"messages"})
+            if s.mode == "block_retry":
+                why = f"the recorded reply was captured for {shape}, this scenario is a retry"
+            elif unsupported:
+                why = f"the recorded shape names fields gcl cannot check ({', '.join(unsupported)})"
+            elif not seen or seen != {shape.get("messages")}:
+                why = (f"the recorded reply was captured for {shape}, this request showed "
+                       f"{'no message list' if not seen else f'messages={sorted(seen)}'}")
+            if why:
+                why += ": fields that depend on the request (locations, indexes) may not match the real vendor's"
+        elif dependent and base in ("client_code", "guessed"):
+            how = {"client_code": "not a real vendor reply", "guessed": "a guess"}[base]
+            why = f"the stand-in's answer is {how} ({proto.provenance_source})"
+        ev["confidence"] = "guessed" if why else "verified"
+        if why:
+            r.notes.append(f"guessed — {why}; confirm against a recorded real reply before reporting")
+
+
 def _crash_not_block(r: Result) -> str | None:
     """A block control proves the integration acts on a verdict only if it ended unlike a
     crash: a server error is what an integration that cannot parse the answer returns."""
@@ -843,6 +897,7 @@ def _summary(results: list[Result]) -> dict:
         "policy_held": count("policy", "held"),
         "policy_violated": count("policy", "violated"),
         "unverified": count("policy", "unverified"),
+        "guessed": sum(1 for r in results if r.evidence.get("confidence") == "guessed"),
         "documented_deviates": count("documented", "deviates"),
         "documented_unspecified_violations": sum(
             1 for r in results if r.policy == "violated" and r.documented == "unspecified"),

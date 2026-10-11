@@ -309,6 +309,19 @@ class Protocol:
     # Overrides for built-in content faults when verdicts are plain text, not JSON:
     # mode ("unknown_verdict", "verdict_type") -> the text to answer with.
     variants: dict = field(default_factory=dict)
+    # How the answers were built, so a result that rests on their exact shape can say so:
+    # "integration" (the integration under test defines the protocol: an LLM judge's
+    # output format, its own webhook or guardrail API), "vendor_schema" (a third party's
+    # published API reference), "recorded" (real replies captured from the vendor),
+    # "client_code" (rebuilt by reading the integration's client of a third-party API),
+    # "guessed".
+    provenance: str = "guessed"
+    provenance_source: str = ""
+    # Verdicts ("allow", "block", "modify") answered with recorded real replies instead,
+    # and the request shape they were captured for (e.g. {"messages": 1}): a scenario
+    # whose request does not positively match it gets a guessed answer.
+    recorded_modes: tuple = ()
+    recorded_shape: dict = field(default_factory=dict)
 
 
 # Modes a stage can be put in. Verdict modes answer correctly; fault modes misbehave.

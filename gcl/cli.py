@@ -417,3 +417,114 @@ def main():  # pragma: no cover
 
 if __name__ == "__main__":  # pragma: no cover
     app()
+
+
+# --------------------------------------------------------------------------- findings
+findings_app = typer.Typer(no_args_is_help=True, help="A findings ledger that only holds what runs can back.")
+app.add_typer(findings_app, name="findings")
+
+
+def _ledger_do(ledger: Path, fn, *args, write: bool = True):
+    from . import findings as F
+
+    try:
+        for w in F.guard_location(ledger):
+            typer.echo(f"warning: {w}", err=True)
+        doc = F.load(ledger)
+        out = fn(doc, *args)
+    except (F.LedgerError, OSError, ValueError) as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2) from None
+    if write:
+        F.save(ledger, doc)
+    return doc, out
+
+
+@findings_app.command("add")
+def findings_add(ledger: Path = typer.Argument(..., help="The ledger file (JSON), kept privately."),
+                 report: Path = typer.Option(..., exists=True, dir_okay=False, help="A gcl enforce report.json."),
+                 scenario: str = typer.Option(..., help="Scenario id in that report."),
+                 title: str = typer.Option(..., help="One line: what is wrong."),
+                 latency: float | None = typer.Option(None, help="With a latency sweep report: which run.")):
+    """Create a finding from a scenario of a stored run (status: proposed)."""
+    from . import findings as F
+
+    _, f = _ledger_do(ledger, lambda d: F.add(d, report, scenario, title, latency))
+    typer.echo(f"{f['id']} proposed{' (rests on a guessed stand-in)' if f['guessed'] else ''}")
+
+
+@findings_app.command("repeat")
+def findings_repeat(ledger: Path, fid: str,
+                    report: Path = typer.Option(..., exists=True, dir_okay=False)):
+    """Add a separate run of the same scenario (proposed → repeated, or contradicted)."""
+    from . import findings as F
+
+    _, f = _ledger_do(ledger, lambda d: F.repeat(d, fid, report))
+    typer.echo(f"{f['id']} {f['status']}")
+
+
+@findings_app.command("confirm")
+def findings_confirm(ledger: Path, fid: str,
+                     repro: Path = typer.Option(..., exists=True, dir_okay=False, help="The hand reproduction."),
+                     answer_source: str = typer.Option(..., help="recorded | live-vendor | vendor-docs"),
+                     note: str = typer.Option(..., help="What the reproduction showed.")):
+    """Attach an independent hand reproduction (repeated → confirmed)."""
+    from . import findings as F
+
+    _, f = _ledger_do(ledger, lambda d: F.confirm(d, fid, repro, answer_source, note))
+    typer.echo(f"{f['id']} {f['status']}")
+
+
+@findings_app.command("retract")
+def findings_retract(ledger: Path, fid: str, reason: str = typer.Option(...)):
+    """Withdraw a finding; the record and its history stay."""
+    from . import findings as F
+
+    _, f = _ledger_do(ledger, lambda d: F.retract(d, fid, reason))
+    typer.echo(f"{f['id']} retracted")
+
+
+@findings_app.command("check")
+def findings_check(ledger: Path,
+                   runs: Path | None = typer.Option(None, exists=True, file_okay=False,
+                                                    help="A folder of newer reports to check against.")):
+    """Re-validate every finding against its reports and newer runs. Exit 1 on any problem."""
+    from . import findings as F
+
+    _, problems = _ledger_do(ledger, lambda d: F.check(d, runs), write=False)
+    for p in problems:
+        typer.echo(f"{p['id']}: {p['problem']}")
+    typer.echo(f"{len(problems)} problem(s)")
+    raise typer.Exit(1 if problems else 0)
+
+
+@findings_app.command("render")
+def findings_render(ledger: Path):
+    """Print the ledger as a Markdown table."""
+    from . import findings as F
+
+    _, table = _ledger_do(ledger, F.render, write=False)
+    typer.echo(table)
+
+
+@findings_app.command("set")
+def findings_set(ledger: Path, fid: str,
+                 field: str = typer.Option(..., help="default_config | trigger"),
+                 value: str = typer.Option(..., help="default_config: yes|no; trigger: attacker | guard down | "
+                                           "guard answers oddly | operator misconfiguration"),
+                 reason: str = typer.Option(...)):
+    """Set a rating input only a person can know, with the reason."""
+    from . import findings as F
+
+    v = {"yes": True, "no": False}.get(value, value) if field == "default_config" else value
+    _, f = _ledger_do(ledger, lambda d: F.set_field(d, fid, field, v, reason))
+    typer.echo(f"{f['id']} severity {f['severity']['score']} ({f['severity']['why']})")
+
+
+@findings_app.command("override")
+def findings_override(ledger: Path, fid: str, score: int = typer.Option(...), reason: str = typer.Option(...)):
+    """Record a person's own rating next to the computed one."""
+    from . import findings as F
+
+    _, f = _ledger_do(ledger, lambda d: F.override(d, fid, score, reason))
+    typer.echo(f"{f['id']} computed {f['severity']['score']}, overridden {score}")

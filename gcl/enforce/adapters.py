@@ -150,6 +150,9 @@ class Adapter:
     # the passage relied on. Shown in reports so a reader can check the expectation.
     documented_sources: ClassVar[dict] = {}
     known_issues: ClassVar[dict] = {}   # mode -> public issue reference
+    # The framework ships no guard of its own: gcl's driver supplies the strictest one, so
+    # results test the framework's enforcement, and the stand-in answers gcl's own protocol.
+    harness_supplies_guard: ClassVar[bool] = False
 
     def __init__(self, python: str, workdir: Path, profile: str = "default"):
         self.python, self.workdir, self.profile = python, Path(workdir), profile
@@ -161,6 +164,11 @@ class Adapter:
         return {"integration": self.name, "profile": self.profile, "config": self.config_summary(),
                 "versions": {k: v for k, v in full.items() if k not in ("dists", "executable")},
                 "install": {"executable": full.get("executable"), "dists": full.get("dists")},
+                "stand_in": {"provenance": "harness" if self.harness_supplies_guard else self.protocol.provenance,
+                             "source": ("gcl's driver supplies the guard; the framework is under test"
+                                        if self.harness_supplies_guard else self.protocol.provenance_source),
+                             "recorded_modes": list(self.protocol.recorded_modes),
+                             "recorded_shape": self.protocol.recorded_shape},
                 "documented_source": self.documented_sources.get(self.profile, {})}
 
     def config_summary(self) -> dict:
@@ -204,6 +212,8 @@ LITELLM_GENERIC = Protocol(
     },
     stage_of=lambda body: {"request": "input", "response": "output"}.get(body.get("input_type")),
     path="/beta/litellm_basic_guardrail_api",
+    provenance="integration",
+    provenance_source="LiteLLM's generic_guardrail_api (defined by LiteLLM, the integration under test)",
 )
 
 LITELLM_PROFILES = {
@@ -306,6 +316,8 @@ NEMO_JAILBREAK = Protocol(
     stage_of=lambda body: "input",
     path="/model", trust_listener=True,
     wrong_schema={"status": "ok"},
+    provenance="integration",
+    provenance_source="NeMo Guardrails ships both the jailbreak detection server and its client",
 )
 
 
@@ -461,6 +473,8 @@ PORTKEY_WEBHOOK = Protocol(
               "block": lambda b, m: {"verdict": False},
               "modify": _portkey_modify},
     stage_of=_portkey_stage,
+    provenance="integration",
+    provenance_source="Portkey's own webhook guardrail contract",
 )
 
 PORTKEY_PROFILES = {"default": {}, "fail_on_error": {"failOnError": True}}
@@ -577,7 +591,9 @@ def judge_protocol(name: str, allow: dict, block: dict, wrong_schema: dict | Non
                     malformed=b"I can't evaluate that request.",
                     wrong_schema=wrong_schema or {"status": "ok"},
                     envelope=_chat_envelope, shared_endpoint=True,
-                    extra_faults={"judge_refusal": _refusal_envelope()})
+                    extra_faults={"judge_refusal": _refusal_envelope()},
+                    provenance="integration",
+                    provenance_source="the integration's own judge prompt and output format")
 
 
 def _driver_path(name: str) -> Path:
@@ -673,6 +689,8 @@ NEMO_SELF_CHECK = Protocol(
     extra_faults={"judge_refusal": _refusal_envelope()},
     # Text-verdict faults: an answer with no Yes/No keyword, and a block said in other words.
     variants={"unknown_verdict": "Unclear.", "verdict_type": "Not safe."},
+    provenance="integration",
+    provenance_source="the integration's own self-check prompt and its expected answer",
 )
 
 
@@ -755,6 +773,8 @@ OPENAI_MODERATION = Protocol(
     variants={"unknown_verdict": json.dumps(_moderation("DENY_UNKNOWN")),
               "verdict_type": json.dumps(_moderation("true"))},
     single_listener=True,
+    provenance="vendor_schema",
+    provenance_source="OpenAI moderation API reference (the SDK's published response type)",
 )
 
 
@@ -826,6 +846,8 @@ MASTRA_JUDGE = Protocol(
               "verdict_type": json.dumps({"categories": [{"type": "injection", "score": "0.95"}],
                                           "category_scores": [{"category": "violence", "score": "0.95"}],
                                           "reason": "gcl stand-in"})},
+    provenance="integration",
+    provenance_source="the integration's own judge prompt and output schema",
 )
 
 
@@ -948,6 +970,7 @@ class PydanticAI(Adapter):
     the run tests what the framework does with a block or an exception. One probe tool."""
 
     name = "pydantic-ai"
+    harness_supplies_guard: ClassVar[bool] = True
     protocol = LITELLM_GENERIC
     capabilities: ClassVar[set[str]] = {"input", "output", "tools"}
     scanner_latency_s = 1.0
@@ -1043,8 +1066,28 @@ def vendor_protocol(spec: dict) -> Protocol:
     # leading path token, drop anything that is not a path.
     routes = tuple(str(r["path"]).split()[0] for r in spec.get("requests") or []
                    if str(r.get("path") or "").startswith("/"))
+    # Provenance: recorded real replies, when the spec carries them, replace the bodies
+    # read from the integration's client; otherwise the spec says what it was built from.
+    rec = spec.get("recorded") or {}
+    rec_modes = tuple(m for m in ("allow", "block", "modify") if m in rec)
+    if rec and not rec_modes:
+        raise ValueError(f"{spec['vendor']}: 'recorded' names no reply (allow, block or modify)")
+    if rec and not isinstance((rec.get("request_shape") or {}).get("messages"), int):
+        raise ValueError(f"{spec['vendor']}: recorded replies need request_shape.messages (the message count "
+                         "of the request they answered)")
+    allow, block, modify = rec.get("allow", allow), rec.get("block", block), rec.get("modify", modify)
+    prov = spec.get("provenance") or {}
+    kind = prov.get("kind", "client_code")
+    if kind not in ("integration", "vendor_schema", "client_code", "guessed"):
+        raise ValueError(f"{spec['vendor']}: unknown provenance kind {kind!r} (recorded replies go under 'recorded')")
+    source = prov.get("source") or f"vendor spec {spec['vendor']} (from the integration's client)"
+    if rec:
+        source += f"; recorded replies for {', '.join(rec_modes)}"
+        source += f" ({rec['source']})" if rec.get("source") else ""
     return Protocol(
         name=f"{spec['vendor']} guardrail API (as called by its integration)",
+        provenance=kind, provenance_source=source, recorded_modes=rec_modes,
+        recorded_shape=dict(rec.get("request_shape") or {}),
         verdicts={"allow": lambda b, m: _fill(allow, "", echo(b)),
                   "block": lambda b, m: _fill(block, "", echo(b)),
                   "modify": (lambda b, m: _fill(modify, m, echo(b))) if modify
@@ -1257,6 +1300,7 @@ class GuardrailsAI(Adapter):
     the output without an on-fail attribute."""
 
     name = "guardrails-ai"
+    harness_supplies_guard: ClassVar[bool] = True
     protocol = LITELLM_GENERIC
     capabilities: ClassVar[set[str]] = {"input", "output"}
     _F = ("error", "timeout", "malformed", "empty", "wrong_schema", "unknown_verdict", "verdict_type", "refused")
@@ -1332,6 +1376,8 @@ INVARIANT_CHECK = Protocol(
     get_routes={"/api/v1/user/identity": {"username": "gcl"},
                 "/api/v1/dataset/byuser/<user>/<dataset>/policy": {"policies": [
                     {"id": "gcl-1", "name": "gcl", "content": _INV_POLICY, "action": "block", "enabled": True}]}},
+    provenance="client_code",
+    provenance_source="rebuilt from Invariant Gateway's client of the guardrails API",
 )
 
 
@@ -1571,6 +1617,8 @@ LASSO_CLASSIFY = Protocol(
               "modify": lambda b, m: {"violations_detected": False, "deputies": {"jailbreak": False}}},
     stage_of=lambda body: {"PROMPT": "input", "COMPLETION": "output"}.get(body.get("messageType")),
     routes=("/gateway/v3/classify",), single_listener=True,
+    provenance="client_code",
+    provenance_source="rebuilt from the lasso plugin's client of the Lasso API",
 )
 
 

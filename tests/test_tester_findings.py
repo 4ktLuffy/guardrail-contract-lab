@@ -15,11 +15,11 @@ from gcl.enforce.contracts import run_contracts
 
 
 def _report(tmp: Path, name: str, profile: str = "naive", clean: bool = True, edit=None) -> Path:
-    """A stored report of a real reference-gateway run. `clean` stands in for a run from a
-    committed checkout (this test runs from a working tree, whose receipt lists it)."""
+    """A stored report of a real reference-gateway run. Its receipt is set explicitly, so
+    the test does not depend on whether this checkout happens to be clean: `clean` is a
+    run from a committed checkout, otherwise one with uncommitted gcl files."""
     run = run_contracts(ReferenceGateway(sys.executable, tmp / name, profile), 15, only={"i04"})
-    if clean:
-        run["receipt"]["problems"] = []
+    run["receipt"]["problems"] = [] if clean else ["gcl has 1 uncommitted or untracked file(s)"]
     if edit:
         edit(run)
     p = tmp / name / "report.json"

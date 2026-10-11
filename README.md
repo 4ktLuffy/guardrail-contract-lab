@@ -183,7 +183,15 @@ passage and the version it was read for). A fail-open you switched on is reporte
 configuration choice, not a bug; behaviour the docs don't cover is labelled as such.
 Four controls (allow and block, before and after the model) are judged first, and only
 if the scanner was really consulted with that scenario's text; if a control doesn't
-hold, what depends on it is **unverified**, never "held", and the run exits 2.
+hold, what depends on it is **unverified**, never "held", and the run exits 2. The controls
+run again at the end (the setup must still work), in every language a scenario used, and
+with a long reply (a driver that cuts answers cannot hide a leak); a block that ends in a
+server error does not count as a block. The stand-in keeps a receipt of what actually
+reached the integration, and every report carries a run receipt: a run id in every
+sentinel, gcl's commit and uncommitted files, and the integration's installed versions
+with a check that the installed files match the release. Each result has an ordered
+timeline of its boundary events; `--judge-latency 0,0.2,1` re-runs the contract at several
+guard latencies and reports results that change with timing (races) as unstable.
 Payloads rotate through Spanish, French, Hebrew, Portuguese, German, Arabic, Russian,
 Chinese, Italian, Japanese and Hindi, so a rewrite that corrupts the text is caught
 too. `--out` writes the report and a reproduction bundle for every scenario that did not

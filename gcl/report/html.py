@@ -208,6 +208,16 @@ def _probe(sec: dict) -> str:
     return "\n".join(out)
 
 
+def _receipt(rc: dict) -> str:
+    if not rc:
+        return ""
+    g = rc.get("gcl") or {}
+    head = (f'<p class="sub">Run <code>{e(rc.get("run_id"))}</code> · gcl {e(g.get("version"))} '
+            f'<code>{e((g.get("commit") or "not a git checkout")[:12])}</code></p>')
+    probs = "".join(f"<li>{e(p)}</li>" for p in rc.get("problems") or [])
+    return head + (f'<div class="warning"><b>Receipt problems</b><ul>{probs}</ul></div>' if probs else "")
+
+
 def _enforce(sec: dict) -> str:
     i = sec["integration"]
     versions = ", ".join(f"{k} {v}" for k, v in i["versions"].items() if v)
@@ -222,6 +232,7 @@ def _enforce(sec: dict) -> str:
            + _tile(sm["policy_held"], "held", bad_if_nonzero=False)
            + "</div>",
            _doc_source(i.get("documented_source") or {}),
+           _receipt(sec.get("receipt") or {}),
            ("<div class='scroll'><table><tr><th>Stage</th><th>Scanner</th><th>Lang</th>"
            "<th>Expected</th><th>Observed</th><th>Policy</th><th>Docs</th><th>Evidence</th></tr>")]
     cls = {"held": "okc", "violated": "error", "unverified": "warning", "conforms": "okc",

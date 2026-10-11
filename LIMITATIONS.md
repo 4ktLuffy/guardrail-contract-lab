@@ -102,7 +102,7 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   could inspect.
 - Leak detection looks for the whole original, its marker, or any fragment of it (two
   consecutive words, or four characters in Chinese/Japanese). A paraphrase of the
-  original is not detected.
+  original is not detected (a scenario that receives one is unverified, not held).
   Results are for the versions recorded in the report (gcl records them; it does not pin
   them) and the configuration printed there.
 - Synchronous, single-turn requests only. Streaming, multi-turn history and policy reload
@@ -119,6 +119,40 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
 - "Documented" expectations are taken from each project's docs for a stated version; the
   report prints the source, the version and the passage relied on. When the docs are
   silent, the verdict says "unspecified".
+
+## Checks on the tester (receipts and bracketing controls)
+- Every run carries a run id in every sentinel. An answer that carries another run's id
+  (an integration's cache, a replay) is not evidence, and a client reply with no model call
+  behind it makes a "stopped" unverified. A cache keyed on text without the markers that
+  returns a *refusal* is not detected.
+- The receipt records gcl's commit, uncommitted and untracked files and a hash over its
+  source, and the integration's distributions as its own interpreter imports them. Install
+  integrity is checked only for Python distributions whose RECORD carries hashes; Node
+  packages are reported by version only. The docs-version check compares versions named in
+  the "read for" text with the installed ones; a docs page that names no version is not
+  checked.
+- Controls run again after the last scenario, plus an allow control in every language a
+  judged scenario used and an allow with a ~6,000-character reply. If one of them fails, a
+  clean result that depends on it is unverified; a proven leak still counts. A driver that
+  cuts answers only beyond 6,000 characters, or a setup that breaks and recovers between
+  the brackets, is not detected.
+- A block control that ends in a server error (5xx) is not accepted as a block: it cannot
+  be told from an integration that crashed on the stand-in's answer.
+- The stand-in records whether each answer reached a connected client (it checks for a
+  closed peer before writing). A peer that closes in the instant between that check and
+  the write is not seen.
+- A provider call charged to a scenario only by its time window, with no marker and no
+  fragment of that scenario's text, is left out of the verdict and makes a clean result
+  unverified. A rewrite that shares no two consecutive words with the original is
+  therefore never reported as a leak — only as unverified.
+- Every result carries an ordered timeline (guard asked / answered, provider received, tool
+  ran, client answered) and flags a provider call or tool run that came before the guard's
+  answer. Times are gcl's clock at its own boundaries, not the integration's.
+- `--judge-latency 0,0.2,1` runs the whole contract once per guard latency and reports
+  results that change as unstable (a race); the report shows the slowest run in full. Each
+  latency is a full run, so the time multiplies.
+- `null_verdict` sets the verdict field to null (unknown and falsy) where the protocol's
+  block answer is JSON; plain-text judges do not get it.
 
 ## What it cannot see
 - Keyword rules cannot tell "disable the firewall" from "don't disable the firewall".

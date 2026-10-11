@@ -55,7 +55,7 @@ else is labelled.
 
 ## enforce (tests/test_enforce.py)
 - Reference gateway: the strict build holds all 22 scenarios and conforms to its docs on
-  every one; the naive build deviates on all 16 fault scenarios (8 faults × 2 stages)
+  every one; the naive build deviates on all 18 fault scenarios (9 faults × 2 stages)
   while all four controls hold — checked.
 - Adversarial gateways, each built to fool a sentinel-only judge: forwarding the blocked
   text with its marker stripped ("altered", violated); a rewrite that keeps only the
@@ -110,6 +110,27 @@ else is labelled.
   documented pass only when the client also got its answer; events carrying several
   scenarios' markers prevent a clean hold; the mock MCP server rejects unknown sessions
   and tools; JS drivers serialise exception state and results — checked.
+
+## Checks on the tester (tests/test_tester_receipts.py, test_tester_controls.py, test_tester_delivery.py)
+- Receipts: every sentinel carries the run id; a marker from another run is not evidence; a
+  reply served from a cache with no model call is not a hold; a truncated client body is
+  never judged clean and the bundle says `truncated: true`; a locally patched install
+  (a file that no longer matches its RECORD hash) is flagged; docs read for another
+  version are flagged; `--out` refuses a non-empty folder — checked.
+- Bracketing controls, each against a gateway built to fool the judge: one that breaks
+  after eight requests, one that fails on Arabic text after the guard answered, one whose
+  driver cuts answers to 300 characters while leaking inside an error, one that crashes
+  (500) on a block answer — every affected clean result is unverified; a correct gateway
+  still holds everything — checked.
+- Delivery: an answer written after the integration hung up is not evidence; an unmarked
+  background provider call is not a violation; background traffic before the run is in
+  the receipt; a stall records who ended it; a gateway that blocks on any truthy verdict
+  holds `unknown_verdict` by accident and is caught by `null_verdict` — checked.
+
+- Timeline (tests/test_tester_timeline.py): a gateway that forwards to the provider before
+  asking the guard, then refuses, is "blocked after send" with the provider first in the
+  timeline and flagged; a gateway that races a parallel check against the model call holds
+  at 0 s guard latency and leaks at 0.6 s, and the sweep reports it unstable — checked.
 
 ## Review pins (tests/test_review_pins.py)
 - Five earlier review fixes that had no test of their own are pinned: no output "refused"

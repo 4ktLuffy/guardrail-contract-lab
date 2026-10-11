@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import select
 import socket
 import threading
 import time
@@ -315,6 +316,20 @@ VERDICTS = ("allow", "block", "modify")
 POLICY_FAULTS = ("policy_missing", "policy_error")
 FAULTS = ("error", "timeout", "malformed", "empty", "wrong_schema", "unknown_verdict", "verdict_type",
           "refused")
+# Planned after every other scenario (so earlier scenario ids stay stable), and only where
+# the protocol's block answer is JSON with a verdict field to null.
+LATE_FAULTS = ("null_verdict",)
+
+
+def null_expressible(proto: Protocol) -> bool:
+    try:
+        fn = proto.verdicts["block"]
+        block = fn({}, "", "input") if fn.__code__.co_argcount >= 3 else fn({}, "")
+        fn = proto.verdicts["allow"]
+        allow = fn({}, "", "input") if fn.__code__.co_argcount >= 3 else fn({}, "")
+    except Exception:
+        return False
+    return _fault_on_operative(block, allow, "null_verdict")[1]
 
 
 class StandInScanner:
@@ -440,12 +455,26 @@ class StandInScanner:
     def _serve(self, h: BaseHTTPRequestHandler, listener: str | None, raw: bytes, by_name: bool = False) -> None:
         proto = self.protocol
 
+        sent: dict = {}
+        current: dict = {}  # the event being answered, once recorded
+
         def send(code: int, body: bytes, ctype: str = "application/json"):
-            h.send_response(code)
-            h.send_header("Content-Type", ctype)
-            h.send_header("Content-Length", str(len(body)))
-            h.end_headers()
-            h.wfile.write(body)
+            if "ev" in current:  # answering is done once the bytes go out, not after
+                current["ev"]["t_done"] = time.monotonic()
+            # A receipt of what reached the integration, not what we meant to send: a
+            # write lands in the kernel buffer even after the peer hung up, so check for
+            # a closed peer first; a write error means it was not delivered either.
+            gone = _peer_gone(h)
+            try:
+                h.send_response(code)
+                h.send_header("Content-Type", ctype)
+                h.send_header("Content-Length", str(len(body)))
+                h.end_headers()
+                h.wfile.write(body)
+                h.wfile.flush()
+            except OSError:
+                gone = True
+            sent.update(delivered=not gone, status=code, bytes=len(body), t_sent=time.monotonic())
 
         def content(text: str, code: int = 200, ctype: str = "application/json"):
             if proto.envelope is not None:
@@ -486,17 +515,20 @@ class StandInScanner:
               "path": h.path, "valid": valid, "mode": mode, "body": body, "scanned": scanned,
               "body_text": text, "answered": None, "fault_expressed": True, "t_done": None}
         self.events.append(ev)
+        current["ev"] = ev
         if not valid:
             ev["answered"] = "400 (wrong path or stage)"
             send(400, b'{"error": "gcl stand-in: unexpected path or stage"}')
             ev["t_done"] = time.monotonic()
             return
         try:
-            self._answer(ev, body, stage, mode, modify_text, send, content)
+            self._answer(ev, body, stage, mode, modify_text, send, content, h)
         finally:
             ev["t_done"] = time.monotonic()
+            if sent:
+                ev["delivery"] = dict(sent)
 
-    def _answer(self, ev, body, stage, mode, modify_text, send, content) -> None:
+    def _answer(self, ev, body, stage, mode, modify_text, send, content, h=None) -> None:
         proto = self.protocol
         release = self._release
         if self.latency_s:
@@ -518,10 +550,21 @@ class StandInScanner:
             send(500, b'{"error": "internal"}')
         elif mode == "timeout":
             ev["answered"] = "(held open, no answer)"
+            t0 = time.monotonic()
             with self._lock:
                 self.stalled += 1
             try:
-                release.wait(300)  # never answer while the scenario runs
+                # Never answer while the scenario runs; note when the integration gives up
+                # (its own timeout fired) or when gcl let go (the scenario was over).
+                ended = "released by gcl"
+                while not release.wait(0.1):
+                    if time.monotonic() - t0 > 300:
+                        ended = "gcl's 300 s cap"
+                        break
+                    if h is not None and _peer_gone(h):
+                        ended = "integration gave up"
+                        break
+                ev["stall"] = {"ended": ended, "s": round(time.monotonic() - t0, 3)}
             finally:
                 with self._lock:
                     self.stalled -= 1
@@ -534,7 +577,7 @@ class StandInScanner:
         elif mode == "wrong_schema":
             ev["answered"] = proto.wrong_schema
             content(json.dumps(proto.wrong_schema))
-        elif mode in ("unknown_verdict", "verdict_type"):
+        elif mode in ("unknown_verdict", "verdict_type", "null_verdict"):
             block, allow = verdict("block"), verdict("allow")
             # Only the fields that decide the verdict — those that differ between the allow
             # and the block answer — are rewritten. If none can be, the fault was not
@@ -587,6 +630,18 @@ class StandInScanner:
                 outer.serve_get(self, listener)
 
         return H
+
+
+def _peer_gone(h) -> bool:
+    """Has the client of handler `h` closed its side of the connection?"""
+    sock = getattr(h, "connection", None)
+    if sock is None:
+        return False
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+        return bool(readable) and sock.recv(1, socket.MSG_PEEK) == b""
+    except (OSError, ValueError):
+        return True
 
 
 def _path_ok(proto: Protocol, path: str) -> bool:
@@ -642,6 +697,12 @@ def _fault_on_operative(block, allow, mode: str):
         if mode == "unknown_verdict":
             if isinstance(v, bool) or (isinstance(v, str) and v):
                 return _set(out, p, "DENY_UNKNOWN" if isinstance(v, str) else "unknown"), True
+        elif mode == "null_verdict":
+            # Unknown *and* falsy: "unknown" and "DENY_UNKNOWN" are truthy or share a prefix
+            # with a block word, so a parser that tests truthiness or a prefix fails safe on
+            # them by accident. null does not.
+            if isinstance(v, (bool, str)):
+                return _set(out, p, None), True
         else:  # verdict_type: the same meaning in the wrong type
             if isinstance(v, bool):
                 out, changed = _set(out, p, "true" if v else "false"), True

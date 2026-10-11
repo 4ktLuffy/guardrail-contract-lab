@@ -305,6 +305,12 @@ def enforce(
     spec: Path | None = typer.Option(None, exists=True, dir_okay=False,
                                      help="For litellm-vendor: a vendor spec JSON (guardrail type, params, "
                                           "the vendor's request path and allow/block bodies)."),
+
+    judge_latency: str = typer.Option("", help="Comma-separated guard latencies in seconds (e.g. "
+                                      "0,0.2,1): run the whole contract once per latency and report "
+                                      "results that change with timing as unstable."),
+    force: bool = typer.Option(False, help="Write into a non-empty --out folder (default: refuse, so "
+                               "reports and repro bundles of different runs never mix)."),
 ):
     """Does a real guardrail integration enforce what its scanner decides?"""
     import tempfile
@@ -322,6 +328,8 @@ def enforce(
     if profile not in cls.documented:
         raise typer.BadParameter(f"{integration} profiles: {', '.join(cls.documented)}",
                                  param_hint="--profile")
+    if out and out.exists() and any(out.iterdir()) and not force:
+        raise typer.BadParameter(f"{out} is not empty; use a new folder or --force", param_hint="--out")
     where = env if cls.runtime == "node" else python
     if where is None:
         flag = "--env" if cls.runtime == "node" else "--python"
@@ -336,8 +344,21 @@ def enforce(
     else:
         adapter = cls(str(where), workdir, profile)
     try:
-        run = run_contracts(adapter, timeout or adapter.default_timeout_s, progress=_say,
-                            only=set(scenario) or None)
+        lats = [float(x) for x in judge_latency.split(",") if x.strip()]
+    except ValueError:
+        raise typer.BadParameter("numbers in seconds, comma-separated", param_hint="--judge-latency") from None
+    try:
+        if lats:
+            from .enforce.contracts import latency_sweep
+
+            sweep = latency_sweep(adapter, lats, timeout or adapter.default_timeout_s, progress=_say,
+                                  only=set(scenario) or None)
+            run = sweep["runs"][-1]  # the slowest guard: where races show
+            run["latency_sweep"] = {k: v for k, v in sweep.items() if k != "runs"}
+            run["latency_sweep"]["summaries"] = [r["summary"] for r in sweep["runs"]]
+        else:
+            run = run_contracts(adapter, timeout or adapter.default_timeout_s, progress=_say,
+                                only=set(scenario) or None)
     except RuntimeError as e:
         typer.echo(f"error: {e}", err=True)
         raise typer.Exit(2) from None
@@ -352,6 +373,11 @@ def enforce(
                   f"--timeout {run['timeout_s']:g}")
         bundles = write_bundles(run, out, replay)
         typer.echo(f"\nReports: {out}/" + (f"  ({len(bundles)} repro bundle(s) in {out}/repro/)" if bundles else ""))
+    sw = run.get("latency_sweep")
+    if sw:
+        codes = [_enforce_exit(sm, fail_on, allow_incomplete) for sm in sw["summaries"]]
+        code = 1 if 1 in codes else (2 if 2 in codes or sw["unstable"] else 0)
+        raise typer.Exit(0 if fail_on == "never" else code)
     raise typer.Exit(_enforce_exit(run["summary"], fail_on, allow_incomplete))
 
 

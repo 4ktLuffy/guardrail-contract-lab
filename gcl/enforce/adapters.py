@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
+from .receipt import probe_versions
 from .servers import MockModel, Protocol, StandInScanner
 
 
@@ -132,19 +133,10 @@ def _tail(log: Path, n: int = 15) -> str:
         return "(no log)"
 
 
-def _versions(python: str, dists: list[str]) -> dict:
-    code = ("import json, importlib.metadata as m, sys\n"
-            f"d = {dists!r}\n"
-            "out = {'python': sys.version.split()[0]}\n"
-            "for x in d:\n"
-            "    try: out[x] = m.version(x)\n"
-            "    except m.PackageNotFoundError: out[x] = None\n"
-            "print(json.dumps(out))")
-    r = subprocess.run([python, "-I", "-c", code], capture_output=True, text=True, timeout=60)
-    try:
-        return json.loads(r.stdout.strip().splitlines()[-1])
-    except (ValueError, IndexError):
-        return {"error": (r.stderr or r.stdout)[-300:]}
+def _versions(python: str, dists: list[str], cwd: Path | None = None) -> dict:
+    """Versions as the integration's own interpreter sees them (same environment and
+    working directory, not isolated), with install details under "dists"."""
+    return probe_versions(python, dists, cwd)
 
 
 class Adapter:
@@ -165,8 +157,10 @@ class Adapter:
         self.log = self.workdir / f"{self.name}-{profile}.log"
 
     def describe(self) -> dict:
+        full = self.versions()
         return {"integration": self.name, "profile": self.profile, "config": self.config_summary(),
-                "versions": self.versions(),
+                "versions": {k: v for k, v in full.items() if k not in ("dists", "executable")},
+                "install": {"executable": full.get("executable"), "dists": full.get("dists")},
                 "documented_source": self.documented_sources.get(self.profile, {})}
 
     def config_summary(self) -> dict:
@@ -261,7 +255,7 @@ class LiteLLMProxy(Adapter):
                 **LITELLM_PROFILES[self.profile]}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["litellm"])
+        return _versions(self.python, ["litellm"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -344,7 +338,7 @@ class NemoServer(Adapter):
         return {"rail": "jailbreak detection model (input)", "server_endpoint": "stand-in /model"}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["nemoguardrails", "langchain-openai", "langchain-core"])
+        return _versions(self.python, ["nemoguardrails", "langchain-openai", "langchain-core"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         cfgdir = self.workdir / "nemo-configs" / "gcl"
@@ -411,7 +405,7 @@ class ReferenceGateway(Adapter):
     default_timeout_s = 15.0
     _closed: ClassVar[dict] = {**_BASE, **{f: "stopped" for f in
                                           ("error", "timeout", "malformed", "empty", "wrong_schema",
-                                           "unknown_verdict", "verdict_type", "refused")}}
+                                           "unknown_verdict", "verdict_type", "refused", "null_verdict")}}
     documented: ClassVar[dict] = {"strict": _closed, "naive": _closed}
     documented_sources: ClassVar[dict] = {
         p: {"source": "examples/enforce/ref_gateway.py (module docstring)", "read_for": "this release",
@@ -423,7 +417,7 @@ class ReferenceGateway(Adapter):
                 "documented_contract": "fail closed"}
 
     def versions(self) -> dict:
-        return _versions(self.python, [])
+        return _versions(self.python, [], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -633,7 +627,7 @@ class OpenAIGuardrails(Adapter):
                 "raise_guardrail_errors": self.profile != "default", "client_timeout_s": 8}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["openai-guardrails", "openai"])
+        return _versions(self.python, ["openai-guardrails", "openai"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -787,7 +781,7 @@ class LangChainModeration(Adapter):
                 "exit_behavior": "end" if self.profile == "default" else "error", "client_timeout_s": 8}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["langchain", "langchain-openai", "langchain-core", "openai"])
+        return _versions(self.python, ["langchain", "langchain-openai", "langchain-core", "openai"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -919,7 +913,7 @@ class OpenAIAgents(OpenAIGuardrails):
                 "raise_guardrail_errors": self.profile == "raise_errors"}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["openai-agents", "openai-guardrails", "openai"])
+        return _versions(self.python, ["openai-agents", "openai-guardrails", "openai"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -985,7 +979,7 @@ class PydanticAI(Adapter):
                 "scanner_latency_s": 1.0}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["pydantic-ai-slim", "pydantic-ai-harness", "openai"])
+        return _versions(self.python, ["pydantic-ai-slim", "pydantic-ai-harness", "openai"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -1097,7 +1091,7 @@ class LiteLLMVendor(Adapter):
                 **{k: v for k, v in (self.spec.get("litellm_params") or {}).items() if "key" not in k.lower()}}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["litellm"])
+        return _versions(self.python, ["litellm"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -1236,7 +1230,7 @@ class CrewAITask(Adapter):
                 "guardrail_max_retries": 3, "tools": ["gcl_probe"]}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["crewai", "litellm", "openai"])
+        return _versions(self.python, ["crewai", "litellm", "openai"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -1290,7 +1284,7 @@ class GuardrailsAI(Adapter):
                 else "Guard().use(check, on='messages').use(check)", "validator": "gcl strict HTTP check"}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["guardrails-ai", "litellm"])
+        return _versions(self.python, ["guardrails-ai", "litellm"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -1381,7 +1375,7 @@ class InvariantMCP(Adapter):
                 "push_to_explorer": self.profile == "push"}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["invariant-gateway", "httpx", "fastapi"])
+        return _versions(self.python, ["invariant-gateway", "httpx", "fastapi"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -1459,7 +1453,7 @@ class AgnoAgent(Adapter):
                 "call": "agent.run"}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["agno", "openai"])
+        return _versions(self.python, ["agno", "openai"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -1551,7 +1545,7 @@ class GoogleADK(PydanticAI):
                 "guard": "gcl strict HTTP guard", "tools": ["gcl_probe"]}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["google-adk", "litellm"])
+        return _versions(self.python, ["google-adk", "litellm"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -1606,7 +1600,7 @@ class LassoMCPGateway(Adapter):
                 "lasso_api_key": self.profile != "no_key", "change": "plugin api_base default only"}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["mcp-gateway", "mcp"])
+        return _versions(self.python, ["mcp-gateway", "mcp"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -1709,7 +1703,7 @@ class SemanticKernel(GoogleADK):
                 "function_invocation"], "guard": "gcl strict HTTP guard", "tools": ["probe.gcl_probe (auto)"]}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["semantic-kernel", "openai"])
+        return _versions(self.python, ["semantic-kernel", "openai"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)

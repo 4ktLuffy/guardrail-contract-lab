@@ -48,11 +48,11 @@ def test_reference_naive_is_caught_as_a_deviation_from_its_own_docs(tmp_path):
     run = run_contracts(ReferenceGateway(sys.executable, tmp_path, "naive"), 15)
     for stage in ("input", "output"):
         for f in ("error", "timeout", "malformed", "empty", "wrong_schema", "unknown_verdict", "verdict_type",
-                  "refused"):
+                  "refused", "null_verdict"):
             r = _by(run, stage, f)
             assert (r["observed"], r["policy"], r["documented"]) == ("passed", "violated", "deviates"), (stage, f)
     # Every control still holds, so the faults are attributable to error handling.
-    assert run["summary"]["documented_deviates"] == 16
+    assert run["summary"]["documented_deviates"] == 18
     for key in (("input", "allow"), ("input", "block"), ("output", "allow"), ("output", "block")):
         assert _by(run, *key)["policy"] == "held", key
 

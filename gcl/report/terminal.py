@@ -173,6 +173,13 @@ def render_enforce(run: dict) -> str:
     src = i.get("documented_source") or {}
     if src:
         lines.append(c(f"Docs: {src.get('source')} (read for {src.get('read_for')})", "dim"))
+    rc = run.get("receipt") or {}
+    if rc:
+        g = rc.get("gcl") or {}
+        lines.append(c(f"Run {rc.get('run_id')}  gcl {g.get('version')} "
+                       f"{(g.get('commit') or 'not a git checkout')[:12]}", "dim"))
+        for p in rc.get("problems") or []:
+            lines.append(c(f"Receipt: {p}", "warning"))
     lines.append("")
     for r in run["results"]:
         s = r["scenario"]
@@ -191,6 +198,15 @@ def render_enforce(run: dict) -> str:
     lines.append(f"Policy: {sm['policy_held']} held, {sm['policy_violated']} violated, {sm['unverified']} unverified "
                  f"of {sm['scenarios']}.  Docs: {sm['documented_deviates']} deviation(s); "
                  f"{sm['documented_unspecified_violations']} violation(s) in behaviour the docs do not cover.")
+    sw = run.get("latency_sweep")
+    if sw:
+        lines.append(f"Guard latency sweep {sw['latencies']} s: {sw['unstable']} result(s) change with timing"
+                     + (" (timing-dependent: a race)" if sw["unstable"] else ""))
+        for x in sw["stability"]:
+            if not x["stable"]:
+                by = ", ".join(f"{k} s: {v['observed']}/{v['policy']}" for k, v in x["by_latency"].items())
+                lines.append(c(f"  unstable  {x['stage']} {x['mode']}{' (' + x['role'] + ')' if x['role'] else ''}"
+                               f"  {by}", "warning"))
     if run.get("known_issues"):
         refs = sorted(set(run["known_issues"].values()))
         lines.append(c("Known public issues for this integration: " + ", ".join(refs), "dim"))

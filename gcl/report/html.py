@@ -159,6 +159,13 @@ def _coverage(sec: dict) -> str:
     out.append(_compare(sec))
     if sec.get("fixtures_note"):
         out.append(f'<p class="sub">{e(sec["fixtures_note"])}</p>')
+    ho = sec.get("heldout") or {}
+    if ho.get("heldout", {}).get("attacks"):
+        out.append(f'<p class="sub">Held-out cases only: recall {e(ho["heldout"]["recall_pct"])}% '
+                   f'({ho["heldout"]["caught"]}/{ho["heldout"]["attacks"]}); fit cases '
+                   f'{e(ho["fit"]["recall_pct"])}% ({ho["fit"]["caught"]}/{ho["fit"]["attacks"]})</p>')
+    if ho.get("note"):
+        out.append(f'<p class="warning">{e(ho["note"])}</p>')
     intents = sec.get("matrix", {})
     if intents:
         langs = list(sec["by_lang"])
@@ -208,6 +215,30 @@ def _probe(sec: dict) -> str:
     return "\n".join(out)
 
 
+def _receipt(rc: dict) -> str:
+    if not rc:
+        return ""
+    g = rc.get("gcl") or {}
+    head = (f'<p class="sub">Run <code>{e(rc.get("run_id"))}</code> · gcl {e(g.get("version"))} '
+            f'<code>{e((g.get("commit") or "not a git checkout")[:12])}</code></p>')
+    probs = "".join(f"<li>{e(p)}</li>" for p in rc.get("problems") or [])
+    return head + (f'<div class="warning"><b>Receipt problems</b><ul>{probs}</ul></div>' if probs else "")
+
+
+def _sweep(sw: dict) -> str:
+    if not sw:
+        return ""
+    rows = "".join(
+        f"<tr><td>{e(x['id'])}</td><td>{e(x['stage'])}</td><td>{e(x['mode'])}</td><td>{e(x['lang'])}</td><td>"
+        + "<br>".join(f"{e(k)} s: {e(v['observed'])} / {e(v['policy'])}" for k, v in x["by_latency"].items())
+        + "</td></tr>" for x in sw["stability"] if not x["stable"])
+    head = (f'<p class="{"warning" if sw["unstable"] else "sub"}"><b>Guard latency sweep</b> '
+            f'{e(sw["latencies"])} s: {sw["unstable"]} result(s) change with timing. The table below '
+            "shows the slowest run; every run is in the JSON record.</p>")
+    return head + (f"<div class='scroll'><table><tr><th>Id</th><th>Stage</th><th>Scanner</th><th>Lang</th>"
+                   f"<th>By latency</th></tr>{rows}</table></div>" if rows else "")
+
+
 def _enforce(sec: dict) -> str:
     i = sec["integration"]
     versions = ", ".join(f"{k} {v}" for k, v in i["versions"].items() if v)
@@ -220,8 +251,11 @@ def _enforce(sec: dict) -> str:
            + _tile(sm["documented_deviates"], "deviations from its own docs")
            + _tile(sm["unverified"], "unverified")
            + _tile(sm["policy_held"], "held", bad_if_nonzero=False)
+           + _tile(sm.get("guessed", 0), "rest on a guessed stand-in")
            + "</div>",
            _doc_source(i.get("documented_source") or {}),
+           _receipt(sec.get("receipt") or {}),
+           _sweep(sec.get("latency_sweep") or {}),
            ("<div class='scroll'><table><tr><th>Stage</th><th>Scanner</th><th>Lang</th>"
            "<th>Expected</th><th>Observed</th><th>Policy</th><th>Docs</th><th>Evidence</th></tr>")]
     cls = {"held": "okc", "violated": "error", "unverified": "warning", "conforms": "okc",
@@ -234,7 +268,8 @@ def _enforce(sec: dict) -> str:
         out.append(f"<tr><td>{e(s['stage'])}{' (control)' if s['control'] else ''}</td>"
                    f"<td><code>{e(s['mode'])}</code></td><td>{e(s['lang'])}</td>"
                    f"<td>{e(r['policy_expect'])}</td><td><b>{e(r['observed'])}</b></td>"
-                   f'<td class="lv {cls[r["policy"]]}">{e(r["policy"])}</td>'
+                   f'<td class="lv {cls[r["policy"]]}">{e(r["policy"])}'
+                   f'{"<br><small>guessed stand-in</small>" if ev.get("confidence") == "guessed" else ""}</td>'
                    f'<td class="lv {cls[r["documented"]]}">{e(r["documented"])}</td>'
                    f"<td><small>{evidence}</small>{notes}</td></tr>")
     out.append("</table></div>")

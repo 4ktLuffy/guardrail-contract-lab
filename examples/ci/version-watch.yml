@@ -1,0 +1,26 @@
+# Re-run a guardrail integration's enforcement contract on every new release and fail
+# when something that held before is violated now. Copy to .github/workflows/.
+name: guardrail version watch
+on:
+  schedule: [{cron: "0 6 * * 1"}]   # weekly
+  workflow_dispatch:
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13"}
+      - name: Install the integration twice — the pinned baseline and the latest release
+        run: |
+          python -m venv /tmp/base && /tmp/base/bin/pip install "litellm[proxy]==1.104.2"
+          python -m venv /tmp/latest && /tmp/latest/bin/pip install --upgrade "litellm[proxy]"
+      - uses: 4ktLuffy/guardrail-contract-lab@main
+        with: {integration: litellm, python: /tmp/base/bin/python, out: base, fail-on: never}
+      - uses: 4ktLuffy/guardrail-contract-lab@main
+        with: {integration: litellm, python: /tmp/latest/bin/python, out: latest, fail-on: never}
+      - name: What changed between the releases (fails on a regression)
+        run: gcl compare base/report.json latest/report.json --json compare.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: gcl-version-watch, path: "base/\nlatest/\ncompare.json"}

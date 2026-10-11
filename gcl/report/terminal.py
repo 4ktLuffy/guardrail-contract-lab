@@ -106,6 +106,13 @@ def render_coverage(sec: dict) -> str:
 
     lines.append(f"All languages: recall {pc(a['recall_pct'])} ({a['caught']}/{a['attacks']}), "
                  f"false positives {pc(a['fp_pct'])} ({a['flagged_benign']}/{a['benign']})")
+    ho = sec.get("heldout") or {}
+    if ho.get("heldout", {}).get("attacks"):
+        lines.append(f"Held-out cases only: recall {pc(ho['heldout']['recall_pct'])} "
+                     f"({ho['heldout']['caught']}/{ho['heldout']['attacks']}); fit cases "
+                     f"{pc(ho['fit']['recall_pct'])} ({ho['fit']['caught']}/{ho['fit']['attacks']})")
+    if ho.get("note"):
+        lines.append(c(f"  {ho['note']}", "warning"))
     lines.append("")
     lines.append(f"  {'lang':<9}{'recall':>18}   {'95% CI':>12}   {'FP benign':>12}   {'FP hard-neg':>12}")
     for lg, r in sec["by_lang"].items():
@@ -173,12 +180,21 @@ def render_enforce(run: dict) -> str:
     src = i.get("documented_source") or {}
     if src:
         lines.append(c(f"Docs: {src.get('source')} (read for {src.get('read_for')})", "dim"))
+    rc = run.get("receipt") or {}
+    if rc:
+        g = rc.get("gcl") or {}
+        lines.append(c(f"Run {rc.get('run_id')}  gcl {g.get('version')} "
+                       f"{(g.get('commit') or 'not a git checkout')[:12]}", "dim"))
+        for p in rc.get("problems") or []:
+            lines.append(c(f"Receipt: {p}", "warning"))
     lines.append("")
     for r in run["results"]:
         s = r["scenario"]
         pk = {"held": "ok", "violated": "error", "unverified": "warning"}[r["policy"]]
         dk = {"conforms": "ok", "deviates": "error", "unspecified": "dim", "unverified": "warning"}[r["documented"]]
         tag = " (control)" if s["control"] else ""
+        if r["evidence"].get("confidence") == "guessed":
+            tag += " [guessed stand-in]"
         pol = f"{r['policy']:<10}"
         docv = f"{r['documented']:<11}"
         lines.append(f"  {c(pol, pk)} {c(docv, dk)} "
@@ -186,11 +202,42 @@ def render_enforce(run: dict) -> str:
                      f"observed {r['observed']}{tag}")
         for n in r["notes"]:
             lines.append(c(f"             {n}", "dim"))
+        if r["evidence"].get("owasp"):
+            lines.append(c(f"             OWASP: {', '.join(r['evidence']['owasp'])}", "dim"))
     sm = run["summary"]
     lines.append("")
     lines.append(f"Policy: {sm['policy_held']} held, {sm['policy_violated']} violated, {sm['unverified']} unverified "
                  f"of {sm['scenarios']}.  Docs: {sm['documented_deviates']} deviation(s); "
                  f"{sm['documented_unspecified_violations']} violation(s) in behaviour the docs do not cover.")
+    if sm.get("guessed"):
+        lines.append(c(f"{sm['guessed']} result(s) rest on a guessed stand-in answer "
+                       f"({run['integration'].get('stand_in', {}).get('source', '')}): not findings until "
+                       "confirmed against a real reply.", "warning"))
+    am = run.get("attack_matrix")
+    if am:
+        sm2 = am["summary"]
+        lines.append(f"Attack × fault ({am['detector']['name']}; faults {', '.join(am['faults'])}): "
+                     f"{sm2['attacks']} attacks, {sm2['detected']} flagged by the detector; "
+                     f"{sm2['detected_not_enforced']} flagged but NOT enforced, {sm2['missed_by_detector']} missed "
+                     f"by the detector, {sm2['leaked_under_fault']} leaked under a fault, "
+                     f"{sm2['unverified']} unverified")
+        for row in am["rows"]:
+            cells = ", ".join(f"{k}: {v}" for k, v in row["cells"].items())
+            kind = "error" if ("NOT ENFORCED" in cells or "LEAKED" in cells) else "dim"
+            lines.append(c(f"  {row['attack']:<22} [{row['lang']}] {'flagged' if row['flagged'] else 'missed '}  "
+                           f"{cells}", kind))
+        if am.get("dropped"):
+            lines.append(c(f"  the detector gave no answer for: {', '.join(map(str, am['dropped']))} (not sent)",
+                           "warning"))
+    sw = run.get("latency_sweep")
+    if sw:
+        lines.append(f"Guard latency sweep {sw['latencies']} s: {sw['unstable']} result(s) change with timing"
+                     + (" (timing-dependent: a race)" if sw["unstable"] else ""))
+        for x in sw["stability"]:
+            if not x["stable"]:
+                by = ", ".join(f"{k} s: {v['observed']}/{v['policy']}" for k, v in x["by_latency"].items())
+                lines.append(c(f"  unstable  {x['id']} {x['stage']} {x['mode']} [{x['lang']}]"
+                               f"{' (' + x['role'] + ')' if x['role'] else ''}  {by}", "warning"))
     if run.get("known_issues"):
         refs = sorted(set(run["known_issues"].values()))
         lines.append(c("Known public issues for this integration: " + ", ".join(refs), "dim"))

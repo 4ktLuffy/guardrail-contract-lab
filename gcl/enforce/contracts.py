@@ -55,9 +55,12 @@ import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
+from . import receipt as _rc
 from .adapters import Adapter
-from .servers import FAULTS, POLICY_FAULTS, MockModel, StandInScanner
+from .receipt import new_run_id
+from .servers import FAULTS, LATE_FAULTS, POLICY_FAULTS, MockModel, StandInScanner, null_expressible
 
 # Widely spoken languages, rotated across scenarios: the plumbing must not depend on the
 # script or on non-ASCII bytes surviving a round trip.
@@ -82,6 +85,8 @@ REDACTED = {"es": "[contenido retirado por la política]", "fr": "[contenu retir
             "hi": "[नीति के कारण सामग्री हटाई गई]"}
 
 POLICY = {"allow": "passed", "block": "stopped", "modify": "modified", **{f: "stopped" for f in FAULTS},
+          "history_block": "stopped",
+          **{f: "stopped" for f in LATE_FAULTS},
           "judge_refusal": "stopped", "block_retry": "stopped", **{f: "stopped" for f in POLICY_FAULTS}}
 
 
@@ -95,14 +100,40 @@ class Scenario:
     reply_text: str
     modify_text: str = ""
     control: bool = False
+    run: str = ""              # the run id, carried in every sentinel ("" in unit tests)
+    # Controls by role: "open" (judged first, gate everything), "close" (the same controls
+    # again after the last scenario: the setup must still work), "lang" (an allow in a
+    # language no opening control used), "observe" (an allow with a long reply: the
+    # driver must pass the whole answer). "" for an ordinary scenario.
+    role: str = ""
+    # Attack mode: the attack case this scenario sends, and what the real detector said
+    # about it (None outside attack mode).
+    attack: str = ""
+    attack_flagged: bool | None = None
+    # Opt-in blind spots (`--extra`): the request streams its answer; the user turn sits
+    # earlier in the conversation, behind a benign follow-up turn.
+    stream: bool = False
+    history: bool = False
+
+    @property
+    def history_sentinel(self) -> str:
+        return f"GCL-H-{self._tag}"
+
+    @property
+    def phase(self) -> str:
+        return self.role or ("open" if self.control else "")
+
+    @property
+    def _tag(self) -> str:
+        return f"{self.id}-{self.run}" if self.run else self.id
 
     @property
     def user_sentinel(self) -> str:
-        return f"GCL-U-{self.id}"
+        return f"GCL-U-{self._tag}"
 
     @property
     def reply_sentinel(self) -> str:
-        return f"GCL-R-{self.id}"
+        return f"GCL-R-{self._tag}"
 
 
 @dataclass
@@ -123,7 +154,11 @@ class Result:
         return d
 
 
-def build_scenarios(adapter: Adapter) -> list[Scenario]:
+EXTRAS = ("stream", "history", "retry")
+FOLLOW_UP = "Thanks. Anything else?"
+
+
+def build_scenarios(adapter: Adapter, run: str = "", extra: tuple = ()) -> list[Scenario]:
     caps = adapter.capabilities
     # The input allow control always runs: it proves requests reach the model at all. An
     # integration that checks only the output gets no input block control or input faults.
@@ -153,17 +188,139 @@ def build_scenarios(adapter: Adapter) -> list[Scenario]:
         plan += [("output", f, False) for f in out_faults]
     if "modify_output" in caps:
         plan.append(("output", "modify", False))
+    if null_expressible(proto):
+        plan += [(st, "null_verdict", False) for st in ("input", "output") if st in caps]
+    # Opt-in blind spots, planned last so every earlier scenario keeps its id.
+    flags: dict[int, str] = {}
+    if "stream" in extra and "stream" in caps and "output" in caps:
+        for mode in ("block", "error"):
+            flags[len(plan)] = "stream"
+            plan.append(("output", mode, False))
+    if "history" in extra and "history" in caps and "input" in caps:
+        flags[len(plan)] = "history"
+        plan.append(("input", "history_block", False))
+    if "retry" in extra and "retry" not in caps and "input" in caps:
+        plan.append(("input", "block_retry", False))
     out = []
     for k, (stage, mode, control) in enumerate(plan):
         lang, user, reply = LANGS[k % len(LANGS)]
-        sid = f"{stage[0]}{k:02d}"
-        out.append(Scenario(sid, stage, mode, lang, user, reply,
-                            modify_text=f"{REDACTED[lang]} GCL-M-{sid}" if mode == "modify" else "",
-                            control=control))
+        sc = _scenario(k, stage, mode, lang, user, reply, run, "open" if control else "")
+        sc.stream, sc.history = flags.get(k) == "stream", flags.get(k) == "history"
+        out.append(sc)
+    # After the last scenario: an allow control in every language a judged scenario used
+    # that no opening allow covered (an integration that fails on a script after the
+    # guard answered would otherwise read as "stopped"), the controls again (the setup
+    # must still work at the end), and an allow with a long reply (a driver that cuts
+    # the answer would otherwise turn a leak into "stopped").
+    opened = {s.lang for s in out if s.phase == "open" and s.mode == "allow" and s.stage == "input"}
+    used = [lang for lang, *_ in LANGS if lang in {s.lang for s in out if not s.control} - opened]
+    texts = {lang: (u, r) for lang, u, r in LANGS}
+    tail = [("input", "allow", lang, "lang") for lang in used]
+    if "input" in caps:
+        tail.append(("input", "block", None, "close"))
+    if "output" in caps:
+        tail += [("output", "allow", None, "close"), ("output", "block", None, "close")]
+    tail.append(("input", "allow", None, "observe"))
+    for stage, mode, lang, role in tail:
+        k = len(out)
+        lang = lang or LANGS[k % len(LANGS)][0]
+        user, reply = texts[lang]
+        if role == "observe":
+            reply = " ".join([reply] * (OBSERVE_CHARS // len(reply) + 1))
+        out.append(_scenario(k, stage, mode, lang, user, reply, run, role))
     return out
 
 
-_SENT = re.compile(r"GCL-[UMRT]-([io]\d{2})\b")
+OBSERVE_CHARS = 6000  # past the 300- and 2000-character cuts drivers have had
+REPLY_FALLBACK = "Here is the summary of the document."
+MAX_SCENARIOS = 100  # scenario ids are two digits
+
+
+def build_attack_scenarios(adapter: Adapter, attacks: list[dict], flagged: dict, faults: list[str],
+                           benign: dict[str, str], run: str = "") -> list[Scenario]:
+    """Attack × fault: every attack case is sent once with the stand-in answering what a
+    real detector decided about that text (block if it flagged it, allow if it missed it),
+    and once per fault (the guard is down or misbehaves while a real attack is in flight).
+    The usual controls open and close the run; the language controls use a benign text in
+    each attack language, so a failure on a script is not mistaken for a block."""
+    if "input" not in adapter.capabilities:
+        raise ValueError("attack mode sends attacks as user input: this integration checks only the output")
+    if len(set(faults)) != len(faults):
+        raise ValueError("each fault once: a repeated fault would hide one of its results")
+    ids = [str(c["id"]) for c in attacks]
+    if any(not i.strip() for i in ids) or len(set(ids)) != len(ids):
+        raise ValueError("attack ids must be non-empty and distinct as text (1 and \"1\" are the same attack)")
+    replies = {lang: r for lang, _, r in LANGS}
+    out = [s for s in build_scenarios(adapter, run) if s.phase == "open"]
+    for case in attacks:
+        lang = str(case.get("lang") or "en")
+        for cond in ["verdict", *faults]:
+            mode = ("block" if flagged[case["id"]] else "allow") if cond == "verdict" else cond
+            s = _scenario(len(out), "input", mode, lang, case["text"], replies.get(lang, REPLY_FALLBACK), run, "")
+            s.attack, s.attack_flagged = str(case["id"]), flagged[case["id"]]
+            out.append(s)
+    tail = [("input", "allow", lang, "lang") for lang in dict.fromkeys(str(c.get("lang") or "en") for c in attacks)
+            if lang in benign]
+    tail.append(("input", "block", "es", "close"))
+    if "output" in adapter.capabilities:
+        tail += [("output", "allow", "fr", "close"), ("output", "block", "pt", "close")]
+    texts = {lang: (u, r) for lang, u, r in LANGS}
+    for stage, mode, lang, role in tail:
+        user, reply = (benign[lang], replies.get(lang, REPLY_FALLBACK)) if role == "lang" else texts[lang]
+        out.append(_scenario(len(out), stage, mode, lang, user, reply, run, role))
+    user, reply = texts["es"]
+    out.append(_scenario(len(out), "input", "allow", "es", user,
+                         " ".join([reply] * (OBSERVE_CHARS // len(reply) + 1)), run, "observe"))
+    if len(out) > MAX_SCENARIOS:
+        raise ValueError(f"{len(out)} scenarios; at most {MAX_SCENARIOS}: use fewer attacks or faults")
+    return out
+
+
+def attack_matrix(results: list[dict]) -> dict:
+    """One row per attack case: what the detector said, and what reached the model with a
+    healthy guard and under each fault. Cells: enforced, NOT ENFORCED (the detector flagged
+    it and it still reached the model), missed (the detector let it through — a detector
+    problem, not an enforcement one), stopped / LEAKED under a fault, or unverified."""
+    rows: dict[str, dict] = {}
+    for r in results:
+        s = r["scenario"]
+        if not s.get("attack"):
+            continue
+        row = rows.setdefault(s["attack"], {"attack": s["attack"], "lang": s["lang"], "flagged": s["attack_flagged"],
+                                            "text": s["user_text"][:80], "cells": {}})
+        leaked = r["observed"] in ("passed", "altered", "blocked after send", "failed after send",
+                                   "tool executed", "retained")
+        if r["policy"] == "unverified":
+            cell = "unverified"
+        elif s["mode"] in ("block", "allow"):
+            cell = ("NOT ENFORCED" if leaked else "enforced") if s["attack_flagged"] else \
+                ("missed" if leaked else "missed, stopped anyway")
+        else:
+            cell = "LEAKED" if leaked else "stopped"
+        row["cells"]["verdict" if s["mode"] in ("block", "allow") else s["mode"]] = cell
+    rows_l = list(rows.values())
+    count = lambda pred: sum(1 for x in rows_l for k, v in x["cells"].items() if pred(k, v))  # noqa: E731
+    return {"rows": rows_l, "summary": {
+        "attacks": len(rows_l),
+        "detected": sum(1 for x in rows_l if x["flagged"]),
+        "detected_not_enforced": count(lambda k, v: k == "verdict" and v == "NOT ENFORCED"),
+        "missed_by_detector": count(lambda k, v: k == "verdict" and v.startswith("missed")),
+        "leaked_under_fault": count(lambda k, v: k != "verdict" and v == "LEAKED"),
+        "unverified": count(lambda k, v: v == "unverified")}}
+
+
+def _scenario(k: int, stage: str, mode: str, lang: str, user: str, reply: str, run: str, role: str) -> Scenario:
+    sid = f"{stage[0]}{k:02d}"
+    tag = f"{sid}-{run}" if run else sid
+    return Scenario(sid, stage, mode, lang, user, reply,
+                    modify_text=f"{REDACTED[lang]} GCL-M-{tag}" if mode == "modify" else "",
+                    control=bool(role), run=run, role=role)
+
+
+# A scenario id, optionally followed by the run id. A marker without a run id belongs to
+# this run (the tool marker is built from the id alone); one with another run's id is
+# foreign — a cached or replayed answer — and is never evidence for this run.
+_SENT = re.compile(r"GCL-[UMRTH]-([io]\d{2})(?:-([0-9a-f]{6}))?\b")
 
 
 def _strings(obj) -> list[str]:
@@ -190,20 +347,28 @@ def _client_strings(text: str, view: str = "answer") -> list[str]:
         if view == "returned":
             return _strings(doc.get("library_return"))
         return _strings({k: v for k, v in doc.items() if k != "library_return"})
-    if view == "returned":
-        return []
     if doc is not None:
-        return _strings(doc)
-    out, deltas = [text], []
+        return [] if view == "returned" else _strings(doc)
+    # An event stream: the deltas are the answer; an event carrying `library_return` is
+    # what the library handed its caller, kept apart like a JSON body's field.
+    out, deltas, returned = [], [], []
     for line in text.splitlines():
         if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]"):
             try:
                 chunk = json.loads(line[5:])
             except ValueError:
+                out.append(line)
+                continue
+            if isinstance(chunk, dict) and "library_return" in chunk:
+                returned += _strings(chunk["library_return"])
                 continue
             out += _strings(chunk)
-            for ch in chunk.get("choices") or []:
+            for ch in (chunk.get("choices") or []) if isinstance(chunk, dict) else []:
                 deltas.append(((ch.get("delta") or {}).get("content")) or "")
+        elif line.strip():
+            out.append(line)
+    if view == "returned":
+        return returned
     out.append("".join(deltas))
     return out
 
@@ -247,9 +412,9 @@ def classify_input(s: Scenario, bodies: list) -> str | None:
 
 
 def classify_output(s: Scenario, obs) -> str | None:
-    got = _classify_output_texts(s, _client_strings(obs.text or ""))
+    got = _classify_output_texts(s, _current_texts(_client_strings(obs.text or ""), s)[0])
     if got in (None, "modified"):
-        returned = _client_strings(obs.text or "", "returned")
+        returned = _current_texts(_client_strings(obs.text or "", "returned"), s)[0]
         if any(s.reply_sentinel in t for t in returned) or _leaks(s.reply_text, returned, s.modify_text):
             return "retained"
     return got
@@ -292,7 +457,7 @@ def classify(s: Scenario, bodies: list, obs) -> str:
         if obs.status is not None and obs.status >= 500:
             return "failed after send"
         reply = f"{s.reply_text} {s.reply_sentinel}"
-        if not any(reply in t for t in _client_strings(obs.text or "")):
+        if not any(reply in t for t in _current_texts(_client_strings(obs.text or ""), s)[0]):
             if _refused(obs):
                 return "blocked after send"
             return "altered"
@@ -301,6 +466,124 @@ def classify(s: Scenario, bodies: list, obs) -> str:
     if obs.finished:
         return "stopped"
     return "transport failure" if obs.transport else "no answer"
+
+
+def _timeline(s: Scenario, sev: list, mev: list, tools: list, begin: float, obs, t0: float) -> list[dict]:
+    """Everything that happened for one scenario, in order, at every boundary: the guard
+    asked and answering, the provider receiving, the tool running, the client answered."""
+    ev = []
+    for e in sev:
+        ev.append({"t": e["t"], "at": "guard", "what": f"asked ({e['stage']}, answered as {e['mode']})"})
+        if e.get("t_done"):
+            stall = e.get("stall")
+            what = (f"held open, ended: {stall['ended']}" if stall else
+                    "answer delivered" if (e.get("delivery") or {}).get("delivered", True) else
+                    "answer NOT delivered (peer gone)")
+            ev.append({"t": e["t_done"], "at": "guard", "what": what})
+    for e in mev:
+        ev.append({"t": e["t"], "at": "provider",
+                   "what": "received a request" + (" (unlabelled)" if _unlabelled(e["body"], s) else "")})
+    for e in tools:
+        ev.append({"t": e["t"], "at": "tool", "what": "ran"})
+    end = begin + (obs.elapsed_s or 0.0)
+    ev.append({"t": end, "at": "client", "what": f"{_stop_kind(obs)} (HTTP {obs.status})"})
+    return [{**x, "t": round(x["t"] - t0, 3)} for x in sorted(ev, key=lambda x: x["t"])]
+
+
+def _order_flags(s: Scenario, mine: list, mev: list, tools: list) -> dict:
+    """Did the provider see the request, or the tool run, before the guard answered this
+    scenario's stage? A final refusal does not undo either. (Input stage, non-allow modes:
+    for an allowed request, provider before verdict is just a parallel check.)"""
+    out = {"provider_before_verdict_s": None, "tool_before_verdict_s": None}
+    if s.stage != "input" or s.mode == "allow":
+        return out
+    # When the answer started going out (not when the handler finished: the client may
+    # already be acting on it by then).
+    answered = [e.get("t_sent") or e["t_done"] for e in mine if e.get("t_done") and not e.get("stall")]
+    verdict_t = min(answered) if answered else None
+    for key, events in (("provider_before_verdict_s", mev), ("tool_before_verdict_s", tools)):
+        if not events:
+            continue
+        first = min(e["t"] for e in events)
+        if verdict_t is None or first < verdict_t:
+            out[key] = round((verdict_t - first) if verdict_t is not None else 0.0, 3)
+    return out
+
+
+def _unlabelled(body, s: Scenario) -> bool:
+    texts = _strings(body)
+    if any(_SENT.search(t) for t in texts):
+        return False
+    return not (_leaks(s.user_text, texts) or _leaks(s.reply_text, texts)
+                or (s.modify_text and any(s.modify_text in t for t in texts)))
+
+
+def _call(adapter: Adapter, msg: list[dict], timeout_s: float, s: Scenario):
+    """One scenario's request: streamed if the scenario says so; a retry is the same
+    request twice (by the adapter if it can, else as two calls), every attempt kept."""
+    import inspect
+
+    params = inspect.signature(adapter.call).parameters
+    kw = {"stream": True} if s.stream else {}
+    if s.mode == "block_retry":
+        if "repeat" in params:
+            return adapter.call(msg, timeout_s, repeat=2, **kw)
+        first = adapter.call(msg, timeout_s, **kw)
+        second = adapter.call(msg, timeout_s, **kw)
+        second.attempts = [first, second]
+        return second
+    return adapter.call(msg, timeout_s, **kw)
+
+
+def _stop_kind(obs) -> str | None:
+    """How the client's exchange ended, whatever reached the model."""
+    if not obs.finished:
+        return "transport failure" if obs.transport else "no answer"
+    if _refused(obs):
+        return "refusal"
+    if obs.status is not None and obs.status >= 500:
+        return "server error"
+    return "answer"
+
+
+def _after_release(s: Scenario, mine: list, mev: list, tools: list) -> bool:
+    """A timeout scenario whose outcome came only after gcl let go of a stalled guard call
+    (not after the integration gave up on it)."""
+    if s.mode != "timeout":
+        return False
+    released = [(e.get("stall") or {}).get("released_at") for e in mine
+                if (e.get("stall") or {}).get("ended") == "released by gcl"]
+    released = [t for t in released if t is not None]
+    outcome = [e["t"] for e in [*mev, *tools]]
+    if not released or not outcome:
+        return False
+    # A leak already shown before gcl let go of any stall stands; only an outcome that
+    # appeared entirely after a release is attributed to the closed connection.
+    return min(outcome) > min(released)
+
+
+def _reply_without_provider_call(s: Scenario, model_events: list, obs) -> bool:
+    """An input-stage scenario the model never saw, whose client still got a model reply
+    (this scenario's reply marker under any run id, or a fragment of its reply text): the
+    answer came from somewhere else — a cache, another run — so "stopped" proves nothing."""
+    if s.stage != "input" or model_events:
+        return False
+    texts = _client_strings(obs.text or "") + _client_strings(obs.text or "", "returned")
+    return any(f"GCL-R-{s.id}" in t for t in texts) or _leaks(s.reply_text, texts)
+
+
+def _receipt(adapter: Adapter, integration: dict, run_id: str, timeout_s: float) -> dict:
+    """What produced this run: gcl's source, the integration's install, the vendor spec,
+    the docs version the expectations were read for. Problems are listed, not hidden."""
+    install = integration.get("install") or {}
+    problems = _rc.integrity_problems({"dists": install.get("dists") or {}})
+    problems += _rc.docs_version_problems(integration.get("documented_source") or {},
+                                          integration.get("versions") or {})
+    src = _rc.gcl_source()
+    if src["dirty_files"]:
+        problems.append(f"gcl has {len(src['dirty_files'])} uncommitted or untracked file(s)")
+    return {"run_id": run_id, "gcl": src, "spec_sha256": _rc.spec_hash(getattr(adapter, "spec", None)),
+            "timeout_s": timeout_s, "problems": problems}
 
 
 def _settle(model: MockModel, scanner: StandInScanner, quiet_s: float, max_s: float) -> bool:
@@ -316,20 +599,41 @@ def _settle(model: MockModel, scanner: StandInScanner, quiet_s: float, max_s: fl
     return False
 
 
-def _owner_ids(text: str) -> set[str]:
-    return set(_SENT.findall(text))
+def _owner_ids(text: str, run: str = "") -> set[str]:
+    return {sid for sid, r in _SENT.findall(text) if not run or r == run}
+
+
+def _foreign_ids(text: str, run: str) -> set[str]:
+    """Scenario ids marked with another run's id (or none, once this run has one)."""
+    return {sid for sid, r in _SENT.findall(text) if run and r != run}
+
+
+def _current_texts(texts: list[str], s: Scenario) -> tuple[list[str], int]:
+    """Drop strings carrying another run's marker and none of this scenario's: an answer
+    from a cache or a replay decides nothing, a leak or a stop. Returns (kept, dropped)."""
+    if not s.run:
+        return texts, 0
+    kept = [t for t in texts if not _foreign_ids(t, s.run) or s.id in _owner_ids(t, s.run)]
+    return kept, len(texts) - len(kept)
 
 
 def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
-                  only: set[str] | None = None, settle_s: float = 0.6) -> dict:
-    """Run every scenario (or the controls plus `only`) against `adapter`."""
+                  only: set[str] | None = None, settle_s: float = 0.6, run_id: str | None = None,
+                  attacks: dict | None = None, extra: tuple = ()) -> dict:
+    """Run every scenario (or the controls plus `only`) against `adapter`. With
+    `attacks` ({"cases", "flagged", "faults", "benign", "detector"}), run the attack × fault
+    plan instead (see build_attack_scenarios)."""
     say = progress or (lambda *_: None)
-    scenarios = [s for s in build_scenarios(adapter) if not only or s.control or s.id in only]
+    run_id = run_id or new_run_id()
+    plan = (build_attack_scenarios(adapter, attacks["cases"], attacks["flagged"], attacks["faults"],
+                                   attacks["benign"], run_id) if attacks else build_scenarios(adapter, run_id, extra))
+    scenarios = [s for s in plan if not only or s.control or s.id in only]
     obs_by: dict[str, object] = {}
     windows: dict[str, tuple[float, float]] = {}
     unsettled: set[str] = set()
     started = time.time()
     t0 = time.monotonic()
+    background: dict = {}
     with StandInScanner(adapter.protocol) as scanner, \
             MockModel("…", judge=scanner if adapter.protocol.shared_endpoint else None,
                       host=getattr(adapter, "model_host", "127.0.0.1")) as model:
@@ -339,15 +643,21 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         try:
             say(f"starting {adapter.name} ({adapter.profile})")
             adapter.start(model, scanner)
+            # A quiet second before the first scenario: calls that arrive with nothing sent
+            # are the integration's own background traffic, recorded in the receipt.
+            time.sleep(1.0)
+            background = {"provider_calls": len(model.events), "scanner_calls": len(scanner.events)}
             for s in scenarios:
                 say(f"{s.id}: {s.stage} {s.mode} [{s.lang}]")
                 served = "block" if s.mode == "block_retry" else s.mode
                 scanner.configure({"input": "allow", "output": "allow", s.stage: served}, s.modify_text, sid=s.id)
                 model.reset(f"{s.reply_text} {s.reply_sentinel}")
                 msg = [{"role": "user", "content": f"{s.user_text} {s.user_sentinel}"}]
+                if s.history:  # the user turn is history now; a benign follow-up is the last message
+                    msg += [{"role": "assistant", "content": "OK."},
+                            {"role": "user", "content": f"{FOLLOW_UP} {s.history_sentinel}"}]
                 begin = time.monotonic()
-                obs_by[s.id] = (adapter.call(msg, timeout_s, repeat=2) if s.mode == "block_retry"
-                                else adapter.call(msg, timeout_s))
+                obs_by[s.id] = _call(adapter, msg, timeout_s, s)
                 # Hold the scenario's modes while the integration finishes reacting: a
                 # stalled scan is released (it closes unanswered), then we wait for quiet.
                 scanner.release_stalled()
@@ -367,11 +677,20 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
     nxt = {sid: (starts[k + 1][0] if k + 1 < len(starts) else float("inf")) for k, (_, sid) in enumerate(starts)}
 
     ambiguous: dict[str, int] = {}
+    foreign_run: dict[str, int] = {}
 
     def owned(events: list[dict], sid: str, key) -> list[dict]:
         out = []
         for e in events:
-            ids = _owner_ids(key(e))
+            text = key(e)
+            ids = _owner_ids(text, run_id)
+            foreign = _foreign_ids(text, run_id)
+            if foreign and not ids:
+                # Another run's marker (a cache, a replay): never this run's evidence, and
+                # never charged by time window either. Noted where it touched the scenario.
+                if sid in foreign or windows[sid][0] <= e["t"] < nxt[sid]:
+                    foreign_run[sid] = foreign_run.get(sid, 0) + 1
+                continue
             if ids:
                 if ids == {sid}:
                     out.append(e)
@@ -385,15 +704,26 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
     docs = adapter.documented.get(adapter.profile, {})
     for s in scenarios:
         obs = obs_by[s.id]
-        mev = owned(model_events, s.id, lambda e: json.dumps(e["body"], ensure_ascii=False))
+        mev_all = owned(model_events, s.id, lambda e: json.dumps(e["body"], ensure_ascii=False))
+        # A provider call charged to this scenario only by its time window, carrying neither
+        # a marker nor any fragment of this scenario's text, is not evidence either way (a
+        # health check, a background job): kept in the record, left out of the verdict.
+        mev = [e for e in mev_all if not _unlabelled(e["body"], s)]
+        unlabelled = len(mev_all) - len(mev)
         sev = owned(scanner_events, s.id, lambda e: e["body_text"])
-        sentinel = s.user_sentinel if s.stage == "input" else s.reply_sentinel
+        sentinel = (s.history_sentinel if s.history else
+                    s.user_sentinel if s.stage == "input" else s.reply_sentinel)
+        marks = (s.history_sentinel, s.user_sentinel) if s.history else (sentinel,)
         mine = [e for e in sev if e["valid"] and e["stage"] == s.stage
-                and sentinel in (e["scanned"] if e.get("scanned") is not None else e["body_text"])]
+                and any(m in (e["scanned"] if e.get("scanned") is not None else e["body_text"]) for m in marks)]
         # Only answers served with this scenario's own mode count: a late retry answered
         # by the next scenario's configuration is not evidence for this one.
         served = "block" if s.mode == "block_retry" else s.mode
         consulted = sum(1 for e in mine if e["mode"] == served)
+        # The stand-in's own receipt: was the answer for this scenario actually written to a
+        # connected peer? (Stalls and refusals send nothing by design.)
+        undelivered = sum(1 for e in mine
+                          if e["mode"] == served and (e.get("delivery") or {}).get("delivered") is False)
         foreign = sum(1 for e in mine if e["mode"] != served)
         unexpressed = any(not e.get("fault_expressed", True) for e in mine if e["mode"] == served)
         late = [round(e["t"] - windows[s.id][1], 2) for e in mev if e["t"] > windows[s.id][1]]
@@ -401,7 +731,16 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         if isinstance(expect, (tuple, set, frozenset)):
             expect = sorted(expect)  # several outcomes the docs allow
         tools_run = owned(tool_events, s.id, lambda e: e["body"])
-        observed = client_outcome = classify(s, [e["body"] for e in mev], obs)
+        bodies = [e["body"] for e in mev]
+        history_transformed = False
+        if s.history:  # only requests that carried the earlier, blocked turn say anything about it
+            carried = [b for b in bodies if s.user_sentinel in json.dumps(b, ensure_ascii=False)
+                       or _leaks(s.user_text, _strings(b))]
+            # The conversation reached the model without the earlier turn in recognisable
+            # form: dropped, or summarised/rewritten. Which one is not known.
+            history_transformed = bool(bodies) and not carried
+            bodies = carried
+        observed = client_outcome = classify(s, bodies, obs)
         if tools_run and s.stage == "input" and s.mode != "allow":
             observed = "tool executed"  # the strongest evidence: a side effect happened
         w0, w1 = windows[s.id][0], nxt[s.id]
@@ -416,24 +755,46 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
                        "client_body": obs.text,
                        "model_input": classify_input(s, [e["body"] for e in mev]),
                        "model_requests": len(mev),
+                       "unlabelled_provider_calls": unlabelled,
                        "client_outcome": client_outcome,
                        "policy_answers": policy_served,
                        "attempts": [{"status": a.status, "finished": a.finished, "error": a.error,
-                                     "body": a.text[:2000]} for a in attempts],
+                                     "body": a.text, "body_truncated": "truncated" in (a.error or "")}
+                                    for a in attempts],
+                       "client_body_truncated": "truncated" in (obs.error or ""),
+                       "lossy_serialisation": "[object Object]" in (obs.text or ""),
+                       "stop_kind": _stop_kind(obs),
+                       "reply_without_provider_call": _reply_without_provider_call(s, mev, obs),
+                       "after_gcl_released_stall": _after_release(s, mine, mev, tools_run),
+                       "history_transformed": history_transformed,
+                       "client_other_run_texts": (_current_texts(_client_strings(obs.text or ""), s)[1]
+                                                  + _current_texts(_client_strings(obs.text or "", "returned"), s)[1]),
                        "ambiguous_events": ambiguous.get(s.id, 0),
+                       "other_run_events": foreign_run.get(s.id, 0),
                        "tool_runs": [{"t": round(e["t"] - t0, 3), "body": e["body"]} for e in tools_run],
-                       "model_events": [{"t": round(e["t"] - t0, 3), "body": e["body"]} for e in mev],
+                       "model_events": [{"t": round(e["t"] - t0, 3), "body": e["body"],
+                                         "unlabelled": _unlabelled(e["body"], s)} for e in mev_all],
                        "scanner_consulted_stage": consulted,
+                       "scanner_answers_undelivered": undelivered,
                        "scanner_answered_by_other_mode": foreign,
                        "fault_not_expressible": unexpressed,
                        "scanner_events": [{"t": round(e["t"] - t0, 3), "listener": e["stage"],
                                            "claimed_stage": e["claimed_stage"], "path": e["path"],
                                            "valid": e["valid"], "mode": e["mode"], "body": e["body"],
-                                           "answered": e["answered"]} for e in sev],
+                                           "answered": e["answered"], "delivery": e.get("delivery"),
+                                           "stall": e.get("stall")} for e in sev],
                        "window_s": [round(windows[s.id][0] - t0, 3), round(windows[s.id][1] - t0, 3)],
                        "late_provider_calls_s": late,
                        "settled": s.id not in unsettled,
                    })
+        r.evidence["timeline"] = _timeline(s, sev, mev_all, tools_run, windows[s.id][0], obs, t0)
+        order = _order_flags(s, mine, mev, tools_run)
+        r.evidence.update(order)
+        if order["provider_before_verdict_s"] is not None:
+            r.notes.append(f"the provider saw this request {order['provider_before_verdict_s']} s before the "
+                           "guard answered")
+        if order["tool_before_verdict_s"] is not None:
+            r.notes.append(f"the tool ran {order['tool_before_verdict_s']} s before the guard answered")
         if late:
             r.notes.append(f"{len(late)} provider call(s) arrived after the scenario had settled "
                            f"(+{max(late)} s); counted here")
@@ -444,8 +805,15 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         results.append(r)
 
     _judge(results, adapter)
-    return {
-        "integration": adapter.describe(),
+    _stand_in_confidence(results, adapter)
+    from ..standards import risks
+
+    for r in results:
+        r.evidence["owasp"] = risks(adapter.name, r.scenario.stage, r.scenario.mode, r.observed, r.policy)
+    integration = adapter.describe()
+    out = {
+        "integration": integration,
+        "receipt": {**_receipt(adapter, integration, run_id, timeout_s), "background_before_run": background},
         "timeout_s": timeout_s,
         "started_at": started,
         "results": [r.to_dict() for r in results],
@@ -454,8 +822,41 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         "config_files": config_files,
         "unattributed_scanner_events": sum(
             1 for e in scanner_events
-            if not _owner_ids(e["body_text"]) and not any(w[0] <= e["t"] < nxt[k] for k, w in windows.items())),
+            if not _owner_ids(e["body_text"], run_id) and not any(w[0] <= e["t"] < nxt[k] for k, w in windows.items())),
     }
+    if attacks:
+        out["attack_matrix"] = {**attack_matrix(out["results"]), "detector": attacks.get("detector"),
+                                "faults": attacks["faults"], "dropped": attacks.get("dropped", [])}
+    return out
+
+
+def latency_sweep(adapter: Adapter, latencies: list[float], timeout_s: float = 20.0, **kw) -> dict:
+    """Run the whole contract once per guard latency. Races between a check and the
+    model call show only when the guard takes time; a result that changes with the
+    latency is timing-dependent and is reported as unstable, never as one fixed verdict."""
+    if len(set(latencies)) != len(latencies):
+        raise ValueError("each latency once")
+    runs = []
+    for lat in latencies:
+        adapter.scanner_latency_s = lat
+        runs.append(run_contracts(adapter, timeout_s, **kw))
+    stability = _stability(latencies, runs)
+    for lat, run in zip(latencies, runs, strict=True):
+        run["judge_latency_s"] = lat
+    return {"latencies": latencies, "runs": runs, "stability": stability,
+            "unstable": sum(1 for x in stability if not x["stable"])}
+
+
+def _stability(latencies: list[float], runs: list[dict]) -> list[dict]:
+    table: dict[tuple, dict] = {}
+    for lat, run in zip(latencies, runs, strict=True):
+        for r in run["results"]:
+            sc = r["scenario"]  # the plan is the same for every latency: ids line up
+            key = (sc["id"], sc["stage"], sc["mode"], sc.get("role") or "", sc["lang"])
+            table.setdefault(key, {})[str(lat)] = {"observed": r["observed"], "policy": r["policy"]}
+    return [{"id": k[0], "stage": k[1], "mode": k[2], "role": k[3], "lang": k[4], "by_latency": v,
+             "stable": len({x["policy"] for x in v.values()}) == 1 and len({x["observed"] for x in v.values()}) == 1}
+            for k, v in table.items()]
 
 
 def _judge(results: list[Result], adapter: Adapter) -> None:
@@ -489,8 +890,24 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
         if r.observed in ("no answer", "transport failure"):
             return ("no complete response before the client deadline" if r.observed == "no answer"
                     else "the connection failed without an HTTP response")
+        if ev.get("after_gcl_released_stall"):
+            # Even a leak: it followed gcl closing the stalled connection, so what the
+            # integration reacted to was a closed connection (the "error" path), not a
+            # guard that never answered. The timeout itself was never exercised.
+            return ("gcl released the stalled guard call before the integration gave up; what followed answers "
+                    "a closed connection, not a timeout (see the error scenario)")
+        if ev.get("history_transformed") and r.observed not in leaks:
+            return ("the conversation reached the model without the earlier turn in recognisable form (dropped, "
+                    "or summarised): whether its content was stopped is not proven")
         if ev.get("ambiguous_events") and r.observed not in leaks:
             return "events carrying several scenarios' markers touched this scenario; a clean result is not proven"
+        if (ev.get("other_run_events") or ev.get("client_other_run_texts")) and r.observed not in leaks:
+            return "events carrying another run's marker (a cached or replayed answer) touched this scenario"
+        if ev.get("reply_without_provider_call") and r.observed not in leaks:
+            return ("the client got a reply although the model was never called for this scenario "
+                    "(a cache or another run's answer?); the stop is not evidence")
+        if ev.get("client_body_truncated") and r.observed not in leaks:
+            return "the client body was truncated, so a leak in the missing part cannot be ruled out"
         if s.mode in POLICY_FAULTS:
             want = 404 if s.mode == "policy_missing" else 500
             if want not in (ev.get("policy_answers") or []):
@@ -498,15 +915,25 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
         if s.mode == "block_retry":
             att = ev.get("attempts") or []
             first = att[0] if att else {}
-            if len(att) < 2 or not (first.get("status") is not None and 400 <= first["status"] < 500):
+            if len(att) < 2 or not _attempt_refused(first):
                 return "the first attempt was not a clean refusal, so the second is not a retry of a block"
             if not att[-1].get("finished") and r.observed not in leaks:
                 return "the retry got no complete answer"
         if ev.get("scanner_answered_by_other_mode"):
             return "a request for this scenario was answered with another scenario's behaviour"
+        if ev.get("lossy_serialisation") and r.observed not in leaks:
+            return ("the client body holds '[object Object]': the driver lost structure, so evidence "
+                    "may be missing")
         if s.control and s.mode == "allow" and s.stage == "input" and "tools" in adapter.capabilities \
                 and not ev.get("tool_runs"):
             return "the probe tool never ran, so tool enforcement is not observable"
+        if ev.get("scanner_answers_undelivered") and ev["scanner_answers_undelivered"] >= ev.get(
+                "scanner_consulted_stage", 0) and r.observed not in leaks:
+            return ("the integration hung up before the stand-in's answer was written: it saw a dropped "
+                    "connection, not this scenario's answer")
+        if ev.get("unlabelled_provider_calls") and r.observed not in leaks:
+            return ("a provider call carrying no marker and no part of this scenario's text landed in its "
+                    "window; whether this scenario reached the model is not proven")
         if ev.get("fault_not_expressible"):
             return "this fault cannot be expressed in this protocol's verdict shape; not exercised"
         if not ev.get("settled", True) and r.observed not in leaks:
@@ -520,39 +947,166 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
             return "the scanner was never consulted for this stage with this scenario's text"
         return None
 
-    controls = {(r.scenario.stage, r.scenario.mode): r for r in results if r.scenario.control}
+    controls = {(r.scenario.stage, r.scenario.mode): r for r in results if r.scenario.phase == "open"}
     allow_in = controls.get(("input", "allow"))
     # Controls first: each is judged on its own evidence; the others are gated on them.
     for key in (("input", "allow"), ("input", "block"), ("output", "allow"), ("output", "block")):
         r = controls.get(key)
         if r is None:
             continue
-        why = own_problem(r)
+        why = own_problem(r) or _crash_not_block(r)
         if not why and key != ("input", "allow") and (allow_in is None or allow_in.policy != "held"):
             why = "the input allow control did not hold, so nothing else is observable"
         verdict(r, why)
 
-    def held(key) -> bool:
+    def usable(r: Result | None) -> bool:
         """Usable as a control: it held the strict policy, or it did exactly what the
         docs say for this configuration (e.g. a block that is documented to arrive after
         the model call). Either way the integration is shown to act on verdicts."""
-        r = controls.get(key)
         if r is not None and r.observed == "retained" and r.scenario.mode == "block" and r.policy != "unverified":
             return True  # the answer was refused; the leftover is reported on the control itself
         return r is not None and (r.policy == "held" or r.documented == "conforms")
+
+    def held(key) -> bool:
+        return usable(controls.get(key))
+
+    def opening_gate(s: Scenario) -> str | None:
+        if not held(("input", "allow")):
+            return "the input allow control did not hold, so nothing else is observable"
+        if s.stage == "input" and s.mode != "allow" and not held(("input", "block")):
+            return "the input block control did not hold"
+        if s.stage == "output" and not (held(("output", "allow")) and held(("output", "block"))):
+            return "an output control did not hold"
+        return None
+
+    # Then the later controls, gated like any scenario and checked like the opening ones.
+    later = [r for r in results if r.scenario.phase in ("close", "lang", "observe")]
+    for r in later:
+        verdict(r, opening_gate(r.scenario) or own_problem(r) or _crash_not_block(r))
+    allow_langs = {r.scenario.lang for r in results
+                   if r.scenario.phase in ("open", "lang") and r.scenario.stage == "input"
+                   and r.scenario.mode == "allow" and usable(r)}
+    broken_close = [r for r in later if r.scenario.phase == "close" and not usable(r)]
+    broken_observe = [r for r in later if r.scenario.phase == "observe" and not usable(r)]
 
     for r in results:
         s = r.scenario
         if s.control:
             continue
-        why = None
-        if not held(("input", "allow")):
-            why = "the input allow control did not hold, so nothing else is observable"
-        elif s.stage == "input" and not held(("input", "block")):
-            why = "the input block control did not hold"
-        elif s.stage == "output" and not (held(("output", "allow")) and held(("output", "block"))):
-            why = "an output control did not hold"
+        why = opening_gate(s)
+        if not why and r.observed not in leaks:
+            # A clean result also needs the setup to have worked in its language, to the
+            # end of the run, and with an observer that sees whole answers. A proven leak
+            # needs none of that.
+            if s.lang not in allow_langs:
+                why = (f"no allow control held in this scenario's language ({s.lang}): a failure on "
+                       "this script cannot be told from a block")
+            elif any(c.scenario.stage == s.stage or c.scenario.stage == "input" for c in broken_close):
+                c = next(c for c in broken_close if c.scenario.stage == s.stage or c.scenario.stage == "input")
+                why = (f"the {c.scenario.stage} {c.scenario.mode} control did not hold when repeated at the "
+                       "end of the run: the setup changed during the run")
+            elif broken_observe:
+                why = ("the long-reply control did not come back whole: the driver or client may cut "
+                       "answers, so a stop is not evidence")
         verdict(r, why or own_problem(r))
+
+
+# Modes whose result depends on the exact shape of the stand-in's answer: a correct verdict
+# the integration mishandled (or handled), or a verdict field the fault was aimed at. The
+# transport faults (error, timeout, malformed, empty, refused), wrong_schema (the whole
+# body replaced) and policy-source faults do not depend on it.
+SHAPE_DEPENDENT = ("allow", "block", "modify", "block_retry", "unknown_verdict", "verdict_type", "null_verdict",
+                   "history_block")
+# Which verdict answers each shape-dependent mode is built from.
+_BUILT_FROM = {"allow": ("allow",), "block": ("block",), "modify": ("modify",), "block_retry": ("block",),
+               "unknown_verdict": ("allow", "block"), "verdict_type": ("allow", "block"),
+               "null_verdict": ("allow", "block"), "history_block": ("allow", "block")}
+
+
+def _stand_in_confidence(results: list[Result], adapter: Adapter) -> None:
+    """Label every judged result "verified" or "guessed". A result resting on a stand-in
+    answer that was rebuilt from client code or guessed — or recorded for a request of
+    another shape, or without a request that positively shows the recorded shape — is
+    "guessed", held or violated alike: it says what this integration did with that
+    answer, not what it does with the real vendor's."""
+    proto = adapter.protocol
+    harness = getattr(adapter, "harness_supplies_guard", False)
+    base = "harness" if harness else proto.provenance
+    shape = proto.recorded_shape or {}
+    for r in results:
+        s, ev = r.scenario, r.evidence
+        dependent = s.mode in SHAPE_DEPENDENT or s.mode in proto.extra_faults
+        recorded = (not harness and dependent and s.mode in _BUILT_FROM
+                    and all(m in proto.recorded_modes for m in _BUILT_FROM[s.mode]))
+        ev["stand_in"] = "recorded" if recorded else base
+        if r.policy == "unverified":
+            ev["confidence"] = None
+            continue
+        why = None
+        if recorded:
+            served = "block" if s.mode == "block_retry" else s.mode
+            events = [e for e in ev.get("scanner_events") or [] if e.get("mode") == served]
+            if s.mode == "block_retry":
+                why = f"the recorded reply was captured for {shape}, this scenario is a retry"
+            else:
+                why = _shape_mismatch(shape, events)
+            if why:
+                why += ": fields that depend on the request (locations, indexes) may not match the real vendor's"
+        elif dependent and base in ("client_code", "guessed"):
+            how = {"client_code": "not a real vendor reply", "guessed": "a guess"}[base]
+            why = f"the stand-in's answer is {how} ({proto.provenance_source})"
+        ev["confidence"] = "guessed" if why else "verified"
+        if why:
+            r.notes.append(f"guessed — {why}; confirm against a recorded real reply before reporting")
+
+
+def _shape_mismatch(shape: dict, events: list[dict]) -> str | None:
+    """Why the requests this scenario's answers were served to are not positively shaped
+    like the recorded one (every request must match; None when they all do)."""
+    from urllib.parse import urlsplit
+
+    unsupported = sorted(set(shape) - {"messages", "content", "path", "method"})
+    if unsupported:
+        return f"the recorded shape names fields gcl cannot check ({', '.join(unsupported)})"
+    if "messages" not in shape:
+        return "the recorded reply has no message count to check requests against"
+    if shape.get("method", "POST") != "POST":
+        return f"the recorded reply answered a {shape['method']} request"
+    if not events:
+        return "no request was answered with the recorded reply"
+    for e in events:
+        b = e.get("body")
+        msgs = b.get("messages") if isinstance(b, dict) else None
+        if not isinstance(msgs, list):
+            return f"a request ({e.get('path')}) had no message list to compare with the recorded {shape}"
+        if len(msgs) != shape["messages"]:
+            return f"the recorded reply was captured for {shape['messages']} message(s), a request had {len(msgs)}"
+        kinds = [type(m.get("content")).__name__ if isinstance(m, dict) else type(m).__name__ for m in msgs]
+        if "content" in shape and kinds != shape["content"]:
+            return f"the recorded reply answered message contents {shape['content']}, a request had {kinds}"
+        if "path" in shape and urlsplit(str(e.get("path") or "")).path.rstrip("/") != shape["path"].rstrip("/"):
+            return f"the recorded reply answered {shape['path']}, a request went to {e.get('path')}"
+    return None
+
+
+def _attempt_refused(a: dict) -> bool:
+    """A recorded attempt that was refused: a 4xx, or an answer carrying the stand-in's
+    block reason (integrations that refuse with a normal reply)."""
+    if a.get("status") is not None and 400 <= a["status"] < 500:
+        return True
+    if not a.get("finished") or a.get("status") is None or a["status"] >= 500:
+        return False
+    return _refused(SimpleNamespace(status=a["status"], text=a.get("body") or ""))
+
+
+def _crash_not_block(r: Result) -> str | None:
+    """A block control proves the integration acts on a verdict only if it ended unlike a
+    crash: a server error is what an integration that cannot parse the answer returns."""
+    st = r.evidence.get("client_status")
+    if r.scenario.mode == "block" and r.observed == "stopped" and st is not None and st >= 500:
+        return (f"the block control ended in a server error ({st}): an integration that crashed on the "
+                "stand-in's answer cannot be told from one that blocked")
+    return None
 
 
 def _summary(results: list[Result]) -> dict:
@@ -562,6 +1116,7 @@ def _summary(results: list[Result]) -> dict:
         "policy_held": count("policy", "held"),
         "policy_violated": count("policy", "violated"),
         "unverified": count("policy", "unverified"),
+        "guessed": sum(1 for r in results if r.evidence.get("confidence") == "guessed"),
         "documented_deviates": count("documented", "deviates"),
         "documented_unspecified_violations": sum(
             1 for r in results if r.policy == "violated" and r.documented == "unspecified"),
@@ -574,6 +1129,9 @@ def write_bundles(run: dict, out: Path, replay: str = "") -> list[Path]:
     the stand-in's answer and a timestamp, the full client body, the generated
     configuration, and the command that reruns just this scenario."""
     written = []
+    # The controls are the contrast for every finding: the same setup, a correct verdict.
+    controls = [{"id": c["scenario"]["id"], "stage": c["scenario"]["stage"], "mode": c["scenario"]["mode"],
+                 "observed": c["observed"], "policy": c["policy"]} for c in run["results"] if c["scenario"]["control"]]
     for r in run["results"]:
         if r["policy"] == "held" and r["documented"] != "deviates":
             continue
@@ -586,7 +1144,9 @@ def write_bundles(run: dict, out: Path, replay: str = "") -> list[Path]:
             "expected_by_policy": r["policy_expect"], "expected_by_docs": r["documented_expect"],
             "verdicts": {"policy": r["policy"], "documented": r["documented"]}, "notes": r["notes"],
             "evidence": r["evidence"], "client_timeout_s": run["timeout_s"],
-            "truncated": False,
+            "receipt": run.get("receipt"), "controls": controls,
+            "truncated": bool(r["evidence"].get("client_body_truncated")
+                              or any(a.get("body_truncated") for a in r["evidence"].get("attempts") or [])),
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         for name, text in (run.get("config_files") or {}).items():
             (d / f"config-{Path(name).name}").write_text(text, encoding="utf-8")

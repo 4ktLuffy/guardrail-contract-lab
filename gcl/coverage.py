@@ -200,6 +200,7 @@ def summarize(cases: list[dict], det: Detector) -> dict:
                 cell[1] += 1
     drivers = _drivers(cases, det, langs)
     return {
+        "heldout": _heldout(cases, det),
         "drivers": drivers,
         "detector": det.label,
         "complete": det.complete,
@@ -214,6 +215,32 @@ def summarize(cases: list[dict], det: Detector) -> dict:
         "by_lang": by_lang,
         "matrix": matrix,
     }
+
+
+def _heldout(cases: list[dict], det: Detector) -> dict:
+    """Recall split by whether the rule authors could have seen the case. A case counts as
+    held out only if its row says `"heldout": true` (written by someone else, before the
+    rules being measured, and never used to tune them). With none, every number measures
+    fit to the cases, not recall on new text."""
+    def rec(rows):
+        known = [f for c, f in rows if f is not None]
+        return {"attacks": len(known), "caught": sum(known),
+                "recall_pct": pct(sum(known) / len(known)) if known else None}
+
+    att = [(c, f) for c, f in zip(cases, det.flags, strict=True) if c.get("label") == 1]
+    held = [(c, f) for c, f in att if c.get("heldout") is True]
+    fit = [(c, f) for c, f in att if c.get("heldout") is not True]
+    authors = sorted({str(c.get("author") or c.get("provenance") or "unknown") for c, _ in held})
+    out = {"heldout": rec(held), "fit": rec(fit), "heldout_authors": authors, "note": ""}
+    if not held:
+        out["note"] = ("No held-out cases: every recall here measures fit to cases the rule authors could "
+                       "see, not recall on new text. Mark rows written independently, before the rules, "
+                       'with "heldout": true.')
+    elif out["heldout"]["recall_pct"] is not None and out["fit"]["recall_pct"] is not None \
+            and out["fit"]["recall_pct"] - out["heldout"]["recall_pct"] >= 20:
+        out["note"] = (f"Held-out recall {out['heldout']['recall_pct']}% is far below the fit recall "
+                       f"{out['fit']['recall_pct']}%: the rules are tuned to their own cases.")
+    return out
 
 
 def _drivers(cases: list[dict], det: Detector, langs: list[str]) -> list[str]:

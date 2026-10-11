@@ -305,6 +305,27 @@ def enforce(
     spec: Path | None = typer.Option(None, exists=True, dir_okay=False,
                                      help="For litellm-vendor: a vendor spec JSON (guardrail type, params, "
                                           "the vendor's request path and allow/block bodies)."),
+
+    judge_latency: str = typer.Option("", help="Comma-separated guard latencies in seconds (e.g. "
+                                      "0,0.2,1): run the whole contract once per latency and report "
+                                      "results that change with timing as unstable."),
+    extra: str = typer.Option("", help="Opt-in blind spots, comma-separated: stream (output checks on "
+                              "streamed answers), history (the attack in an earlier turn), retry (a "
+                              "blocked request sent twice)."),
+    attacks: Path | None = typer.Option(None, exists=True, dir_okay=False,
+                                        help="Attack mode: JSON-lines attack cases (rows with label 1). Each is "
+                                             "sent with a real detector's verdict and under each fault."),
+    detector: Path | None = typer.Option(None, exists=True, dir_okay=False,
+                                         help="Attack mode: a coverage adapter manifest for the real detector."),
+    attack_faults: str = typer.Option("error,timeout", help="Attack mode: faults to send each attack under."),
+    attack_limit: int = typer.Option(8, help="Attack mode: at most this many attacks (spread over languages)."),
+    attack_plan_file: Path | None = typer.Option(None, "--attack-plan", exists=True, dir_okay=False,
+                                                 help="Attack mode from a frozen plan (attacks and the detector's "
+                                                      "verdicts) written by an earlier run: replays exactly that."),
+    sarif_anchor: str | None = typer.Option(None, help="With --format sarif: a repository file to attach "
+                                            "results to (code scanning needs one; default: the spec)."),
+    force: bool = typer.Option(False, help="Write into a non-empty --out folder (default: refuse, so "
+                               "reports and repro bundles of different runs never mix)."),
 ):
     """Does a real guardrail integration enforce what its scanner decides?"""
     import tempfile
@@ -322,6 +343,8 @@ def enforce(
     if profile not in cls.documented:
         raise typer.BadParameter(f"{integration} profiles: {', '.join(cls.documented)}",
                                  param_hint="--profile")
+    if out and out.exists() and any(out.iterdir()) and not force:
+        raise typer.BadParameter(f"{out} is not empty; use a new folder or --force", param_hint="--out")
     where = env if cls.runtime == "node" else python
     if where is None:
         flag = "--env" if cls.runtime == "node" else "--python"
@@ -336,22 +359,95 @@ def enforce(
     else:
         adapter = cls(str(where), workdir, profile)
     try:
-        run = run_contracts(adapter, timeout or adapter.default_timeout_s, progress=_say,
-                            only=set(scenario) or None)
+        lats = [float(x) for x in judge_latency.split(",") if x.strip()]
+    except ValueError:
+        raise typer.BadParameter("numbers in seconds, comma-separated", param_hint="--judge-latency") from None
+    if len(set(lats)) != len(lats) or any(x < 0 for x in lats):
+        raise typer.BadParameter("each latency once, none negative", param_hint="--judge-latency")
+    from .enforce.contracts import EXTRAS
+
+    extras = tuple(x.strip() for x in extra.split(",") if x.strip())
+    if any(x not in EXTRAS for x in extras):
+        raise typer.BadParameter(f"choose from {', '.join(EXTRAS)}", param_hint="--extra")
+    attack_plan = None
+    if attack_plan_file:
+        import json
+
+        if attacks or detector:
+            raise typer.BadParameter("--attack-plan replaces --attacks and --detector", param_hint="--attack-plan")
+        attack_plan = json.loads(attack_plan_file.read_text(encoding="utf-8"))
+    elif attacks or detector:
+        if not (attacks and detector):
+            raise typer.BadParameter("attack mode needs both --attacks and --detector", param_hint="--attacks")
+        from .enforce.attacks import prepare
+        from .enforce.servers import FAULTS
+
+        afaults = [f.strip() for f in attack_faults.split(",") if f.strip()]
+        if any(f not in FAULTS for f in afaults):
+            raise typer.BadParameter(f"choose from {', '.join(FAULTS)}", param_hint="--attack-faults")
+        try:
+            attack_plan = prepare(attacks, detector, afaults, attack_limit)
+        except ValueError as e:
+            typer.echo(f"error: {e}", err=True)
+            raise typer.Exit(2) from None
+    try:
+        if lats and attack_plan:
+            raise typer.BadParameter("use --judge-latency or attack mode, not both", param_hint="--judge-latency")
+        if attack_plan:
+            run = run_contracts(adapter, timeout or adapter.default_timeout_s, progress=_say,
+                                only=set(scenario) or None, attacks=attack_plan)
+        elif lats:
+            from .enforce.contracts import latency_sweep
+
+            sweep = latency_sweep(adapter, lats, timeout or adapter.default_timeout_s, progress=_say,
+                                  only=set(scenario) or None, extra=extras)
+            slowest = max(range(len(lats)), key=lambda k: lats[k])  # where races show
+            run = sweep["runs"][slowest]
+            run["latency_sweep"] = {k: v for k, v in sweep.items() if k != "runs"}
+            run["latency_sweep"]["summaries"] = [r["summary"] for r in sweep["runs"]]
+        else:
+            run = run_contracts(adapter, timeout or adapter.default_timeout_s, progress=_say,
+                                only=set(scenario) or None, extra=extras)
     except RuntimeError as e:
         typer.echo(f"error: {e}", err=True)
         raise typer.Exit(2) from None
     doc = R.envelope("enforce", {"integration": integration, "profile": profile})
     doc["enforce"] = run
+    if lats:  # every latency's full run is part of the record, not only the one shown
+        doc["enforce_by_latency"] = sweep["runs"]
+    if out:  # the evidence is written before anything is rendered: a display bug cannot lose it
+        import json
+        import shlex
+
+        _write_outputs(doc, out, _formats(format), render_html)
+        if "sarif" in _formats(format):
+            from .report.sarif import enforce_sarif
+
+            R.write_json(enforce_sarif(sweep["runs"] if lats else run,
+                                       sarif_anchor or (str(spec) if spec else f"{integration}.gcl")),
+                         out / "report.sarif")
+        flag = "--env" if cls.runtime == "node" else "--python"
+        extra_spec = f" --spec {shlex.quote(str(spec.resolve()))}" if spec else ""
+        replay = (f"gcl enforce {shlex.quote(integration)} {flag} {shlex.quote(str(Path(str(where)).resolve()))} "
+                  f"--profile {shlex.quote(profile)}{extra_spec} --timeout {run['timeout_s']:g}"
+                  + (f" --extra {','.join(extras)}" if extras else ""))
+        if attack_plan:  # the plan is frozen next to the report; a replay sends exactly it
+            frozen = out / "attack-plan.json"
+            frozen.write_text(json.dumps(attack_plan, ensure_ascii=False, indent=2), encoding="utf-8")
+            replay += f" --attack-plan {shlex.quote(str(frozen.resolve()))}"
+        if lats:
+            bundles = [b for r in sweep["runs"] for b in write_bundles(
+                r, out / f"latency-{r['judge_latency_s']:g}", f"{replay} --judge-latency {r['judge_latency_s']:g}")]
+        else:
+            bundles = write_bundles(run, out, replay)
     typer.echo(render_enforce(run))
     if out:
-        _write_outputs(doc, out, _formats(format), render_html)
-        flag = "--env" if cls.runtime == "node" else "--python"
-        extra = f" --spec {spec}" if spec else ""
-        replay = (f"gcl enforce {integration} {flag} {where} --profile {profile}{extra} "
-                  f"--timeout {run['timeout_s']:g}")
-        bundles = write_bundles(run, out, replay)
         typer.echo(f"\nReports: {out}/" + (f"  ({len(bundles)} repro bundle(s) in {out}/repro/)" if bundles else ""))
+    sw = run.get("latency_sweep")
+    if sw:
+        codes = [_enforce_exit(sm, fail_on, allow_incomplete) for sm in sw["summaries"]]
+        code = 1 if 1 in codes else (2 if 2 in codes or sw["unstable"] else 0)
+        raise typer.Exit(0 if fail_on == "never" else code)
     raise typer.Exit(_enforce_exit(run["summary"], fail_on, allow_incomplete))
 
 
@@ -380,5 +476,215 @@ def main():  # pragma: no cover
     app()
 
 
+
+
+# --------------------------------------------------------------------------- findings
+findings_app = typer.Typer(no_args_is_help=True, help="A findings ledger that only holds what runs can back.")
+app.add_typer(findings_app, name="findings")
+
+
+def _ledger_do(ledger: Path, fn, *args, write: bool = True):
+    from . import findings as F
+
+    try:
+        for w in F.guard_location(ledger):
+            typer.echo(f"warning: {w}", err=True)
+        doc = F.load(ledger)
+        out = fn(doc, *args)
+    except (F.LedgerError, OSError, ValueError) as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2) from None
+    if write:
+        F.save(ledger, doc)
+    return doc, out
+
+
+@findings_app.command("add")
+def findings_add(ledger: Path = typer.Argument(..., help="The ledger file (JSON), kept privately."),
+                 report: Path = typer.Option(..., exists=True, dir_okay=False, help="A gcl enforce report.json."),
+                 scenario: str = typer.Option(..., help="Scenario id in that report."),
+                 title: str = typer.Option(..., help="One line: what is wrong."),
+                 latency: float | None = typer.Option(None, help="With a latency sweep report: which run.")):
+    """Create a finding from a scenario of a stored run (status: proposed)."""
+    from . import findings as F
+
+    _, f = _ledger_do(ledger, lambda d: F.add(d, report, scenario, title, latency))
+    typer.echo(f"{f['id']} proposed{' (rests on a guessed stand-in)' if f['guessed'] else ''}")
+
+
+@findings_app.command("repeat")
+def findings_repeat(ledger: Path, fid: str,
+                    report: Path = typer.Option(..., exists=True, dir_okay=False)):
+    """Add a separate run of the same scenario (proposed → repeated, or contradicted)."""
+    from . import findings as F
+
+    _, f = _ledger_do(ledger, lambda d: F.repeat(d, fid, report))
+    typer.echo(f"{f['id']} {f['status']}")
+
+
+@findings_app.command("confirm")
+def findings_confirm(ledger: Path, fid: str,
+                     repro: Path = typer.Option(..., exists=True, dir_okay=False, help="The hand reproduction."),
+                     answer_source: str = typer.Option(..., help="recorded | live-vendor | vendor-docs"),
+                     note: str = typer.Option(..., help="What the reproduction showed.")):
+    """Attach an independent hand reproduction (repeated → confirmed)."""
+    from . import findings as F
+
+    _, f = _ledger_do(ledger, lambda d: F.confirm(d, fid, repro, answer_source, note))
+    typer.echo(f"{f['id']} {f['status']}")
+
+
+@findings_app.command("retract")
+def findings_retract(ledger: Path, fid: str, reason: str = typer.Option(...)):
+    """Withdraw a finding; the record and its history stay."""
+    from . import findings as F
+
+    _, f = _ledger_do(ledger, lambda d: F.retract(d, fid, reason))
+    typer.echo(f"{f['id']} retracted")
+
+
+@findings_app.command("check")
+def findings_check(ledger: Path,
+                   runs: Path | None = typer.Option(None, exists=True, file_okay=False,
+                                                    help="A folder of newer reports to check against.")):
+    """Re-validate every finding against its reports and newer runs. Exit 1 on any problem."""
+    from . import findings as F
+
+    _, problems = _ledger_do(ledger, lambda d: F.check(d, runs), write=False)
+    for p in problems:
+        typer.echo(f"{p['id']}: {p['problem']}")
+    typer.echo(f"{len(problems)} problem(s)")
+    raise typer.Exit(1 if problems else 0)
+
+
+@findings_app.command("render")
+def findings_render(ledger: Path):
+    """Print the ledger as a Markdown table."""
+    from . import findings as F
+
+    _, table = _ledger_do(ledger, F.render, write=False)
+    typer.echo(table)
+
+
+@findings_app.command("set")
+def findings_set(ledger: Path, fid: str,
+                 field: str = typer.Option(..., help="default_config | trigger"),
+                 value: str = typer.Option(..., help="default_config: yes|no; trigger: attacker | guard down | "
+                                           "guard answers oddly | operator misconfiguration"),
+                 reason: str = typer.Option(...)):
+    """Set a rating input only a person can know, with the reason."""
+    from . import findings as F
+
+    v = {"yes": True, "no": False}.get(value, value) if field == "default_config" else value
+    _, f = _ledger_do(ledger, lambda d: F.set_field(d, fid, field, v, reason))
+    typer.echo(f"{f['id']} severity {f['severity']['score']} ({f['severity']['why']})")
+
+
+@findings_app.command("override")
+def findings_override(ledger: Path, fid: str, score: int = typer.Option(...), reason: str = typer.Option(...)):
+    """Record a person's own rating next to the computed one."""
+    from . import findings as F
+
+    _, f = _ledger_do(ledger, lambda d: F.override(d, fid, score, reason))
+    typer.echo(f"{f['id']} computed {f['severity']['score']}, overridden {score}")
+
+
+# --------------------------------------------------------------------------- record
+record_app = typer.Typer(no_args_is_help=True, help="Capture real vendor replies for stand-in specs.")
+app.add_typer(record_app, name="record")
+
+
+@record_app.command("serve")
+def record_serve(upstream: str = typer.Option(..., help="The real vendor's base URL."),
+                 out: Path = typer.Option(..., help="JSON-lines file to append exchanges to."),
+                 port: int = typer.Option(8899, help="Local port; point the integration here.")):
+    """Forward everything to the vendor and record each exchange (no request headers,
+    secret-looking fields redacted). Stop with Ctrl-C."""
+    import time
+
+    from .record import RecordingProxy
+
+    with RecordingProxy(upstream, out, port=port) as p:
+        typer.echo(f"recording {upstream} at {p.url} into {out} (Ctrl-C to stop)")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            typer.echo(f"\n{p.count} exchange(s) recorded")
+
+
+@record_app.command("to-spec")
+def record_to_spec(records: Path = typer.Argument(..., exists=True, dir_okay=False),
+                   spec: Path = typer.Option(..., exists=True, dir_okay=False, help="The vendor spec to extend."),
+                   allow: int = typer.Option(..., help="Record number of a real allow answer."),
+                   block: int = typer.Option(..., help="Record number of a real block answer."),
+                   out: Path = typer.Option(..., help="Where to write the spec with recorded replies.")):
+    """Put a recorded allow and block answer into a vendor spec ("recorded" block)."""
+    import json
+
+    from .record import load, to_spec
+
+    try:
+        new = to_spec(load(records), json.loads(spec.read_text()), allow, block)
+    except ValueError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2) from None
+    out.write_text(json.dumps(new, ensure_ascii=False, indent=2))
+    shape = new["recorded"]["request_shape"]
+    typer.echo(f"wrote {out}: recorded allow #{allow}, block #{block}, request shape {shape}")
+
+
+@app.command()
+def compare(old: Path = typer.Argument(..., exists=True, dir_okay=False, help="Earlier report.json."),
+            new: Path = typer.Argument(..., exists=True, dir_okay=False, help="Later report.json."),
+            json_out: Path | None = typer.Option(None, "--json", help="Also write the comparison as JSON.")):
+    """What changed between two enforce reports (e.g. before and after an upgrade).
+    Exit 1 if anything that held is now violated."""
+    import json
+
+    from .compare import compare as cmp
+    from .compare import render
+
+    try:
+        d = cmp(old, new)
+    except ValueError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2) from None
+    typer.echo(render(d))
+    if json_out:
+        json_out.write_text(json.dumps(d, ensure_ascii=False, indent=2))
+    raise typer.Exit(1 if d["regressions"] else 0)
+
+
+@findings_app.command("disclose")
+def findings_disclose(ledger: Path, fid: str, where: str = typer.Option(..., help="Issue URL, advisory, or a "
+                                                                          "dated reference to the report.")):
+    """Mark a finding disclosed to its maintainers; only those appear in a public table."""
+    from . import findings as F
+
+    _, f = _ledger_do(ledger, lambda d: F.disclose(d, fid, where))
+    typer.echo(f"{f['id']} disclosed ({where})")
+
+
+@app.command()
+def table(runs: Path = typer.Argument(..., exists=True, file_okay=False, help="Folder of enforce reports."),
+          ledger: Path | None = typer.Option(None, exists=True, dir_okay=False, help="Findings ledger."),
+          public: bool = typer.Option(False, help="Show only violations of disclosed findings; withhold the rest."),
+          out: Path | None = typer.Option(None, help="Write the Markdown table here.")):
+    """Integration × guard behaviour × version, from stored runs. Private unless --public."""
+    import json
+
+    from .table import build, render
+
+    if public and ledger is None:
+        raise typer.BadParameter("a public table needs --ledger (to know what was disclosed)", param_hint="--public")
+    doc = json.loads(ledger.read_text()) if ledger else None
+    text = render(build(runs, doc, public))
+    if out:
+        out.write_text(text + "\n", encoding="utf-8")
+    typer.echo(text)
+
+
+# Last, so every command above is registered when run as `python -m gcl.cli`.
 if __name__ == "__main__":  # pragma: no cover
     app()

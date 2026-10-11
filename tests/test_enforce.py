@@ -48,11 +48,11 @@ def test_reference_naive_is_caught_as_a_deviation_from_its_own_docs(tmp_path):
     run = run_contracts(ReferenceGateway(sys.executable, tmp_path, "naive"), 15)
     for stage in ("input", "output"):
         for f in ("error", "timeout", "malformed", "empty", "wrong_schema", "unknown_verdict", "verdict_type",
-                  "refused"):
+                  "refused", "null_verdict"):
             r = _by(run, stage, f)
             assert (r["observed"], r["policy"], r["documented"]) == ("passed", "violated", "deviates"), (stage, f)
     # Every control still holds, so the faults are attributable to error handling.
-    assert run["summary"]["documented_deviates"] == 16
+    assert run["summary"]["documented_deviates"] == 18
     for key in (("input", "allow"), ("input", "block"), ("output", "allow"), ("output", "block")):
         assert _by(run, *key)["policy"] == "held", key
 
@@ -151,9 +151,10 @@ class _Fake(ReferenceGateway):
                     self.close_connection = True
                     return
                 code, obj = res
-                b = json.dumps(obj, ensure_ascii=False).encode()
+                streamed = isinstance(obj, str)  # a server-sent event stream, written as given
+                b = obj.encode() if streamed else json.dumps(obj, ensure_ascii=False).encode()
                 self.send_response(code)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", "text/event-stream" if streamed else "application/json")
                 self.send_header("Content-Length", str(len(b)))
                 self.end_headers()
                 self.wfile.write(b)
@@ -508,7 +509,7 @@ def test_adapters_registry():
                              "invariant-mcp", "agno",
                              "openai-guardrails-js", "google-adk",
                              "lasso-mcp-gateway", "openai-agents-js",
-                             "semantic-kernel", "reference"}
+                             "semantic-kernel", "reference", "coralogix-langchain", "llamafirewall"}
 
 
 # Real integrations (opt-in): each points at an environment with the integration
@@ -525,6 +526,8 @@ def _env(name):
 
 
 REAL = [
+    ("GCL_INTEG_CORALOGIX_ENV", "coralogix-langchain", "default"),
+    ("GCL_INTEG_LLAMAFIREWALL_PYTHON", "llamafirewall", "default"),
     ("GCL_INTEG_PYTHON", "litellm", "default"), ("GCL_INTEG_PYTHON", "nemo", "default"),
     ("GCL_INTEG_PYTHON", "nemo-selfcheck", "default"), ("GCL_INTEG_PYTHON", "openai-guardrails", "pre_flight"),
     ("GCL_INTEG_NODE_ENV", "portkey", "fail_on_error"), ("GCL_INTEG_LANGCHAIN_PYTHON", "langchain-moderation", "error"),

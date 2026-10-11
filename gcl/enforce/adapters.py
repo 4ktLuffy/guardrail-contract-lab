@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
+from .receipt import probe_versions
 from .servers import MockModel, Protocol, StandInScanner
 
 
@@ -132,19 +133,10 @@ def _tail(log: Path, n: int = 15) -> str:
         return "(no log)"
 
 
-def _versions(python: str, dists: list[str]) -> dict:
-    code = ("import json, importlib.metadata as m, sys\n"
-            f"d = {dists!r}\n"
-            "out = {'python': sys.version.split()[0]}\n"
-            "for x in d:\n"
-            "    try: out[x] = m.version(x)\n"
-            "    except m.PackageNotFoundError: out[x] = None\n"
-            "print(json.dumps(out))")
-    r = subprocess.run([python, "-I", "-c", code], capture_output=True, text=True, timeout=60)
-    try:
-        return json.loads(r.stdout.strip().splitlines()[-1])
-    except (ValueError, IndexError):
-        return {"error": (r.stderr or r.stdout)[-300:]}
+def _versions(python: str, dists: list[str], cwd: Path | None = None) -> dict:
+    """Versions as the integration's own interpreter sees them (same environment and
+    working directory, not isolated), with install details under "dists"."""
+    return probe_versions(python, dists, cwd)
 
 
 class Adapter:
@@ -158,6 +150,9 @@ class Adapter:
     # the passage relied on. Shown in reports so a reader can check the expectation.
     documented_sources: ClassVar[dict] = {}
     known_issues: ClassVar[dict] = {}   # mode -> public issue reference
+    # The framework ships no guard of its own: gcl's driver supplies the strictest one, so
+    # results test the framework's enforcement, and the stand-in answers gcl's own protocol.
+    harness_supplies_guard: ClassVar[bool] = False
 
     def __init__(self, python: str, workdir: Path, profile: str = "default"):
         self.python, self.workdir, self.profile = python, Path(workdir), profile
@@ -165,8 +160,15 @@ class Adapter:
         self.log = self.workdir / f"{self.name}-{profile}.log"
 
     def describe(self) -> dict:
+        full = self.versions()
         return {"integration": self.name, "profile": self.profile, "config": self.config_summary(),
-                "versions": self.versions(),
+                "versions": {k: v for k, v in full.items() if k not in ("dists", "executable")},
+                "install": {"executable": full.get("executable"), "dists": full.get("dists")},
+                "stand_in": {"provenance": "harness" if self.harness_supplies_guard else self.protocol.provenance,
+                             "source": ("gcl's driver supplies the guard; the framework is under test"
+                                        if self.harness_supplies_guard else self.protocol.provenance_source),
+                             "recorded_modes": list(self.protocol.recorded_modes),
+                             "recorded_shape": self.protocol.recorded_shape},
                 "documented_source": self.documented_sources.get(self.profile, {})}
 
     def config_summary(self) -> dict:
@@ -210,6 +212,8 @@ LITELLM_GENERIC = Protocol(
     },
     stage_of=lambda body: {"request": "input", "response": "output"}.get(body.get("input_type")),
     path="/beta/litellm_basic_guardrail_api",
+    provenance="integration",
+    provenance_source="LiteLLM's generic_guardrail_api (defined by LiteLLM, the integration under test)",
 )
 
 LITELLM_PROFILES = {
@@ -230,7 +234,8 @@ class LiteLLMProxy(Adapter):
 
     name = "litellm"
     protocol = LITELLM_GENERIC
-    capabilities: ClassVar[set[str]] = {"input", "output", "modify_input", "modify_output"}
+    capabilities: ClassVar[set[str]] = {"input", "output", "modify_input", "modify_output",
+                                         "stream", "history"}
     master_key = "sk-gcl-master"
     # From LiteLLM's generic guardrail API docs and example config: an unreachable
     # endpoint fails closed by default; fail_open proceeds only when the endpoint is
@@ -261,7 +266,7 @@ class LiteLLMProxy(Adapter):
                 **LITELLM_PROFILES[self.profile]}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["litellm"])
+        return _versions(self.python, ["litellm"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -295,9 +300,9 @@ class LiteLLMProxy(Adapter):
         p = getattr(self, "_cfg_path", None)
         return {p.name: p.read_text()} if p and p.exists() else {}
 
-    def call(self, messages: list[dict], timeout_s: float) -> Observation:
+    def call(self, messages: list[dict], timeout_s: float, stream: bool = False) -> Observation:
         return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
-                     {"model": "gcl-model", "messages": messages},
+                     {"model": "gcl-model", "messages": messages, **({"stream": True} if stream else {})},
                      {"Authorization": f"Bearer {self.master_key}"}, timeout_s)
 
 
@@ -312,6 +317,8 @@ NEMO_JAILBREAK = Protocol(
     stage_of=lambda body: "input",
     path="/model", trust_listener=True,
     wrong_schema={"status": "ok"},
+    provenance="integration",
+    provenance_source="NeMo Guardrails ships both the jailbreak detection server and its client",
 )
 
 
@@ -344,7 +351,7 @@ class NemoServer(Adapter):
         return {"rail": "jailbreak detection model (input)", "server_endpoint": "stand-in /model"}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["nemoguardrails", "langchain-openai", "langchain-core"])
+        return _versions(self.python, ["nemoguardrails", "langchain-openai", "langchain-core"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         cfgdir = self.workdir / "nemo-configs" / "gcl"
@@ -407,11 +414,12 @@ class ReferenceGateway(Adapter):
 
     name = "reference"
     protocol = LITELLM_GENERIC
-    capabilities: ClassVar[set[str]] = {"input", "output", "modify_input", "modify_output"}
+    capabilities: ClassVar[set[str]] = {"input", "output", "modify_input", "modify_output",
+                                         "stream", "history"}
     default_timeout_s = 15.0
     _closed: ClassVar[dict] = {**_BASE, **{f: "stopped" for f in
                                           ("error", "timeout", "malformed", "empty", "wrong_schema",
-                                           "unknown_verdict", "verdict_type", "refused")}}
+                                           "unknown_verdict", "verdict_type", "refused", "null_verdict")}}
     documented: ClassVar[dict] = {"strict": _closed, "naive": _closed}
     documented_sources: ClassVar[dict] = {
         p: {"source": "examples/enforce/ref_gateway.py (module docstring)", "read_for": "this release",
@@ -423,7 +431,7 @@ class ReferenceGateway(Adapter):
                 "documented_contract": "fail closed"}
 
     def versions(self) -> dict:
-        return _versions(self.python, [])
+        return _versions(self.python, [], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -437,9 +445,10 @@ class ReferenceGateway(Adapter):
                  "--policy", self.profile], stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
         _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 30, self.log)
 
-    def call(self, messages: list[dict], timeout_s: float) -> Observation:
+    def call(self, messages: list[dict], timeout_s: float, stream: bool = False) -> Observation:
         return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
-                     {"model": "gcl-mock", "messages": messages}, None, timeout_s)
+                     {"model": "gcl-mock", "messages": messages, **({"stream": True} if stream else {})},
+                     None, timeout_s)
 
 
 # --------------------------------------------------------------------------- Portkey
@@ -467,6 +476,8 @@ PORTKEY_WEBHOOK = Protocol(
               "block": lambda b, m: {"verdict": False},
               "modify": _portkey_modify},
     stage_of=_portkey_stage,
+    provenance="integration",
+    provenance_source="Portkey's own webhook guardrail contract",
 )
 
 PORTKEY_PROFILES = {"default": {}, "fail_on_error": {"failOnError": True}}
@@ -479,7 +490,8 @@ class PortkeyGateway(Adapter):
     name = "portkey"
     runtime = "node"
     protocol = PORTKEY_WEBHOOK
-    capabilities: ClassVar[set[str]] = {"input", "output", "modify_input", "modify_output"}
+    capabilities: ClassVar[set[str]] = {"input", "output", "modify_input", "modify_output",
+                                         "stream", "history"}
     # Docs (bring-your-own-guardrails): "If your webhook fails to respond within the
     # timeout period, Portkey will default to verdict: true." failOnError: "Treat a
     # non-200 response or a timeout as a failed check." Nothing on unparseable or empty
@@ -533,9 +545,9 @@ class PortkeyGateway(Adapter):
         p = self.workdir / "portkey-config.json"
         return {p.name: p.read_text()} if p.exists() else {}
 
-    def call(self, messages: list[dict], timeout_s: float) -> Observation:
+    def call(self, messages: list[dict], timeout_s: float, stream: bool = False) -> Observation:
         return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
-                     {"model": "gcl-mock", "messages": messages},
+                     {"model": "gcl-mock", "messages": messages, **({"stream": True} if stream else {})},
                      {"x-portkey-provider": "openai", "x-portkey-custom-host": self._model_base,
                       "Authorization": "Bearer sk-gcl", "x-portkey-config": json.dumps(self._config)},
                      timeout_s)
@@ -583,7 +595,9 @@ def judge_protocol(name: str, allow: dict, block: dict, wrong_schema: dict | Non
                     malformed=b"I can't evaluate that request.",
                     wrong_schema=wrong_schema or {"status": "ok"},
                     envelope=_chat_envelope, shared_endpoint=True,
-                    extra_faults={"judge_refusal": _refusal_envelope()})
+                    extra_faults={"judge_refusal": _refusal_envelope()},
+                    provenance="integration",
+                    provenance_source="the integration's own judge prompt and output format")
 
 
 def _driver_path(name: str) -> Path:
@@ -633,7 +647,7 @@ class OpenAIGuardrails(Adapter):
                 "raise_guardrail_errors": self.profile != "default", "client_timeout_s": 8}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["openai-guardrails", "openai"])
+        return _versions(self.python, ["openai-guardrails", "openai"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -679,6 +693,8 @@ NEMO_SELF_CHECK = Protocol(
     extra_faults={"judge_refusal": _refusal_envelope()},
     # Text-verdict faults: an answer with no Yes/No keyword, and a block said in other words.
     variants={"unknown_verdict": "Unclear.", "verdict_type": "Not safe."},
+    provenance="integration",
+    provenance_source="the integration's own self-check prompt and its expected answer",
 )
 
 
@@ -761,6 +777,8 @@ OPENAI_MODERATION = Protocol(
     variants={"unknown_verdict": json.dumps(_moderation("DENY_UNKNOWN")),
               "verdict_type": json.dumps(_moderation("true"))},
     single_listener=True,
+    provenance="vendor_schema",
+    provenance_source="OpenAI moderation API reference (the SDK's published response type)",
 )
 
 
@@ -787,7 +805,7 @@ class LangChainModeration(Adapter):
                 "exit_behavior": "end" if self.profile == "default" else "error", "client_timeout_s": 8}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["langchain", "langchain-openai", "langchain-core", "openai"])
+        return _versions(self.python, ["langchain", "langchain-openai", "langchain-core", "openai"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -832,6 +850,8 @@ MASTRA_JUDGE = Protocol(
               "verdict_type": json.dumps({"categories": [{"type": "injection", "score": "0.95"}],
                                           "category_scores": [{"category": "violence", "score": "0.95"}],
                                           "reason": "gcl stand-in"})},
+    provenance="integration",
+    provenance_source="the integration's own judge prompt and output schema",
 )
 
 
@@ -887,6 +907,117 @@ class MastraAgent(Adapter):
                      {"model": "gcl-mock", "messages": messages}, None, timeout_s)
 
 
+# --------------------------------------------------------------------------- Coralogix
+def _coralogix_scanned(body: dict) -> str:
+    if body.get("validation_target") == "response":
+        return str(body.get("response") or "")
+    return json.dumps(body.get("messages") or [], ensure_ascii=False)
+
+
+CORALOGIX_VALIDATE = Protocol(
+    name="Coralogix (Aporia) guardrails validate API",
+    verdicts={"allow": lambda body, m: {"action": "passthrough", "revised_response": None},
+              "block": lambda body, m: {"action": "block", "revised_response": "GCL-BLOCKED by the stand-in"},
+              "modify": lambda body, m: {"action": "modify", "revised_response": m}},
+    stage_of=lambda body: {"prompt": "input", "response": "output"}.get(body.get("validation_target")),
+    routes=("/<project>/validate",), single_listener=True, scanned=_coralogix_scanned,
+    wrong_schema={"verdict": "ok"},
+    provenance="client_code",
+    provenance_source="rebuilt from the response schema in @coralogix/guardrails-langchain (zod, index.mjs)",
+)
+
+
+class CoralogixLangChain(Adapter):
+    """A LangChain ChatOpenAI wrapped with Coralogix guardrails (withGuardrails): the
+    prompt is validated before the model call, the reply after it; a block returns the
+    library's override text as the answer. One base URL serves both checks."""
+
+    name = "coralogix-langchain"
+    runtime = "node"
+    protocol = CORALOGIX_VALIDATE
+    capabilities: ClassVar[set[str]] = {"input", "output", "modify_output", "stream", "history"}
+    documented: ClassVar[dict] = {"default": dict(_BASE)}
+    documented_sources: ClassVar[dict] = {"default": {
+        "source": "@coralogix/guardrails-langchain README", "read_for": "@coralogix/guardrails-langchain 0.6.0",
+        "passage": "withGuardrails intercepts prompts and responses; a blocked prompt or response is replaced by "
+                   "an override. The README does not describe what happens when the guardrails service fails."}}
+
+    def config_summary(self) -> dict:
+        return {"wrapper": "withGuardrails(ChatOpenAI)", "call": "model.invoke / model.stream"}
+
+    def versions(self) -> dict:
+        out = {}
+        for pkg in ("@coralogix/guardrails-langchain", "@langchain/core", "@langchain/openai"):
+            try:
+                pj = Path(self.python) / "node_modules" / pkg / "package.json"
+                out[pkg] = json.loads(pj.read_text())["version"]
+            except (OSError, ValueError, KeyError):
+                out[pkg] = None
+        out["node"] = subprocess.run(["node", "--version"], capture_output=True, text=True).stdout.strip()
+        return out
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        self.port = _free_port()
+        cmd = ["node", str(_driver_path("coralogix_driver.cjs")), "--env", str(Path(self.python).resolve()),
+               "--port", str(self.port), "--model-base", model.openai_base, "--guard-base", scanner.base_for("input")]
+        env = dict(os.environ, NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost")
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env,
+                                         start_new_session=True, cwd=str(self.workdir))
+        _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 60, self.log)
+
+    def call(self, messages: list[dict], timeout_s: float, stream: bool = False) -> Observation:
+        return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                     {"messages": messages, **({"stream": True} if stream else {})}, None, timeout_s)
+
+
+# --------------------------------------------------------------------------- LlamaFirewall
+LLAMAFIREWALL_PII = judge_protocol(
+    "LlamaFirewall PIICheckScanner (structured output in a chat completion)",
+    allow={"detected_pii_types": ["None"]}, block={"detected_pii_types": ["EMAIL"]},
+    wrong_schema={"pii": "none"})
+
+
+class LlamaFirewallPII(Adapter):
+    """Meta LlamaFirewall with its LLM-judged PII check on the user message. The library
+    decides; the driver enforces its decision the way the README shows (refuse on BLOCK,
+    otherwise call the model), so results test the library's decision under judge
+    failures — the refusal itself is the driver's."""
+
+    name = "llamafirewall"
+    protocol = LLAMAFIREWALL_PII
+    capabilities: ClassVar[set[str]] = {"input"}
+    documented: ClassVar[dict] = {"default": dict(_BASE)}
+    documented_sources: ClassVar[dict] = {"default": {
+        "source": "llamafirewall README / scanner docstrings", "read_for": "llamafirewall 1.0.3",
+        "passage": "Scanners return a ScanResult with a decision (ALLOW, BLOCK, HUMAN_IN_THE_LOOP_REQUIRED); the "
+                   "PII check is marked experimental. The docs do not say what a failed LLM call decides."}}
+
+    def config_summary(self) -> dict:
+        return {"scanner": "PIICheckScanner (registered subclass, judge URL set)", "roles": "USER",
+                "enforcement": "driver: refuse on ScanDecision.BLOCK, else call the model"}
+
+    def versions(self) -> dict:
+        return _versions(self.python, ["llamafirewall", "openai"], self.workdir)
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        self.port = _free_port()
+        cmd = [self.python, str(_driver_path("llamafirewall_driver.py")), "--port", str(self.port),
+               "--model-base", model.openai_base, "--judge-base", model.openai_base]
+        env = dict(os.environ, NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost",
+                   GCL_JUDGE_KEY="sk-gcl", OPENAI_MAX_RETRIES="0")
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env,
+                                         start_new_session=True, cwd=str(self.workdir))
+        _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 120, self.log)
+
+    def call(self, messages: list[dict], timeout_s: float) -> Observation:
+        return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                     {"model": "gcl-mock", "messages": messages}, None, timeout_s)
+
+
 # --------------------------------------------------------------------------- OpenAI Agents SDK
 class OpenAIAgents(OpenAIGuardrails):
     """The OpenAI Agents SDK running openai-guardrails' `GuardrailAgent`: an LLM Jailbreak
@@ -919,7 +1050,7 @@ class OpenAIAgents(OpenAIGuardrails):
                 "raise_guardrail_errors": self.profile == "raise_errors"}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["openai-agents", "openai-guardrails", "openai"])
+        return _versions(self.python, ["openai-agents", "openai-guardrails", "openai"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -954,6 +1085,7 @@ class PydanticAI(Adapter):
     the run tests what the framework does with a block or an exception. One probe tool."""
 
     name = "pydantic-ai"
+    harness_supplies_guard: ClassVar[bool] = True
     protocol = LITELLM_GENERIC
     capabilities: ClassVar[set[str]] = {"input", "output", "tools"}
     scanner_latency_s = 1.0
@@ -985,7 +1117,7 @@ class PydanticAI(Adapter):
                 "scanner_latency_s": 1.0}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["pydantic-ai-slim", "pydantic-ai-harness", "openai"])
+        return _versions(self.python, ["pydantic-ai-slim", "pydantic-ai-harness", "openai"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -1032,6 +1164,13 @@ def _dotted(body, path: str):
     return cur if isinstance(cur, str) else None
 
 
+def _literal(reply):
+    """A recorded reply is served exactly as captured: no ECHO_TEXT / MODIFY_TEXT templating
+    (the vendor's own text may contain those words)."""
+    frozen = json.dumps(reply)
+    return lambda b, m: json.loads(frozen)
+
+
 def vendor_protocol(spec: dict) -> Protocol:
     """A scanner protocol built from a vendor spec file: the vendor's own allow, block and
     (optionally) rewrite bodies, served on one listener per stage, on the vendor's routes
@@ -1049,12 +1188,33 @@ def vendor_protocol(spec: dict) -> Protocol:
     # leading path token, drop anything that is not a path.
     routes = tuple(str(r["path"]).split()[0] for r in spec.get("requests") or []
                    if str(r.get("path") or "").startswith("/"))
+    # Provenance: recorded real replies, when the spec carries them, replace the bodies
+    # read from the integration's client; otherwise the spec says what it was built from.
+    rec = spec.get("recorded") or {}
+    rec_modes = tuple(m for m in ("allow", "block", "modify") if m in rec)
+    if rec and not rec_modes:
+        raise ValueError(f"{spec['vendor']}: 'recorded' names no reply (allow, block or modify)")
+    if rec and not isinstance((rec.get("request_shape") or {}).get("messages"), int):
+        raise ValueError(f"{spec['vendor']}: recorded replies need request_shape.messages (the message count "
+                         "of the request they answered)")
+    allow, block, modify = rec.get("allow", allow), rec.get("block", block), rec.get("modify", modify)
+    prov = spec.get("provenance") or {}
+    kind = prov.get("kind", "client_code")
+    if kind not in ("integration", "vendor_schema", "client_code", "guessed"):
+        raise ValueError(f"{spec['vendor']}: unknown provenance kind {kind!r} (recorded replies go under 'recorded')")
+    source = prov.get("source") or f"vendor spec {spec['vendor']} (from the integration's client)"
+    if rec:
+        source += f"; recorded replies for {', '.join(rec_modes)}"
+        source += f" ({rec['source']})" if rec.get("source") else ""
     return Protocol(
         name=f"{spec['vendor']} guardrail API (as called by its integration)",
-        verdicts={"allow": lambda b, m: _fill(allow, "", echo(b)),
-                  "block": lambda b, m: _fill(block, "", echo(b)),
-                  "modify": (lambda b, m: _fill(modify, m, echo(b))) if modify
-                  else (lambda b, m: _fill(allow, "", echo(b)))},
+        provenance=kind, provenance_source=source, recorded_modes=rec_modes,
+        recorded_shape=dict(rec.get("request_shape") or {}),
+        verdicts={"allow": _literal(allow) if "allow" in rec_modes else (lambda b, m: _fill(allow, "", echo(b))),
+                  "block": _literal(block) if "block" in rec_modes else (lambda b, m: _fill(block, "", echo(b))),
+                  "modify": _literal(modify) if "modify" in rec_modes else
+                  ((lambda b, m: _fill(modify, m, echo(b))) if modify
+                   else (lambda b, m: _fill(allow, "", echo(b))))},
         stage_of=lambda body: None, trust_listener=True, routes=routes, scanned=scanned)
 
 
@@ -1097,7 +1257,7 @@ class LiteLLMVendor(Adapter):
                 **{k: v for k, v in (self.spec.get("litellm_params") or {}).items() if "key" not in k.lower()}}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["litellm"])
+        return _versions(self.python, ["litellm"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -1236,7 +1396,7 @@ class CrewAITask(Adapter):
                 "guardrail_max_retries": 3, "tools": ["gcl_probe"]}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["crewai", "litellm", "openai"])
+        return _versions(self.python, ["crewai", "litellm", "openai"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -1263,6 +1423,7 @@ class GuardrailsAI(Adapter):
     the output without an on-fail attribute."""
 
     name = "guardrails-ai"
+    harness_supplies_guard: ClassVar[bool] = True
     protocol = LITELLM_GENERIC
     capabilities: ClassVar[set[str]] = {"input", "output"}
     _F = ("error", "timeout", "malformed", "empty", "wrong_schema", "unknown_verdict", "verdict_type", "refused")
@@ -1290,7 +1451,7 @@ class GuardrailsAI(Adapter):
                 else "Guard().use(check, on='messages').use(check)", "validator": "gcl strict HTTP check"}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["guardrails-ai", "litellm"])
+        return _versions(self.python, ["guardrails-ai", "litellm"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -1338,6 +1499,8 @@ INVARIANT_CHECK = Protocol(
     get_routes={"/api/v1/user/identity": {"username": "gcl"},
                 "/api/v1/dataset/byuser/<user>/<dataset>/policy": {"policies": [
                     {"id": "gcl-1", "name": "gcl", "content": _INV_POLICY, "action": "block", "enabled": True}]}},
+    provenance="client_code",
+    provenance_source="rebuilt from Invariant Gateway's client of the guardrails API",
 )
 
 
@@ -1381,7 +1544,7 @@ class InvariantMCP(Adapter):
                 "push_to_explorer": self.profile == "push"}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["invariant-gateway", "httpx", "fastapi"])
+        return _versions(self.python, ["invariant-gateway", "httpx", "fastapi"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -1459,7 +1622,7 @@ class AgnoAgent(Adapter):
                 "call": "agent.run"}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["agno", "openai"])
+        return _versions(self.python, ["agno", "openai"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -1551,7 +1714,7 @@ class GoogleADK(PydanticAI):
                 "guard": "gcl strict HTTP guard", "tools": ["gcl_probe"]}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["google-adk", "litellm"])
+        return _versions(self.python, ["google-adk", "litellm"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -1577,6 +1740,8 @@ LASSO_CLASSIFY = Protocol(
               "modify": lambda b, m: {"violations_detected": False, "deputies": {"jailbreak": False}}},
     stage_of=lambda body: {"PROMPT": "input", "COMPLETION": "output"}.get(body.get("messageType")),
     routes=("/gateway/v3/classify",), single_listener=True,
+    provenance="client_code",
+    provenance_source="rebuilt from the lasso plugin's client of the Lasso API",
 )
 
 
@@ -1606,7 +1771,7 @@ class LassoMCPGateway(Adapter):
                 "lasso_api_key": self.profile != "no_key", "change": "plugin api_base default only"}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["mcp-gateway", "mcp"])
+        return _versions(self.python, ["mcp-gateway", "mcp"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -1709,7 +1874,7 @@ class SemanticKernel(GoogleADK):
                 "function_invocation"], "guard": "gcl strict HTTP guard", "tools": ["probe.gcl_probe (auto)"]}
 
     def versions(self) -> dict:
-        return _versions(self.python, ["semantic-kernel", "openai"])
+        return _versions(self.python, ["semantic-kernel", "openai"], self.workdir)
 
     def start(self, model: MockModel, scanner: StandInScanner) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -1734,4 +1899,5 @@ ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": Op
             "guardrails-ai": GuardrailsAI, "invariant-mcp": InvariantMCP,
             "agno": AgnoAgent, "openai-guardrails-js": OpenAIGuardrailsJS,
             "google-adk": GoogleADK, "lasso-mcp-gateway": LassoMCPGateway,
-            "openai-agents-js": OpenAIAgentsJS, "semantic-kernel": SemanticKernel, "reference": ReferenceGateway}
+            "openai-agents-js": OpenAIAgentsJS, "semantic-kernel": SemanticKernel, "reference": ReferenceGateway,
+            "coralogix-langchain": CoralogixLangChain, "llamafirewall": LlamaFirewallPII}

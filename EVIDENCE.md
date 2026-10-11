@@ -55,7 +55,7 @@ else is labelled.
 
 ## enforce (tests/test_enforce.py)
 - Reference gateway: the strict build holds all 22 scenarios and conforms to its docs on
-  every one; the naive build deviates on all 16 fault scenarios (8 faults × 2 stages)
+  every one; the naive build deviates on all 18 fault scenarios (9 faults × 2 stages)
   while all four controls hold — checked.
 - Adversarial gateways, each built to fool a sentinel-only judge: forwarding the blocked
   text with its marker stripped ("altered", violated); a rewrite that keeps only the
@@ -111,14 +111,135 @@ else is labelled.
   scenarios' markers prevent a clean hold; the mock MCP server rejects unknown sessions
   and tools; JS drivers serialise exception state and results — checked.
 
+## Checks on the tester (tests/test_tester_receipts.py, test_tester_controls.py, test_tester_delivery.py)
+- Receipts: every sentinel carries the run id; a marker from another run is not evidence; a
+  reply served from a cache with no model call is not a hold; a truncated client body is
+  never judged clean and the bundle says `truncated: true`; a locally patched install
+  (a file that no longer matches its RECORD hash) is flagged; docs read for another
+  version are flagged; `--out` refuses a non-empty folder — checked.
+- Bracketing controls, each against a gateway built to fool the judge: one that breaks
+  after eight requests, one that fails on Arabic text after the guard answered, one whose
+  driver cuts answers to 300 characters while leaking inside an error, one that crashes
+  (500) on a block answer — every affected clean result is unverified; a correct gateway
+  still holds everything — checked.
+- Delivery: an answer written after the integration hung up is not evidence; an unmarked
+  background provider call is not a violation; background traffic before the run is in
+  the receipt; a stall records who ended it; a gateway that blocks on any truthy verdict
+  holds `unknown_verdict` by accident and is caught by `null_verdict` — checked.
+
+- Timeline (tests/test_tester_timeline.py): a gateway that forwards to the provider before
+  asking the guard, then refuses, is "blocked after send" with the provider first in the
+  timeline and flagged; a gateway that races a parallel check against the model call holds
+  at 0 s guard latency and leaks at 0.6 s, and the sweep reports it unstable — checked.
+
+## Stand-in provenance (tests/test_tester_provenance.py)
+- Every built-in stand-in declares how it was built; results on a stand-in rebuilt from
+  client code are "guessed" whether they hold or not, while a transport fault on the same
+  stand-in stays verified; the same scenarios on an integration-defined stand-in are
+  verified; vendor specs default to client code, recorded replies replace the rebuilt
+  bodies and count only for their request shape (a retry or another message count is
+  guessed); a guard supplied by gcl's own driver is labelled "harness" — checked.
+
+## Held-out cases (tests/test_tester_heldout.py)
+- Coverage without held-out rows says its recall is fit; with them, held-out and fit
+  recall are reported apart and a large gap is called out; unanswered held-out rows are not counted as
+  misses — checked.
+
+## Attack mode, recording, CI (tests/test_attacks.py, test_record.py, test_ci.py)
+- Attack × fault: with the bundled keyword detector, a strict gateway shows only detector
+  misses; a gateway that passes anything but an explicit block leaks every attack under
+  error and timeout; a gateway that ignores the detector's block on attack text is "not
+  enforced"; the CLI refuses half a configuration — checked. Real run: LiteLLM 1.104.2,
+  profile fail_open, five bundled attacks: the flagged attack is enforced, every attack
+  leaks under a guard timeout and stops under a guard error, as LiteLLM documents; all
+  controls hold — checked locally, not in CI.
+- Recording: the proxy is transparent, stores no request headers and redacts secret
+  fields; recorded allow/block replies become a spec whose block results are "recorded" for
+  the recorded request shape and "guessed" otherwise; `to-spec` refuses identical,
+  failed, redacted or differently shaped records — checked (against a fake vendor; no real
+  vendor credentials were used).
+- CI: SARIF has one result per scenario that did not cleanly hold, with stable
+  fingerprints; `gcl compare` reports regressions, fixes and unverified changes and exits
+  1 on a regression; every command is registered under `python -m gcl.cli`; the Action
+  passes its inputs as environment data, not script text — checked. Real run: LiteLLM
+  1.104.2 against 1.105.0, `gcl compare`: no change — checked locally.
+
+## Blind spots, standards, table (tests/test_blind_spots.py, test_standards.py, test_table.py)
+- The default plan is unchanged with no `--extra`; a strict gateway holds every blind-spot
+  scenario; a gateway that streams the reply before the output check, one that checks only
+  the last message, and one that lets a repeated request skip the guard are each caught
+  — checked. Real run: LiteLLM 1.104.2 with all three: history and retry hold — checked
+  locally.
+- OWASP IDs per outcome (prompt injection, output handling, disclosure to the provider,
+  excessive agency, cascading failure, MCP intent/context) and in SARIF tags — checked.
+- A private table shows every result; a public one withholds every violation not covered
+  by a disclosed ledger finding and shows it once disclosed — checked; built from real
+  LiteLLM runs — checked locally.
+
+## New targets (tests/test_new_targets.py)
+- Coralogix guardrails-langchain 0.6.0 and LlamaFirewall 1.0.3 adapters: protocol shapes
+  and capabilities — checked; real runs with every control holding, including streaming,
+  history and retry for Coralogix — checked locally (opt-in `GCL_INTEG_CORALOGIX_ENV`,
+  `GCL_INTEG_LLAMAFIREWALL_PYTHON`), not in CI.
+- A timeout result that only followed gcl releasing the stalled call is unverified
+  (tests/test_tester_delivery.py) — checked; found on a real run.
+
+## Review round 13 (tests/test_review_round13.py)
+- A third independent review of the new parts found ten defects; each is fixed and
+  pinned, and each test fails on the code before its fix: disclosure scope, a summarised
+  history counted as a hold, release attribution of timeout leaks, history verdicts
+  bypassing stand-in confidence, a per-message guard counted as not consulted, retries
+  after a normal-answer refusal, OWASP tags without a leak, "fails open" for an over-block,
+  and drivers dropping the library's own evidence — checked.
+
+## Findings ledger and severity (tests/test_tester_findings.py, test_tester_severity.py)
+- A finding comes only from a violated or deviating result in a stored run with a clean
+  receipt; a repeat needs another run id; a different outcome contradicts it; confirmation
+  needs a declared answer source, refuses a reproduction that reuses the stand-in's
+  answers, and for a guessed stand-in needs recorded or live answers; a retraction keeps
+  the record; `check` catches an edited or missing report, a newer disagreeing run on the
+  same versions, a run on another gcl source, and a hand-edited rating; the ledger is
+  refused inside gcl's checkout; the severity rule gives the same number for the same
+  evidence, and human inputs need a reason — checked.
+
+## Review round 11 (tests/test_review_round11.py)
+- A second independent review, of provenance, the ledger and severity, found nine
+  defects; each is fixed and pinned: `check` now re-derives every field of a finding from
+  the report it names (status, runs, run ids, guessed, versions) and its history; rating
+  inputs a person may not set are ignored and flagged; receipts are required for add,
+  repeat and check; a confirmation needs a non-empty reproduction that must stay in place;
+  "recorded" applies per verdict and needs a positive request-shape match; allow answers
+  rest on the stand-in too; a finding from a latency sweep is checked against its own run;
+  language controls are separate findings — checked (the tests pass; the reviewer showed
+  each defect on the code before the fix in memory, the tests were not re-run against it).
+
+## Review round 10 (tests/test_review_round10.py)
+- An independent adversarial review of the checks above found eight defects, each
+  reproduced and fixed: a 5xx block control that leaked was hidden as unverified; another
+  run's reply in a client body counted as a leak; another run's marker for a different
+  scenario fell back to time-window attribution; tool markers lacked the run id; the
+  cached-reply check erased a recorded tool run; the latency sweep kept only one run,
+  overwrote language controls in its table and replayed without the latency; "before the
+  guard answered" used handler completion instead of transmission. Each test fails on the
+  code before its fix — checked.
+
+## Review pins (tests/test_review_pins.py)
+- Five earlier review fixes that had no test of their own are pinned: no output "refused"
+  scenario for a single-listener guard; a slow stand-in answer keeps the configuration it
+  arrived under, and quiet time counts from completion and tool runs; tool runs are
+  attributed by exact marker, then by time window, and agent runs need the probe tool to
+  fire; the JS drivers' serialiser keeps nested state, cycles and bigints; one deadline
+  covers a whole MCP session. Each test was run against the code before its fix and
+  failed there — checked.
+
 ## Independent review
 - Ten adversarial review rounds by independent models (nine by an OpenAI model, one by a
   separate Claude instance) before release. Every issue they reproduced — wrong verdicts,
   misattributed timeouts, rewrites that changed what a rule matches, unbounded
   subprocesses, overclaims — was fixed and pinned by a regression test
   (`tests/test_review_round*.py` and the suites above).
-- Local runs: 167 tests pass (plus 11 opt-in real-integration tests) on Python 3.11.14 and
-  3.13.15 with Node 25.8.0; the demo runs
+- Local runs: 301 tests pass (plus 12 opt-in real-integration tests, run separately against
+  twelve installed integrations) on Python 3.13.15 with Node 25.8.0; the demo runs
   from an installed wheel outside the checkout.
 
 ## Not yet verified

@@ -153,7 +153,8 @@ Drives a **real** guardrail integration end to end, offline: LiteLLM's proxy gua
 jailbreak-detection and self-check rails, openai-guardrails' LLM checks in Python and JavaScript (a small driver serves the
 library over HTTP), the Portkey gateway's webhook guardrails (Node: `--env DIR`), LangChain's
 OpenAI moderation middleware, Mastra's model-backed processors, the OpenAI Agents SDK (Python and JavaScript) with
-openai-guardrails' `GuardrailAgent`, Pydantic AI's harness guardrails, Google ADK's model callbacks, Semantic Kernel's filters, CrewAI's `LLMGuardrail`, Guardrails AI's `Guard` (Python API and RAIL), Invariant Gateway's MCP proxy and Lasso's
+openai-guardrails' `GuardrailAgent`, Pydantic AI's harness guardrails, Google ADK's model callbacks, Semantic Kernel's filters, CrewAI's `LLMGuardrail`, Guardrails AI's `Guard` (Python API and RAIL), Coralogix (Aporia) guardrails for LangChain models (`coralogix-langchain`, Node), Meta
+LlamaFirewall's LLM-judged PII check (`llamafirewall`), Invariant Gateway's MCP proxy and Lasso's
 mcp-gateway (gcl plays the MCP client and a mock MCP server, over HTTP or stdio), Agno's built-in guardrails, or the bundled
 reference gateway. A report notes when one request ran a tool more than once (retries that
 re-execute side effects). The Invariant MCP adapter also runs a retry scenario (the same
@@ -183,7 +184,17 @@ passage and the version it was read for). A fail-open you switched on is reporte
 configuration choice, not a bug; behaviour the docs don't cover is labelled as such.
 Four controls (allow and block, before and after the model) are judged first, and only
 if the scanner was really consulted with that scenario's text; if a control doesn't
-hold, what depends on it is **unverified**, never "held", and the run exits 2.
+hold, what depends on it is **unverified**, never "held", and the run exits 2. The controls
+run again at the end (the setup must still work), in every language a scenario used, and
+with a long reply (a driver that cuts answers cannot hide a leak); a block that ends in a
+server error does not count as a block. The stand-in keeps a receipt of what actually
+reached the integration, and every report carries a run receipt: a run id in every
+sentinel, gcl's commit and uncommitted files, and the integration's installed versions
+with a check that the installed files match the release. Each result has an ordered
+timeline of its boundary events; `--judge-latency 0,0.2,1` re-runs the contract at several
+guard latencies and reports results that change with timing (races) as unstable. Every
+stand-in says how it was built; a result that rests on the shape of a stand-in answer
+rebuilt from client code or guessed is labelled "guessed" (it still counts for the exit code).
 Payloads rotate through Spanish, French, Hebrew, Portuguese, German, Arabic, Russian,
 Chinese, Italian, Japanese and Hindi, so a rewrite that corrupts the text is caught
 too. `--out` writes the report and a reproduction bundle for every scenario that did not
@@ -209,6 +220,87 @@ gcl enforce nemo-vendor --spec acme-nemo.json --python /path/to/venv/bin/python
 The real integration code runs unmodified; only the vendor's API is replaced. NeMo specs
 name the input/output flows and the `rails.config` block, with `STANDIN_URL` where the
 endpoint goes.
+
+#### Real attacks, a real detector, and faults at the same time
+
+```bash
+gcl enforce litellm --python /path/to/venv/bin/python --attacks attacks.jsonl \
+    --detector my-detector.yaml --attack-faults error,timeout --attack-limit 8
+```
+
+Each attack (JSON lines, the `coverage` format) is sent once with the stand-in answering
+what your detector decided about that exact text, and once per fault. The detector is a
+`coverage` adapter: wrap Prompt Guard, LlamaFirewall or a vendor API in a small script.
+The report separates what the detector missed (a detector problem), what it flagged but
+the integration let through (an enforcement problem) and what leaked while the guard was
+failing (fail-open), per attack.
+
+#### Record real vendor replies
+
+```bash
+gcl record serve --upstream https://api.vendor.example --out rec.jsonl --port 8899
+# point the integration's vendor URL at http://127.0.0.1:8899, send one clean and one bad request
+gcl record to-spec rec.jsonl --spec vendor.json --allow 1 --block 2 --out vendor.recorded.json
+```
+
+The proxy forwards everything unchanged and never stores request headers; secret-looking
+JSON fields are redacted. The spec then serves the vendor's real answers, and results on
+them are "recorded", not "guessed" — for requests shaped like the recorded ones.
+
+#### Blind spots, opt-in
+
+`--extra stream,history,retry` adds, after the usual plan: output checks on a **streamed**
+answer (an output guard that blocks after the text was already streamed is a leak), the
+attack in an **earlier turn** behind a benign follow-up (a guard that checks only the last
+message is caught: the stand-in blocks only when it is shown the attack), and a blocked
+request **sent twice** for any integration. Streaming and history run where the adapter
+can send them (LiteLLM, Portkey, the reference gateway).
+
+#### Which OWASP risk a failure is evidence about
+
+Every violated result names the OWASP risks it is evidence about — OWASP Top 10 for LLM
+Applications 2025, Top 10 for Agentic Applications 2026, MCP Top 10 — in the report and
+as SARIF tags. The mapping is a short, explicit table ([gcl/standards.py](gcl/standards.py)).
+
+#### A compatibility table
+
+`gcl table RUNS/` turns a folder of reports into integration × guard behaviour × version.
+It is private by default (it shows everything). `--public --ledger L` shows a failure
+only if a finding in the ledger covers it and was marked disclosed
+(`gcl findings disclose ID --where URL`); every other failure prints as "withheld".
+
+#### In CI
+
+`--format json,html,sarif` writes SARIF for code scanning (`--sarif-anchor FILE` names the
+repository file results attach to). `gcl compare old/report.json new/report.json` lists
+what changed between two runs — typically before and after an upgrade — and exits 1 on a
+regression (held → violated). The repository is also a GitHub Action
+([action.yml](action.yml)); [examples/ci/version-watch.yml](examples/ci/version-watch.yml)
+re-runs an integration on its latest release every week and fails on a regression.
+
+### `gcl findings` — a ledger that only holds what runs can back
+
+```bash
+gcl findings add    ledger.json --report out/report.json --scenario i04 --title "500 from the guard passes"
+gcl findings repeat ledger.json F-1a2b3c4d --report out2/report.json
+gcl findings confirm ledger.json F-1a2b3c4d --repro repro.py --answer-source recorded --note "..."
+gcl findings retract ledger.json F-1a2b3c4d --reason "..."
+gcl findings check  ledger.json --runs out/        # exit 1 on any problem
+gcl findings render ledger.json                    # Markdown table, every qualifier a column
+```
+
+A finding is created from a stored run, never typed by hand; a run whose receipt lists
+problems (uncommitted gcl, a patched install) is refused. A second run with its own run id
+makes it *repeated* (same stand-in: not independent); *confirmed* needs a hand reproduction
+that says where its guard answers came from and does not reuse gcl's stand-in answers, and
+for a result on a guessed stand-in, real recorded or live vendor answers. `check` re-reads
+every report a finding names (present, unchanged, same outcome), flags newer runs of the
+same scenario and versions that disagree (*contradicted*) or used another gcl source or
+spec (*stale*), and recomputes the severity. Severity comes from fields — what leaked, who
+has to misbehave, default configuration, documented — by a fixed rule
+([gcl/severity.py](gcl/severity.py)); inputs only a person can know (`findings set`) and a
+person's own number (`findings override`) are kept with their reasons. The ledger may not
+live inside gcl's own checkout.
 
 ## What the static checks mean
 

@@ -227,7 +227,9 @@ class MockModel(_Server):
                 msgs = body.get("messages") or []
                 if (outer.tools_mode and body.get("tools") and not body.get("stream")
                         and not any(isinstance(m, dict) and m.get("role") == "tool" for m in msgs)):
-                    ids = re.findall(r"GCL-U-([io]\d{2})", json.dumps(msgs, ensure_ascii=False))
+                    # The tool marker carries the scenario's full tag (id and run id), so a tool
+                    # run can never be charged to the same id in another run.
+                    ids = re.findall(r"GCL-U-([io]\d{2}(?:-[0-9a-f]{6})?)\b", json.dumps(msgs, ensure_ascii=False))
                     fn = (body["tools"][0].get("function") or {}).get("name", "gcl_probe")
                     sid = ids[-1] if ids else "x"
                     call = {"id": f"call_gcl_{sid}", "type": "function",
@@ -460,7 +462,7 @@ class StandInScanner:
 
         def send(code: int, body: bytes, ctype: str = "application/json"):
             if "ev" in current:  # answering is done once the bytes go out, not after
-                current["ev"]["t_done"] = time.monotonic()
+                current["ev"]["t_done"] = current["ev"]["t_sent"] = time.monotonic()
             # A receipt of what reached the integration, not what we meant to send: a
             # write lands in the kernel buffer even after the peer hung up, so check for
             # a closed peer first; a write error means it was not delivered either.

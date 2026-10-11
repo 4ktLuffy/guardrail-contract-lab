@@ -298,9 +298,9 @@ def classify_input(s: Scenario, bodies: list) -> str | None:
 
 
 def classify_output(s: Scenario, obs) -> str | None:
-    got = _classify_output_texts(s, _client_strings(obs.text or ""))
+    got = _classify_output_texts(s, _current_texts(_client_strings(obs.text or ""), s)[0])
     if got in (None, "modified"):
-        returned = _client_strings(obs.text or "", "returned")
+        returned = _current_texts(_client_strings(obs.text or "", "returned"), s)[0]
         if any(s.reply_sentinel in t for t in returned) or _leaks(s.reply_text, returned, s.modify_text):
             return "retained"
     return got
@@ -343,7 +343,7 @@ def classify(s: Scenario, bodies: list, obs) -> str:
         if obs.status is not None and obs.status >= 500:
             return "failed after send"
         reply = f"{s.reply_text} {s.reply_sentinel}"
-        if not any(reply in t for t in _client_strings(obs.text or "")):
+        if not any(reply in t for t in _current_texts(_client_strings(obs.text or ""), s)[0]):
             if _refused(obs):
                 return "blocked after send"
             return "altered"
@@ -383,7 +383,9 @@ def _order_flags(s: Scenario, mine: list, mev: list, tools: list) -> dict:
     out = {"provider_before_verdict_s": None, "tool_before_verdict_s": None}
     if s.stage != "input" or s.mode == "allow":
         return out
-    answered = [e["t_done"] for e in mine if e.get("t_done") and not e.get("stall")]
+    # When the answer started going out (not when the handler finished: the client may
+    # already be acting on it by then).
+    answered = [e.get("t_sent") or e["t_done"] for e in mine if e.get("t_done") and not e.get("stall")]
     verdict_t = min(answered) if answered else None
     for key, events in (("provider_before_verdict_s", mev), ("tool_before_verdict_s", tools)):
         if not events:
@@ -451,11 +453,21 @@ def _settle(model: MockModel, scanner: StandInScanner, quiet_s: float, max_s: fl
 
 
 def _owner_ids(text: str, run: str = "") -> set[str]:
-    return {sid for sid, r in _SENT.findall(text) if not r or not run or r == run}
+    return {sid for sid, r in _SENT.findall(text) if not run or r == run}
 
 
 def _foreign_ids(text: str, run: str) -> set[str]:
-    return {sid for sid, r in _SENT.findall(text) if run and r and r != run}
+    """Scenario ids marked with another run's id (or none, once this run has one)."""
+    return {sid for sid, r in _SENT.findall(text) if run and r != run}
+
+
+def _current_texts(texts: list[str], s: Scenario) -> tuple[list[str], int]:
+    """Drop strings carrying another run's marker and none of this scenario's: an answer
+    from a cache or a replay decides nothing, a leak or a stop. Returns (kept, dropped)."""
+    if not s.run:
+        return texts, 0
+    kept = [t for t in texts if not _foreign_ids(t, s.run) or s.id in _owner_ids(t, s.run)]
+    return kept, len(texts) - len(kept)
 
 
 def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
@@ -518,8 +530,12 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         for e in events:
             text = key(e)
             ids = _owner_ids(text, run_id)
-            if sid in _foreign_ids(text, run_id):  # another run's marker: a cache or replay
-                foreign_run[sid] = foreign_run.get(sid, 0) + 1
+            foreign = _foreign_ids(text, run_id)
+            if foreign and not ids:
+                # Another run's marker (a cache, a replay): never this run's evidence, and
+                # never charged by time window either. Noted where it touched the scenario.
+                if sid in foreign or windows[sid][0] <= e["t"] < nxt[sid]:
+                    foreign_run[sid] = foreign_run.get(sid, 0) + 1
                 continue
             if ids:
                 if ids == {sid}:
@@ -584,6 +600,8 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
                        "lossy_serialisation": "[object Object]" in (obs.text or ""),
                        "stop_kind": _stop_kind(obs),
                        "reply_without_provider_call": _reply_without_provider_call(s, mev, obs),
+                       "client_other_run_texts": (_current_texts(_client_strings(obs.text or ""), s)[1]
+                                                  + _current_texts(_client_strings(obs.text or "", "returned"), s)[1]),
                        "ambiguous_events": ambiguous.get(s.id, 0),
                        "other_run_events": foreign_run.get(s.id, 0),
                        "tool_runs": [{"t": round(e["t"] - t0, 3), "body": e["body"]} for e in tools_run],
@@ -640,22 +658,29 @@ def latency_sweep(adapter: Adapter, latencies: list[float], timeout_s: float = 2
     """Run the whole contract once per guard latency. Races between a check and the
     model call show only when the guard takes time; a result that changes with the
     latency is timing-dependent and is reported as unstable, never as one fixed verdict."""
+    if len(set(latencies)) != len(latencies):
+        raise ValueError("each latency once")
     runs = []
     for lat in latencies:
         adapter.scanner_latency_s = lat
         runs.append(run_contracts(adapter, timeout_s, **kw))
+    stability = _stability(latencies, runs)
+    for lat, run in zip(latencies, runs, strict=True):
+        run["judge_latency_s"] = lat
+    return {"latencies": latencies, "runs": runs, "stability": stability,
+            "unstable": sum(1 for x in stability if not x["stable"])}
+
+
+def _stability(latencies: list[float], runs: list[dict]) -> list[dict]:
     table: dict[tuple, dict] = {}
     for lat, run in zip(latencies, runs, strict=True):
         for r in run["results"]:
-            sc = r["scenario"]
-            key = (sc["stage"], sc["mode"], sc.get("role") or "")
+            sc = r["scenario"]  # the plan is the same for every latency: ids line up
+            key = (sc["id"], sc["stage"], sc["mode"], sc.get("role") or "", sc["lang"])
             table.setdefault(key, {})[str(lat)] = {"observed": r["observed"], "policy": r["policy"]}
-    stability = [{"stage": k[0], "mode": k[1], "role": k[2], "by_latency": v,
-                  "stable": len({x["policy"] for x in v.values()}) == 1
-                  and len({x["observed"] for x in v.values()}) == 1}
-                 for k, v in table.items()]
-    return {"latencies": latencies, "runs": runs, "stability": stability,
-            "unstable": sum(1 for x in stability if not x["stable"])}
+    return [{"id": k[0], "stage": k[1], "mode": k[2], "role": k[3], "lang": k[4], "by_latency": v,
+             "stable": len({x["policy"] for x in v.values()}) == 1 and len({x["observed"] for x in v.values()}) == 1}
+            for k, v in table.items()]
 
 
 def _judge(results: list[Result], adapter: Adapter) -> None:
@@ -691,9 +716,9 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
                     else "the connection failed without an HTTP response")
         if ev.get("ambiguous_events") and r.observed not in leaks:
             return "events carrying several scenarios' markers touched this scenario; a clean result is not proven"
-        if ev.get("other_run_events") and r.observed not in leaks:
+        if (ev.get("other_run_events") or ev.get("client_other_run_texts")) and r.observed not in leaks:
             return "events carrying another run's marker (a cached or replayed answer) touched this scenario"
-        if ev.get("reply_without_provider_call"):
+        if ev.get("reply_without_provider_call") and r.observed not in leaks:
             return ("the client got a reply although the model was never called for this scenario "
                     "(a cache or another run's answer?); the stop is not evidence")
         if ev.get("client_body_truncated") and r.observed not in leaks:
@@ -805,7 +830,7 @@ def _crash_not_block(r: Result) -> str | None:
     """A block control proves the integration acts on a verdict only if it ended unlike a
     crash: a server error is what an integration that cannot parse the answer returns."""
     st = r.evidence.get("client_status")
-    if r.scenario.mode == "block" and st is not None and st >= 500:
+    if r.scenario.mode == "block" and r.observed == "stopped" and st is not None and st >= 500:
         return (f"the block control ended in a server error ({st}): an integration that crashed on the "
                 "stand-in's answer cannot be told from one that blocked")
     return None

@@ -34,7 +34,8 @@ def test_another_runs_marker_is_foreign_and_not_evidence():
     assert _owner_ids("x GCL-U-i05-abc123 y", "abc123") == {"i05"}
     assert _owner_ids("x GCL-U-i05-def456 y", "abc123") == set()
     assert _foreign_ids("x GCL-U-i05-def456 y", "abc123") == {"i05"}
-    assert _owner_ids("tool GCL-T-i05", "abc123") == {"i05"}  # tool markers carry the id only
+    assert _owner_ids("tool GCL-T-i05", "abc123") == set()  # no run id: not this run's
+    assert _foreign_ids("tool GCL-T-i05", "abc123") == {"i05"}
     r = _r("input", "error", "stopped", False, other_run_events=1)
     _judge([*_controls(), r], _A())
     assert r.policy == "unverified"

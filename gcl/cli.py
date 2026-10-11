@@ -347,13 +347,16 @@ def enforce(
         lats = [float(x) for x in judge_latency.split(",") if x.strip()]
     except ValueError:
         raise typer.BadParameter("numbers in seconds, comma-separated", param_hint="--judge-latency") from None
+    if len(set(lats)) != len(lats) or any(x < 0 for x in lats):
+        raise typer.BadParameter("each latency once, none negative", param_hint="--judge-latency")
     try:
         if lats:
             from .enforce.contracts import latency_sweep
 
             sweep = latency_sweep(adapter, lats, timeout or adapter.default_timeout_s, progress=_say,
                                   only=set(scenario) or None)
-            run = sweep["runs"][-1]  # the slowest guard: where races show
+            slowest = max(range(len(lats)), key=lambda k: lats[k])  # where races show
+            run = sweep["runs"][slowest]
             run["latency_sweep"] = {k: v for k, v in sweep.items() if k != "runs"}
             run["latency_sweep"]["summaries"] = [r["summary"] for r in sweep["runs"]]
         else:
@@ -364,6 +367,8 @@ def enforce(
         raise typer.Exit(2) from None
     doc = R.envelope("enforce", {"integration": integration, "profile": profile})
     doc["enforce"] = run
+    if lats:  # every latency's full run is part of the record, not only the one shown
+        doc["enforce_by_latency"] = sweep["runs"]
     typer.echo(render_enforce(run))
     if out:
         _write_outputs(doc, out, _formats(format), render_html)
@@ -371,7 +376,11 @@ def enforce(
         extra = f" --spec {spec}" if spec else ""
         replay = (f"gcl enforce {integration} {flag} {where} --profile {profile}{extra} "
                   f"--timeout {run['timeout_s']:g}")
-        bundles = write_bundles(run, out, replay)
+        if lats:
+            bundles = [b for r in sweep["runs"] for b in write_bundles(
+                r, out / f"latency-{r['judge_latency_s']:g}", f"{replay} --judge-latency {r['judge_latency_s']:g}")]
+        else:
+            bundles = write_bundles(run, out, replay)
         typer.echo(f"\nReports: {out}/" + (f"  ({len(bundles)} repro bundle(s) in {out}/repro/)" if bundles else ""))
     sw = run.get("latency_sweep")
     if sw:

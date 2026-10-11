@@ -132,6 +132,16 @@ else is labelled.
   timeline and flagged; a gateway that races a parallel check against the model call holds
   at 0 s guard latency and leaks at 0.6 s, and the sweep reports it unstable — checked.
 
+## Review round 10 (tests/test_review_round10.py)
+- An independent adversarial review of the checks above found eight defects, each
+  reproduced and fixed: a 5xx block control that leaked was hidden as unverified; another
+  run's reply in a client body counted as a leak; another run's marker for a different
+  scenario fell back to time-window attribution; tool markers lacked the run id; the
+  cached-reply check erased a recorded tool run; the latency sweep kept only one run,
+  overwrote language controls in its table and replayed without the latency; "before the
+  guard answered" used handler completion instead of transmission. Each test fails on the
+  code before its fix — checked.
+
 ## Review pins (tests/test_review_pins.py)
 - Five earlier review fixes that had no test of their own are pinned: no output "refused"
   scenario for a single-listener guard; a slow stand-in answer keeps the configuration it

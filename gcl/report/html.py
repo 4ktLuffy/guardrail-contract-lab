@@ -218,6 +218,20 @@ def _receipt(rc: dict) -> str:
     return head + (f'<div class="warning"><b>Receipt problems</b><ul>{probs}</ul></div>' if probs else "")
 
 
+def _sweep(sw: dict) -> str:
+    if not sw:
+        return ""
+    rows = "".join(
+        f"<tr><td>{e(x['id'])}</td><td>{e(x['stage'])}</td><td>{e(x['mode'])}</td><td>{e(x['lang'])}</td><td>"
+        + "<br>".join(f"{e(k)} s: {e(v['observed'])} / {e(v['policy'])}" for k, v in x["by_latency"].items())
+        + "</td></tr>" for x in sw["stability"] if not x["stable"])
+    head = (f'<p class="{"warning" if sw["unstable"] else "sub"}"><b>Guard latency sweep</b> '
+            f'{e(sw["latencies"])} s: {sw["unstable"]} result(s) change with timing. The table below '
+            "shows the slowest run; every run is in the JSON record.</p>")
+    return head + (f"<div class='scroll'><table><tr><th>Id</th><th>Stage</th><th>Scanner</th><th>Lang</th>"
+                   f"<th>By latency</th></tr>{rows}</table></div>" if rows else "")
+
+
 def _enforce(sec: dict) -> str:
     i = sec["integration"]
     versions = ", ".join(f"{k} {v}" for k, v in i["versions"].items() if v)
@@ -233,6 +247,7 @@ def _enforce(sec: dict) -> str:
            + "</div>",
            _doc_source(i.get("documented_source") or {}),
            _receipt(sec.get("receipt") or {}),
+           _sweep(sec.get("latency_sweep") or {}),
            ("<div class='scroll'><table><tr><th>Stage</th><th>Scanner</th><th>Lang</th>"
            "<th>Expected</th><th>Observed</th><th>Policy</th><th>Docs</th><th>Evidence</th></tr>")]
     cls = {"held": "okc", "violated": "error", "unverified": "warning", "conforms": "okc",

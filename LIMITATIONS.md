@@ -121,8 +121,9 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   silent, the verdict says "unspecified".
 
 ## Checks on the tester (receipts and bracketing controls)
-- Every run carries a run id in every sentinel. An answer that carries another run's id
-  (an integration's cache, a replay) is not evidence, and a client reply with no model call
+- Every run carries a run id in every sentinel (user, reply, rewrite and tool markers). An
+  answer that carries another run's id, or no run id, (an integration's cache, a replay) is
+  not evidence for either a leak or a stop, and a client reply with no model call
   behind it makes a "stopped" unverified. A cache keyed on text without the markers that
   returns a *refusal* is not detected.
 - The receipt records gcl's commit, uncommitted and untracked files and a hash over its
@@ -149,8 +150,9 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   ran, client answered) and flags a provider call or tool run that came before the guard's
   answer. Times are gcl's clock at its own boundaries, not the integration's.
 - `--judge-latency 0,0.2,1` runs the whole contract once per guard latency and reports
-  results that change as unstable (a race); the report shows the slowest run in full. Each
-  latency is a full run, so the time multiplies.
+  results that change as unstable (a race); the report shows the slowest run in full, the
+  JSON keeps every run, and repro bundles go to one folder per latency. Each latency is a
+  full run, so the time multiplies.
 - `null_verdict` sets the verdict field to null (unknown and falsy) where the protocol's
   block answer is JSON; plain-text judges do not get it.
 

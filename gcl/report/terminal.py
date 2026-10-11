@@ -205,8 +205,8 @@ def render_enforce(run: dict) -> str:
         for x in sw["stability"]:
             if not x["stable"]:
                 by = ", ".join(f"{k} s: {v['observed']}/{v['policy']}" for k, v in x["by_latency"].items())
-                lines.append(c(f"  unstable  {x['stage']} {x['mode']}{' (' + x['role'] + ')' if x['role'] else ''}"
-                               f"  {by}", "warning"))
+                lines.append(c(f"  unstable  {x['id']} {x['stage']} {x['mode']} [{x['lang']}]"
+                               f"{' (' + x['role'] + ')' if x['role'] else ''}  {by}", "warning"))
     if run.get("known_issues"):
         refs = sorted(set(run["known_issues"].values()))
         lines.append(c("Known public issues for this integration: " + ", ".join(refs), "dim"))

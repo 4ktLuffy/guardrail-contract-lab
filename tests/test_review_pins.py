@@ -89,8 +89,9 @@ def test_an_agent_integration_must_run_the_probe_tool_on_the_input_allow_control
         return g.strict(msgs)
 
     def uses_tool(g, msgs):
-        if "GCL-U-i00" in msgs[0]["content"]:
-            _post_json(g.model.tool_url, {"note": "GCL-T-i00"})
+        tag = re.search(r"GCL-U-(i00(?:-[0-9a-f]{6})?)\b", msgs[0]["content"])
+        if tag:  # echo the tool marker the model would send: the scenario's full tag
+            _post_json(g.model.tool_url, {"note": f"GCL-T-{tag.group(1)}"})
         return g.strict(msgs)
 
     def notes(behave):

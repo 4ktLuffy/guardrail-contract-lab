@@ -62,35 +62,48 @@ def to_sarif(sec: dict) -> dict:
     }
 
 
-def enforce_sarif(run: dict, anchor: str) -> dict:
+def enforce_sarif(runs, anchor: str) -> dict:
     """One SARIF result per scenario that is not a clean hold: violated (error), deviating
     from the integration's own docs (warning), or unverified (note) — guessed results say
-    so. Enforcement has no source line, so every result points at `anchor`, a file in the
-    repository that names the integration under test (its spec or config)."""
-    i = run["integration"]
+    so. `runs` is one run or every run of a latency sweep (each result names its latency).
+    Enforcement has no source line, so every result points at `anchor`, a file in the
+    repository that names the integration under test; GitHub tells results apart by
+    `primaryLocationLineHash`, which is set from the scenario's identity."""
+    import hashlib
+
+    runs = runs if isinstance(runs, list) else [runs]
     rules, results = {}, []
-    for r in run["results"]:
-        s, ev = r["scenario"], r["evidence"]
-        if r["policy"] == "held" and r["documented"] != "deviates":
-            continue
-        rid = f"GCL-E-{s['stage']}-{s['mode']}"
-        rules.setdefault(rid, {"id": rid, "name": f"{s['stage']} {s['mode']}",
-                               "shortDescription": {"text": f"{s['stage']} stage, guard behaviour: {s['mode']}"}})
-        level = "error" if r["policy"] == "violated" else ("warning" if r["documented"] == "deviates" else "note")
-        guessed = " Rests on a guessed stand-in answer: confirm before reporting." \
-            if ev.get("confidence") == "guessed" else ""
-        msg = (f"{i['integration']} ({i['profile']}): {s['stage']} {s['mode']} [{s['lang']}] observed "
-               f"{r['observed']}, policy {r['policy']}, docs {r['documented']}.{guessed} "
-               + " ".join(r["notes"][:3]))
-        results.append({"ruleId": rid, "level": level, "message": {"text": msg.strip()},
-                        "partialFingerprints": {"gclScenario": f"{i['integration']}/{i['profile']}/{s['stage']}/"
-                                                               f"{s['mode']}/{s.get('role') or ''}/{s['lang']}"},
-                        "properties": {"observed": r["observed"], "policy": r["policy"],
-                                       "documented": r["documented"], "confidence": ev.get("confidence"),
-                                       "run_id": (run.get("receipt") or {}).get("run_id")},
-                        "locations": [{"physicalLocation": {"artifactLocation": {"uri": anchor},
-                                                            "region": {"startLine": 1}}}]})
-    sm = run["summary"]
+    for run in runs:
+        i, lat = run["integration"], run.get("judge_latency_s")
+        for r in run["results"]:
+            s, ev = r["scenario"], r["evidence"]
+            if r["policy"] == "held" and r["documented"] != "deviates":
+                continue
+            rid = f"GCL-E-{s['stage']}-{s['mode']}"
+            rules.setdefault(rid, {"id": rid, "name": f"{s['stage']} {s['mode']}",
+                                   "shortDescription": {"text": f"{s['stage']} stage, guard behaviour: {s['mode']}"}})
+            level = "error" if r["policy"] == "violated" else ("warning" if r["documented"] == "deviates" else "note")
+            ident = "/".join(str(x) for x in (i["integration"], i["profile"], s["stage"], s["mode"],
+                                              s.get("role") or "", s["lang"], s.get("attack") or "",
+                                              "" if lat is None else f"{lat:g}s"))
+            guessed = " Rests on a guessed stand-in answer: confirm before reporting." \
+                if ev.get("confidence") == "guessed" else ""
+            what = f"attack {s['attack']} " if s.get("attack") else ""
+            at = f" at guard latency {lat:g}s" if lat is not None else ""
+            msg = (f"{i['integration']} ({i['profile']}): {what}{s['stage']} {s['mode']} [{s['lang']}]{at} "
+                   f"observed {r['observed']}, policy {r['policy']}, docs {r['documented']}.{guessed} "
+                   + " ".join(r["notes"][:3]))
+            results.append({"ruleId": rid, "level": level, "message": {"text": msg.strip()},
+                            "partialFingerprints": {
+                                "primaryLocationLineHash": hashlib.sha256(ident.encode()).hexdigest()[:32],
+                                "gclScenario": ident},
+                            "properties": {"tags": ev.get("owasp") or [],
+                                           "observed": r["observed"], "policy": r["policy"],
+                                           "documented": r["documented"], "confidence": ev.get("confidence"),
+                                           "attack": s.get("attack") or None, "judge_latency_s": lat,
+                                           "run_id": (run.get("receipt") or {}).get("run_id")},
+                            "locations": [{"physicalLocation": {"artifactLocation": {"uri": anchor},
+                                                                "region": {"startLine": 1}}}]})
     return {
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
@@ -98,8 +111,10 @@ def enforce_sarif(run: dict, anchor: str) -> dict:
             "tool": {"driver": {"name": "guardrail-contract-lab", "version": __version__,
                                 "informationUri": "https://github.com/4ktLuffy/guardrail-contract-lab",
                                 "rules": list(rules.values())}},
-            "invocations": [{"executionSuccessful": sm["unverified"] < sm["scenarios"],
-                             "properties": {"receipt": run.get("receipt"), "summary": sm}}],
+            "invocations": [{"executionSuccessful": all(r["summary"]["unverified"] < r["summary"]["scenarios"]
+                                                        for r in runs),
+                             "properties": {"receipts": [r.get("receipt") for r in runs],
+                                            "summaries": [r["summary"] for r in runs]}}],
             "results": results,
         }],
     }

@@ -90,7 +90,7 @@ def test_a_recorded_reply_counts_only_for_the_request_shape_it_was_recorded_for(
     same, other, retry = _result("block", 1), _result("block", 3), _result("block_retry", 1)
     _stand_in_confidence([same, other, retry], adapter)
     assert same.evidence["confidence"] == "verified"
-    assert other.evidence["confidence"] == "guessed" and "messages=[3]" in other.notes[0]
+    assert other.evidence["confidence"] == "guessed" and "a request had 3" in other.notes[0]
     assert retry.evidence["confidence"] == "guessed" and "retry" in retry.notes[0]
 
 

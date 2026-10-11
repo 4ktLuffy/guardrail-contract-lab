@@ -34,13 +34,18 @@ def _round_robin(cases: list[dict], limit: int) -> list[dict]:
 
 def prepare(attacks_file: Path, detector_file: Path, faults: list[str], limit: int) -> dict:
     rows = load_cases(attacks_file)
-    attacks = _round_robin([c for c in rows if c.get("label") == 1], limit)
+    ids = [str(c["id"]) for c in rows]
+    if any(not i.strip() for i in ids) or len(set(ids)) != len(ids):
+        raise ValueError("case ids must be non-empty and distinct as text (1 and \"1\" are the same case)")
+    if len(set(faults)) != len(faults):
+        raise ValueError("each fault once")
+    attacks = [dict(c, id=str(c["id"])) for c in _round_robin([c for c in rows if c.get("label") == 1], limit)]
     if not attacks:
         raise ValueError(f"{attacks_file} has no attack rows (label 1)")
     manifest = load_adapter(detector_file)
     det = detect_with_adapter(manifest, attacks)
     flagged = {c["id"]: f for c, f in zip(attacks, det.flags, strict=True) if f is not None}
-    dropped = [c["id"] for c, f in zip(attacks, det.flags, strict=True) if f is None]
+    dropped = [str(c["id"]) for c, f in zip(attacks, det.flags, strict=True) if f is None]
     kept = [c for c in attacks if c["id"] in flagged]
     if not kept:
         raise ValueError(f"the detector answered none of the attacks ({det.note})")

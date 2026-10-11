@@ -164,6 +164,34 @@ else is labelled.
   passes its inputs as environment data, not script text — checked. Real run: LiteLLM
   1.104.2 against 1.105.0, `gcl compare`: no change — checked locally.
 
+## Blind spots, standards, table (tests/test_blind_spots.py, test_standards.py, test_table.py)
+- The default plan is unchanged with no `--extra`; a strict gateway holds every blind-spot
+  scenario; a gateway that streams the reply before the output check, one that checks only
+  the last message, and one that lets a repeated request skip the guard are each caught
+  — checked. Real run: LiteLLM 1.104.2 with all three: history and retry hold — checked
+  locally.
+- OWASP IDs per outcome (prompt injection, output handling, disclosure to the provider,
+  excessive agency, cascading failure, MCP intent/context) and in SARIF tags — checked.
+- A private table shows every result; a public one withholds every violation not covered
+  by a disclosed ledger finding and shows it once disclosed — checked; built from real
+  LiteLLM runs — checked locally.
+
+## New targets (tests/test_new_targets.py)
+- Coralogix guardrails-langchain 0.6.0 and LlamaFirewall 1.0.3 adapters: protocol shapes
+  and capabilities — checked; real runs with every control holding, including streaming,
+  history and retry for Coralogix — checked locally (opt-in `GCL_INTEG_CORALOGIX_ENV`,
+  `GCL_INTEG_LLAMAFIREWALL_PYTHON`), not in CI.
+- A timeout result that only followed gcl releasing the stalled call is unverified
+  (tests/test_tester_delivery.py) — checked; found on a real run.
+
+## Review round 13 (tests/test_review_round13.py)
+- A third independent review of the new parts found ten defects; each is fixed and
+  pinned, and each test fails on the code before its fix: disclosure scope, a summarised
+  history counted as a hold, release attribution of timeout leaks, history verdicts
+  bypassing stand-in confidence, a per-message guard counted as not consulted, retries
+  after a normal-answer refusal, OWASP tags without a leak, "fails open" for an over-block,
+  and drivers dropping the library's own evidence — checked.
+
 ## Findings ledger and severity (tests/test_tester_findings.py, test_tester_severity.py)
 - A finding comes only from a violated or deviating result in a stored run with a clean
   receipt; a repeat needs another run id; a different outcome contradicts it; confirmation
@@ -210,8 +238,8 @@ else is labelled.
   misattributed timeouts, rewrites that changed what a rule matches, unbounded
   subprocesses, overclaims — was fixed and pinned by a regression test
   (`tests/test_review_round*.py` and the suites above).
-- Local runs: 242 tests pass (plus 10 opt-in real-integration tests, run separately against
-  ten installed integrations) on Python 3.13.15 with Node 25.8.0; the demo runs
+- Local runs: 301 tests pass (plus 12 opt-in real-integration tests, run separately against
+  twelve installed integrations) on Python 3.13.15 with Node 25.8.0; the demo runs
   from an installed wheel outside the checkout.
 
 ## Not yet verified

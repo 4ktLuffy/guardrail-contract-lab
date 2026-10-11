@@ -13,31 +13,52 @@ import json
 from pathlib import Path
 
 
-def _run(path: Path) -> dict:
+def _runs(path: Path) -> list[dict]:
+    """Every run in a report: all latencies of a sweep, or the one run."""
     doc = json.loads(Path(path).read_text(encoding="utf-8"))
-    run = doc.get("enforce") or doc
-    if "results" not in run:
+    runs = doc.get("enforce_by_latency") or [doc.get("enforce") or doc]
+    if not all("results" in r for r in runs):
         raise ValueError(f"{path} is not a gcl enforce report")
-    return run
+    return runs
 
 
-def _key(r: dict) -> tuple:
+def _key(run: dict, r: dict) -> tuple:
     s = r["scenario"]
-    return (s["stage"], s["mode"], s.get("role") or "", s["lang"])
+    return (run.get("judge_latency_s"), s["stage"], s["mode"], s.get("role") or "", s["lang"], s.get("attack") or "")
+
+
+def _index(runs: list[dict], path) -> dict:
+    out: dict = {}
+    for run in runs:
+        for r in run["results"]:
+            k = _key(run, r)
+            if k in out:
+                raise ValueError(f"{path}: two scenarios share {k}; they cannot be matched safely")
+            out[k] = r
+    return out
+
+
+def _name(k: tuple) -> str:
+    lat, *rest = k
+    name = "/".join(str(x) for x in rest if x)
+    return f"{name} @{lat:g}s" if lat is not None else name
 
 
 def compare(old_path: Path, new_path: Path) -> dict:
-    old, new = _run(old_path), _run(new_path)
-    if (old["integration"]["integration"], old["integration"]["profile"]) != \
-            (new["integration"]["integration"], new["integration"]["profile"]):
+    old, new = _runs(old_path), _runs(new_path)
+    ids = {(r["integration"]["integration"], r["integration"]["profile"]) for r in old + new}
+    if len(ids) != 1:
         raise ValueError("the two reports are for different integrations or profiles")
-    a = {_key(r): r for r in old["results"]}
-    b = {_key(r): r for r in new["results"]}
-    out = {"old": {"versions": old["integration"].get("versions"), "run_id": (old.get("receipt") or {}).get("run_id")},
-           "new": {"versions": new["integration"].get("versions"), "run_id": (new.get("receipt") or {}).get("run_id")},
+    a, b = _index(old, old_path), _index(new, new_path)
+    lat_a = sorted({x.get("judge_latency_s") for x in old}, key=str)
+    lat_b = sorted({x.get("judge_latency_s") for x in new}, key=str)
+    out = {"old": {"versions": old[0]["integration"].get("versions"),
+                   "run_id": [(x.get("receipt") or {}).get("run_id") for x in old], "latencies": lat_a},
+           "new": {"versions": new[0]["integration"].get("versions"),
+                   "run_id": [(x.get("receipt") or {}).get("run_id") for x in new], "latencies": lat_b},
            "regressions": [], "fixes": [], "changed": [], "unverified_changes": [], "only_old": [], "only_new": []}
-    for k in sorted(set(a) | set(b)):
-        name = "/".join(x for x in k if x)
+    for k in sorted(set(a) | set(b), key=str):
+        name = _name(k)
         if k not in b:
             out["only_old"].append(name)
             continue
@@ -45,9 +66,9 @@ def compare(old_path: Path, new_path: Path) -> dict:
             out["only_new"].append(name)
             continue
         x, y = a[k], b[k]
-        row = {"scenario": name, "old": f"{x['observed']}/{x['policy']}", "new": f"{y['observed']}/{y['policy']}"}
         if x["policy"] == y["policy"] and x["observed"] == y["observed"]:
             continue
+        row = {"scenario": name, "old": f"{x['observed']}/{x['policy']}", "new": f"{y['observed']}/{y['policy']}"}
         if "unverified" in (x["policy"], y["policy"]):
             out["unverified_changes"].append(row)
         elif x["policy"] == "held" and y["policy"] == "violated":

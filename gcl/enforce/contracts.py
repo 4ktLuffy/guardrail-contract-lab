@@ -55,6 +55,7 @@ import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 from . import receipt as _rc
 from .adapters import Adapter
@@ -84,6 +85,7 @@ REDACTED = {"es": "[contenido retirado por la política]", "fr": "[contenu retir
             "hi": "[नीति के कारण सामग्री हटाई गई]"}
 
 POLICY = {"allow": "passed", "block": "stopped", "modify": "modified", **{f: "stopped" for f in FAULTS},
+          "history_block": "stopped",
           **{f: "stopped" for f in LATE_FAULTS},
           "judge_refusal": "stopped", "block_retry": "stopped", **{f: "stopped" for f in POLICY_FAULTS}}
 
@@ -108,6 +110,14 @@ class Scenario:
     # about it (None outside attack mode).
     attack: str = ""
     attack_flagged: bool | None = None
+    # Opt-in blind spots (`--extra`): the request streams its answer; the user turn sits
+    # earlier in the conversation, behind a benign follow-up turn.
+    stream: bool = False
+    history: bool = False
+
+    @property
+    def history_sentinel(self) -> str:
+        return f"GCL-H-{self._tag}"
 
     @property
     def phase(self) -> str:
@@ -144,7 +154,11 @@ class Result:
         return d
 
 
-def build_scenarios(adapter: Adapter, run: str = "") -> list[Scenario]:
+EXTRAS = ("stream", "history", "retry")
+FOLLOW_UP = "Thanks. Anything else?"
+
+
+def build_scenarios(adapter: Adapter, run: str = "", extra: tuple = ()) -> list[Scenario]:
     caps = adapter.capabilities
     # The input allow control always runs: it proves requests reach the model at all. An
     # integration that checks only the output gets no input block control or input faults.
@@ -176,10 +190,23 @@ def build_scenarios(adapter: Adapter, run: str = "") -> list[Scenario]:
         plan.append(("output", "modify", False))
     if null_expressible(proto):
         plan += [(st, "null_verdict", False) for st in ("input", "output") if st in caps]
+    # Opt-in blind spots, planned last so every earlier scenario keeps its id.
+    flags: dict[int, str] = {}
+    if "stream" in extra and "stream" in caps and "output" in caps:
+        for mode in ("block", "error"):
+            flags[len(plan)] = "stream"
+            plan.append(("output", mode, False))
+    if "history" in extra and "history" in caps and "input" in caps:
+        flags[len(plan)] = "history"
+        plan.append(("input", "history_block", False))
+    if "retry" in extra and "retry" not in caps and "input" in caps:
+        plan.append(("input", "block_retry", False))
     out = []
     for k, (stage, mode, control) in enumerate(plan):
         lang, user, reply = LANGS[k % len(LANGS)]
-        out.append(_scenario(k, stage, mode, lang, user, reply, run, "open" if control else ""))
+        sc = _scenario(k, stage, mode, lang, user, reply, run, "open" if control else "")
+        sc.stream, sc.history = flags.get(k) == "stream", flags.get(k) == "history"
+        out.append(sc)
     # After the last scenario: an allow control in every language a judged scenario used
     # that no opening allow covered (an integration that fails on a script after the
     # guard answered would otherwise read as "stopped"), the controls again (the setup
@@ -218,6 +245,11 @@ def build_attack_scenarios(adapter: Adapter, attacks: list[dict], flagged: dict,
     each attack language, so a failure on a script is not mistaken for a block."""
     if "input" not in adapter.capabilities:
         raise ValueError("attack mode sends attacks as user input: this integration checks only the output")
+    if len(set(faults)) != len(faults):
+        raise ValueError("each fault once: a repeated fault would hide one of its results")
+    ids = [str(c["id"]) for c in attacks]
+    if any(not i.strip() for i in ids) or len(set(ids)) != len(ids):
+        raise ValueError("attack ids must be non-empty and distinct as text (1 and \"1\" are the same attack)")
     replies = {lang: r for lang, _, r in LANGS}
     out = [s for s in build_scenarios(adapter, run) if s.phase == "open"]
     for case in attacks:
@@ -288,7 +320,7 @@ def _scenario(k: int, stage: str, mode: str, lang: str, user: str, reply: str, r
 # A scenario id, optionally followed by the run id. A marker without a run id belongs to
 # this run (the tool marker is built from the id alone); one with another run's id is
 # foreign — a cached or replayed answer — and is never evidence for this run.
-_SENT = re.compile(r"GCL-[UMRT]-([io]\d{2})(?:-([0-9a-f]{6}))?\b")
+_SENT = re.compile(r"GCL-[UMRTH]-([io]\d{2})(?:-([0-9a-f]{6}))?\b")
 
 
 def _strings(obj) -> list[str]:
@@ -315,20 +347,28 @@ def _client_strings(text: str, view: str = "answer") -> list[str]:
         if view == "returned":
             return _strings(doc.get("library_return"))
         return _strings({k: v for k, v in doc.items() if k != "library_return"})
-    if view == "returned":
-        return []
     if doc is not None:
-        return _strings(doc)
-    out, deltas = [text], []
+        return [] if view == "returned" else _strings(doc)
+    # An event stream: the deltas are the answer; an event carrying `library_return` is
+    # what the library handed its caller, kept apart like a JSON body's field.
+    out, deltas, returned = [], [], []
     for line in text.splitlines():
         if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]"):
             try:
                 chunk = json.loads(line[5:])
             except ValueError:
+                out.append(line)
+                continue
+            if isinstance(chunk, dict) and "library_return" in chunk:
+                returned += _strings(chunk["library_return"])
                 continue
             out += _strings(chunk)
-            for ch in chunk.get("choices") or []:
+            for ch in (chunk.get("choices") or []) if isinstance(chunk, dict) else []:
                 deltas.append(((ch.get("delta") or {}).get("content")) or "")
+        elif line.strip():
+            out.append(line)
+    if view == "returned":
+        return returned
     out.append("".join(deltas))
     return out
 
@@ -478,6 +518,23 @@ def _unlabelled(body, s: Scenario) -> bool:
                 or (s.modify_text and any(s.modify_text in t for t in texts)))
 
 
+def _call(adapter: Adapter, msg: list[dict], timeout_s: float, s: Scenario):
+    """One scenario's request: streamed if the scenario says so; a retry is the same
+    request twice (by the adapter if it can, else as two calls), every attempt kept."""
+    import inspect
+
+    params = inspect.signature(adapter.call).parameters
+    kw = {"stream": True} if s.stream else {}
+    if s.mode == "block_retry":
+        if "repeat" in params:
+            return adapter.call(msg, timeout_s, repeat=2, **kw)
+        first = adapter.call(msg, timeout_s, **kw)
+        second = adapter.call(msg, timeout_s, **kw)
+        second.attempts = [first, second]
+        return second
+    return adapter.call(msg, timeout_s, **kw)
+
+
 def _stop_kind(obs) -> str | None:
     """How the client's exchange ended, whatever reached the model."""
     if not obs.finished:
@@ -487,6 +544,22 @@ def _stop_kind(obs) -> str | None:
     if obs.status is not None and obs.status >= 500:
         return "server error"
     return "answer"
+
+
+def _after_release(s: Scenario, mine: list, mev: list, tools: list) -> bool:
+    """A timeout scenario whose outcome came only after gcl let go of a stalled guard call
+    (not after the integration gave up on it)."""
+    if s.mode != "timeout":
+        return False
+    released = [(e.get("stall") or {}).get("released_at") for e in mine
+                if (e.get("stall") or {}).get("ended") == "released by gcl"]
+    released = [t for t in released if t is not None]
+    outcome = [e["t"] for e in [*mev, *tools]]
+    if not released or not outcome:
+        return False
+    # A leak already shown before gcl let go of any stall stands; only an outcome that
+    # appeared entirely after a release is attributed to the closed connection.
+    return min(outcome) > min(released)
 
 
 def _reply_without_provider_call(s: Scenario, model_events: list, obs) -> bool:
@@ -546,14 +619,14 @@ def _current_texts(texts: list[str], s: Scenario) -> tuple[list[str], int]:
 
 def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
                   only: set[str] | None = None, settle_s: float = 0.6, run_id: str | None = None,
-                  attacks: dict | None = None) -> dict:
+                  attacks: dict | None = None, extra: tuple = ()) -> dict:
     """Run every scenario (or the controls plus `only`) against `adapter`. With
     `attacks` ({"cases", "flagged", "faults", "benign", "detector"}), run the attack × fault
     plan instead (see build_attack_scenarios)."""
     say = progress or (lambda *_: None)
     run_id = run_id or new_run_id()
     plan = (build_attack_scenarios(adapter, attacks["cases"], attacks["flagged"], attacks["faults"],
-                                   attacks["benign"], run_id) if attacks else build_scenarios(adapter, run_id))
+                                   attacks["benign"], run_id) if attacks else build_scenarios(adapter, run_id, extra))
     scenarios = [s for s in plan if not only or s.control or s.id in only]
     obs_by: dict[str, object] = {}
     windows: dict[str, tuple[float, float]] = {}
@@ -580,9 +653,11 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
                 scanner.configure({"input": "allow", "output": "allow", s.stage: served}, s.modify_text, sid=s.id)
                 model.reset(f"{s.reply_text} {s.reply_sentinel}")
                 msg = [{"role": "user", "content": f"{s.user_text} {s.user_sentinel}"}]
+                if s.history:  # the user turn is history now; a benign follow-up is the last message
+                    msg += [{"role": "assistant", "content": "OK."},
+                            {"role": "user", "content": f"{FOLLOW_UP} {s.history_sentinel}"}]
                 begin = time.monotonic()
-                obs_by[s.id] = (adapter.call(msg, timeout_s, repeat=2) if s.mode == "block_retry"
-                                else adapter.call(msg, timeout_s))
+                obs_by[s.id] = _call(adapter, msg, timeout_s, s)
                 # Hold the scenario's modes while the integration finishes reacting: a
                 # stalled scan is released (it closes unanswered), then we wait for quiet.
                 scanner.release_stalled()
@@ -636,9 +711,11 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         mev = [e for e in mev_all if not _unlabelled(e["body"], s)]
         unlabelled = len(mev_all) - len(mev)
         sev = owned(scanner_events, s.id, lambda e: e["body_text"])
-        sentinel = s.user_sentinel if s.stage == "input" else s.reply_sentinel
+        sentinel = (s.history_sentinel if s.history else
+                    s.user_sentinel if s.stage == "input" else s.reply_sentinel)
+        marks = (s.history_sentinel, s.user_sentinel) if s.history else (sentinel,)
         mine = [e for e in sev if e["valid"] and e["stage"] == s.stage
-                and sentinel in (e["scanned"] if e.get("scanned") is not None else e["body_text"])]
+                and any(m in (e["scanned"] if e.get("scanned") is not None else e["body_text"]) for m in marks)]
         # Only answers served with this scenario's own mode count: a late retry answered
         # by the next scenario's configuration is not evidence for this one.
         served = "block" if s.mode == "block_retry" else s.mode
@@ -654,7 +731,16 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         if isinstance(expect, (tuple, set, frozenset)):
             expect = sorted(expect)  # several outcomes the docs allow
         tools_run = owned(tool_events, s.id, lambda e: e["body"])
-        observed = client_outcome = classify(s, [e["body"] for e in mev], obs)
+        bodies = [e["body"] for e in mev]
+        history_transformed = False
+        if s.history:  # only requests that carried the earlier, blocked turn say anything about it
+            carried = [b for b in bodies if s.user_sentinel in json.dumps(b, ensure_ascii=False)
+                       or _leaks(s.user_text, _strings(b))]
+            # The conversation reached the model without the earlier turn in recognisable
+            # form: dropped, or summarised/rewritten. Which one is not known.
+            history_transformed = bool(bodies) and not carried
+            bodies = carried
+        observed = client_outcome = classify(s, bodies, obs)
         if tools_run and s.stage == "input" and s.mode != "allow":
             observed = "tool executed"  # the strongest evidence: a side effect happened
         w0, w1 = windows[s.id][0], nxt[s.id]
@@ -679,6 +765,8 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
                        "lossy_serialisation": "[object Object]" in (obs.text or ""),
                        "stop_kind": _stop_kind(obs),
                        "reply_without_provider_call": _reply_without_provider_call(s, mev, obs),
+                       "after_gcl_released_stall": _after_release(s, mine, mev, tools_run),
+                       "history_transformed": history_transformed,
                        "client_other_run_texts": (_current_texts(_client_strings(obs.text or ""), s)[1]
                                                   + _current_texts(_client_strings(obs.text or "", "returned"), s)[1]),
                        "ambiguous_events": ambiguous.get(s.id, 0),
@@ -718,6 +806,10 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
 
     _judge(results, adapter)
     _stand_in_confidence(results, adapter)
+    from ..standards import risks
+
+    for r in results:
+        r.evidence["owasp"] = risks(adapter.name, r.scenario.stage, r.scenario.mode, r.observed, r.policy)
     integration = adapter.describe()
     out = {
         "integration": integration,
@@ -798,6 +890,15 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
         if r.observed in ("no answer", "transport failure"):
             return ("no complete response before the client deadline" if r.observed == "no answer"
                     else "the connection failed without an HTTP response")
+        if ev.get("after_gcl_released_stall"):
+            # Even a leak: it followed gcl closing the stalled connection, so what the
+            # integration reacted to was a closed connection (the "error" path), not a
+            # guard that never answered. The timeout itself was never exercised.
+            return ("gcl released the stalled guard call before the integration gave up; what followed answers "
+                    "a closed connection, not a timeout (see the error scenario)")
+        if ev.get("history_transformed") and r.observed not in leaks:
+            return ("the conversation reached the model without the earlier turn in recognisable form (dropped, "
+                    "or summarised): whether its content was stopped is not proven")
         if ev.get("ambiguous_events") and r.observed not in leaks:
             return "events carrying several scenarios' markers touched this scenario; a clean result is not proven"
         if (ev.get("other_run_events") or ev.get("client_other_run_texts")) and r.observed not in leaks:
@@ -814,7 +915,7 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
         if s.mode == "block_retry":
             att = ev.get("attempts") or []
             first = att[0] if att else {}
-            if len(att) < 2 or not (first.get("status") is not None and 400 <= first["status"] < 500):
+            if len(att) < 2 or not _attempt_refused(first):
                 return "the first attempt was not a clean refusal, so the second is not a retry of a block"
             if not att[-1].get("finished") and r.observed not in leaks:
                 return "the retry got no complete answer"
@@ -914,11 +1015,12 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
 # the integration mishandled (or handled), or a verdict field the fault was aimed at. The
 # transport faults (error, timeout, malformed, empty, refused), wrong_schema (the whole
 # body replaced) and policy-source faults do not depend on it.
-SHAPE_DEPENDENT = ("allow", "block", "modify", "block_retry", "unknown_verdict", "verdict_type", "null_verdict")
+SHAPE_DEPENDENT = ("allow", "block", "modify", "block_retry", "unknown_verdict", "verdict_type", "null_verdict",
+                   "history_block")
 # Which verdict answers each shape-dependent mode is built from.
 _BUILT_FROM = {"allow": ("allow",), "block": ("block",), "modify": ("modify",), "block_retry": ("block",),
                "unknown_verdict": ("allow", "block"), "verdict_type": ("allow", "block"),
-               "null_verdict": ("allow", "block")}
+               "null_verdict": ("allow", "block"), "history_block": ("allow", "block")}
 
 
 def _stand_in_confidence(results: list[Result], adapter: Adapter) -> None:
@@ -943,16 +1045,11 @@ def _stand_in_confidence(results: list[Result], adapter: Adapter) -> None:
         why = None
         if recorded:
             served = "block" if s.mode == "block_retry" else s.mode
-            bodies = [e.get("body") for e in ev.get("scanner_events") or [] if e.get("mode") == served]
-            seen = {len(b["messages"]) for b in bodies if isinstance(b, dict) and isinstance(b.get("messages"), list)}
-            unsupported = sorted(set(shape) - {"messages"})
+            events = [e for e in ev.get("scanner_events") or [] if e.get("mode") == served]
             if s.mode == "block_retry":
                 why = f"the recorded reply was captured for {shape}, this scenario is a retry"
-            elif unsupported:
-                why = f"the recorded shape names fields gcl cannot check ({', '.join(unsupported)})"
-            elif not seen or seen != {shape.get("messages")}:
-                why = (f"the recorded reply was captured for {shape}, this request showed "
-                       f"{'no message list' if not seen else f'messages={sorted(seen)}'}")
+            else:
+                why = _shape_mismatch(shape, events)
             if why:
                 why += ": fields that depend on the request (locations, indexes) may not match the real vendor's"
         elif dependent and base in ("client_code", "guessed"):
@@ -961,6 +1058,45 @@ def _stand_in_confidence(results: list[Result], adapter: Adapter) -> None:
         ev["confidence"] = "guessed" if why else "verified"
         if why:
             r.notes.append(f"guessed — {why}; confirm against a recorded real reply before reporting")
+
+
+def _shape_mismatch(shape: dict, events: list[dict]) -> str | None:
+    """Why the requests this scenario's answers were served to are not positively shaped
+    like the recorded one (every request must match; None when they all do)."""
+    from urllib.parse import urlsplit
+
+    unsupported = sorted(set(shape) - {"messages", "content", "path", "method"})
+    if unsupported:
+        return f"the recorded shape names fields gcl cannot check ({', '.join(unsupported)})"
+    if "messages" not in shape:
+        return "the recorded reply has no message count to check requests against"
+    if shape.get("method", "POST") != "POST":
+        return f"the recorded reply answered a {shape['method']} request"
+    if not events:
+        return "no request was answered with the recorded reply"
+    for e in events:
+        b = e.get("body")
+        msgs = b.get("messages") if isinstance(b, dict) else None
+        if not isinstance(msgs, list):
+            return f"a request ({e.get('path')}) had no message list to compare with the recorded {shape}"
+        if len(msgs) != shape["messages"]:
+            return f"the recorded reply was captured for {shape['messages']} message(s), a request had {len(msgs)}"
+        kinds = [type(m.get("content")).__name__ if isinstance(m, dict) else type(m).__name__ for m in msgs]
+        if "content" in shape and kinds != shape["content"]:
+            return f"the recorded reply answered message contents {shape['content']}, a request had {kinds}"
+        if "path" in shape and urlsplit(str(e.get("path") or "")).path.rstrip("/") != shape["path"].rstrip("/"):
+            return f"the recorded reply answered {shape['path']}, a request went to {e.get('path')}"
+    return None
+
+
+def _attempt_refused(a: dict) -> bool:
+    """A recorded attempt that was refused: a 4xx, or an answer carrying the stand-in's
+    block reason (integrations that refuse with a normal reply)."""
+    if a.get("status") is not None and 400 <= a["status"] < 500:
+        return True
+    if not a.get("finished") or a.get("status") is None or a["status"] >= 500:
+        return False
+    return _refused(SimpleNamespace(status=a["status"], text=a.get("body") or ""))
 
 
 def _crash_not_block(r: Result) -> str | None:

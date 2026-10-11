@@ -151,9 +151,10 @@ class _Fake(ReferenceGateway):
                     self.close_connection = True
                     return
                 code, obj = res
-                b = json.dumps(obj, ensure_ascii=False).encode()
+                streamed = isinstance(obj, str)  # a server-sent event stream, written as given
+                b = obj.encode() if streamed else json.dumps(obj, ensure_ascii=False).encode()
                 self.send_response(code)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", "text/event-stream" if streamed else "application/json")
                 self.send_header("Content-Length", str(len(b)))
                 self.end_headers()
                 self.wfile.write(b)
@@ -508,7 +509,7 @@ def test_adapters_registry():
                              "invariant-mcp", "agno",
                              "openai-guardrails-js", "google-adk",
                              "lasso-mcp-gateway", "openai-agents-js",
-                             "semantic-kernel", "reference"}
+                             "semantic-kernel", "reference", "coralogix-langchain", "llamafirewall"}
 
 
 # Real integrations (opt-in): each points at an environment with the integration
@@ -525,6 +526,8 @@ def _env(name):
 
 
 REAL = [
+    ("GCL_INTEG_CORALOGIX_ENV", "coralogix-langchain", "default"),
+    ("GCL_INTEG_LLAMAFIREWALL_PYTHON", "llamafirewall", "default"),
     ("GCL_INTEG_PYTHON", "litellm", "default"), ("GCL_INTEG_PYTHON", "nemo", "default"),
     ("GCL_INTEG_PYTHON", "nemo-selfcheck", "default"), ("GCL_INTEG_PYTHON", "openai-guardrails", "pre_flight"),
     ("GCL_INTEG_NODE_ENV", "portkey", "fail_on_error"), ("GCL_INTEG_LANGCHAIN_PYTHON", "langchain-moderation", "error"),

@@ -8,9 +8,12 @@ allow and one recorded block answer into the `recorded` block of a vendor spec, 
 request shape they were captured for, so `gcl enforce` serves real answers and labels its
 results "recorded" instead of "guessed".
 
-What is never written to the file: request headers (credentials travel there), and any
-JSON field whose name looks like a secret (key, token, secret, password, authorization)
-— its value is replaced by "[redacted]" in both requests and responses.
+What is never written to the file: request and response headers (credentials and
+cookies travel there); the value of any field or query parameter whose name looks like a
+secret (key, token, secret, password, authorization, cookie, session ...), in JSON and
+form bodies, in the path and in error messages; and bodies that are neither JSON nor a
+form (they are replaced by a note of their size and type). The proxy itself forwards
+everything, headers included, both ways.
 """
 
 from __future__ import annotations
@@ -23,11 +26,12 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-SECRET = re.compile(r"(api[_-]?key|token|secret|password|authorization|credential|bearer)", re.I)
+SECRET = re.compile(r"(^key$|_key$|-key$|api[_-]?key|token|secret|passw|authori[sz]ation|credential|bearer|"
+                    r"cookie|session|signature|private)", re.I)
 HOP = {"host", "content-length", "connection", "keep-alive", "transfer-encoding", "accept-encoding",
-       "proxy-authorization", "te", "trailer", "upgrade"}
+       "proxy-authorization", "proxy-authenticate", "te", "trailer", "trailers", "upgrade"}
 
 
 def redact(obj):
@@ -39,19 +43,44 @@ def redact(obj):
     return obj
 
 
-def _decode(raw: bytes):
+def redact_url(path: str) -> str:
+    """A path or URL with secret-looking query parameters redacted."""
+    u = urlsplit(path)
+    if not u.query:
+        return path
+    q = [(k, "[redacted]" if SECRET.search(k) else v) for k, v in parse_qsl(u.query, keep_blank_values=True)]
+    return urlunsplit((u.scheme, u.netloc, u.path, urlencode(q), u.fragment))
+
+
+def redact_text(text: str) -> str:
+    """Secret-looking `name=value` pairs and URLs inside free text (error messages)."""
+    return re.sub(r"(?i)\b([\w-]*(?:key|token|secret|passw|session|signature)[\w-]*)=([^&\s'\"]+)",
+                  r"\1=[redacted]", text)
+
+
+def _decode(raw: bytes, ctype: str = ""):
+    """JSON, or a form as a dict, or — anything else — a note instead of the content."""
+    if not raw:
+        return None
     text = raw.decode("utf-8", "replace")
     try:
         return json.loads(text)
     except ValueError:
-        return text
+        pass
+    if "x-www-form-urlencoded" in ctype.lower() or re.fullmatch(r"[^=&\s]+=[^&\s]*(&[^=&\s]+=[^&\s]*)*", text):
+        return {"_form": dict(parse_qsl(text, keep_blank_values=True))}
+    return f"[omitted: {len(raw)} bytes of {ctype or 'unknown type'}]"
 
 
-def request_shape(body) -> dict:
-    """What a recorded reply depends on that gcl can check: the message count."""
+def request_shape(body, method: str = "POST", path: str = "/") -> dict:
+    """What a recorded reply may depend on, as far as gcl can check it: the endpoint, and
+    for a message list its length and the type of each message's content."""
+    shape = {"method": method, "path": urlsplit(path).path}
     if isinstance(body, dict) and isinstance(body.get("messages"), list):
-        return {"messages": len(body["messages"])}
-    return {}
+        shape["messages"] = len(body["messages"])
+        shape["content"] = [type(m.get("content")).__name__ if isinstance(m, dict) else type(m).__name__
+                            for m in body["messages"]]
+    return shape
 
 
 class RecordingProxy:
@@ -63,7 +92,9 @@ class RecordingProxy:
             raise ValueError(f"upstream must be an http(s) URL, got {upstream!r}")
         self.upstream, self.out, self.timeout_s = upstream.rstrip("/"), Path(out), timeout_s
         self._lock = threading.Lock()
-        self.count = 0
+        # Appending to an earlier recording continues its numbering: record numbers stay
+        # unique, so `to-spec --allow N` can never pick a record from another session.
+        self.count = max((r.get("n") or 0 for r in load(self.out)), default=0) if self.out.exists() else 0
         self.srv = ThreadingHTTPServer((host, port), self._handler())
         self.srv.daemon_threads = True
 
@@ -97,26 +128,30 @@ class RecordingProxy:
             def _forward(self):
                 raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
+                req_ctype = self.headers.get("Content-Type", "")
                 req = urllib.request.Request(outer.upstream + self.path, data=raw if raw else None,
                                              headers=headers, method=self.command)
                 try:
                     with urllib.request.urlopen(req, timeout=outer.timeout_s) as r:
-                        status, body, ctype = r.status, r.read(), r.headers.get("Content-Type", "")
+                        status, body, rheaders = r.status, r.read(), r.headers
                 except urllib.error.HTTPError as e:
-                    status, body, ctype = e.code, e.read(), e.headers.get("Content-Type", "")
+                    status, body, rheaders = e.code, e.read(), e.headers
                 except (urllib.error.URLError, OSError) as e:
-                    outer._write({"t": _now(), "method": self.command, "path": self.path,
-                                  "request": redact(_decode(raw)), "error": str(e)})
+                    outer._write({"t": _now(), "method": self.command, "path": redact_url(self.path),
+                                  "request": redact(_decode(raw, req_ctype)), "error": redact_text(str(e))})
                     self.send_response(502)
                     self.end_headers()
                     return
-                req_body = _decode(raw)
-                outer._write({"t": _now(), "method": self.command, "path": self.path,
-                              "request": redact(req_body), "request_shape": request_shape(req_body),
-                              "status": status, "response": redact(_decode(body))})
+                ctype = rheaders.get("Content-Type", "")
+                req_body = _decode(raw, req_ctype)
+                outer._write({"t": _now(), "method": self.command, "path": redact_url(self.path),
+                              "request": redact(req_body),
+                              "request_shape": request_shape(req_body, self.command, self.path),
+                              "status": status, "response": redact(_decode(body, ctype))})
                 self.send_response(status)
-                if ctype:
-                    self.send_header("Content-Type", ctype)
+                for k, v in rheaders.items():  # forwarded, never recorded
+                    if k.lower() not in HOP:
+                        self.send_header(k, v)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -138,6 +173,11 @@ def to_spec(records: list[dict], spec: dict, allow: int, block: int, upstream_no
     """Put recorded allow and block replies (by record number) into a copy of `spec`.
     Both must be successful JSON answers to requests of the same shape: a reply whose
     content depends on the request is only valid for requests like the one it answered."""
+    seen: set = set()
+    for r in records:
+        if r.get("n") in seen:
+            raise ValueError(f"record number {r.get('n')} appears twice: record each session into its own file")
+        seen.add(r.get("n"))
     by_n = {r.get("n"): r for r in records}
     picked = {}
     for name, n in (("allow", allow), ("block", block)):
@@ -150,7 +190,7 @@ def to_spec(records: list[dict], spec: dict, allow: int, block: int, upstream_no
             raise ValueError(f"record {n}'s answer had secret-looking fields redacted; it would not be the real reply")
         picked[name] = r
     shapes = {json.dumps(r.get("request_shape") or {}, sort_keys=True) for r in picked.values()}
-    if len(shapes) != 1 or not picked["block"].get("request_shape"):
+    if len(shapes) != 1 or "messages" not in (picked["block"].get("request_shape") or {}):
         raise ValueError("the allow and block records must answer requests of the same, known shape "
                          f"(got {[r.get('request_shape') for r in picked.values()]})")
     if picked["allow"]["response"] == picked["block"]["response"]:

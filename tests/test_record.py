@@ -66,10 +66,11 @@ def test_the_proxy_is_transparent_and_keeps_no_secrets(tmp_path):
     text = out.read_text()
     assert "sk-SECRET" not in text and "Authorization" not in text
     recs = load(out)
-    assert [r["n"] for r in recs] == [1, 2] and recs[1]["request_shape"] == {"messages": 1}
+    assert [r["n"] for r in recs] == [1, 2] and recs[1]["request_shape"] == SHAPE
     assert recs[0]["request"]["api_key"] == "[redacted]"
 
 
+SHAPE = {"method": "POST", "path": "/v1/check", "messages": 1, "content": ["str"]}
 SPEC = {"vendor": "acme", "requests": [{"path": "/v1/check"}], "allow_response": {"flagged": False},
         "block_response": {"flagged": True, "location": "messages.0"}}
 
@@ -78,14 +79,15 @@ def test_recorded_replies_become_a_spec_and_count_only_for_their_shape(tmp_path)
     out, _, _ = _record(tmp_path)
     spec = to_spec(load(out), SPEC, allow=1, block=2)
     proto = vendor_protocol(spec)
-    assert proto.recorded_modes == ("allow", "block") and proto.recorded_shape == {"messages": 1}
+    assert proto.recorded_modes == ("allow", "block") and proto.recorded_shape == SHAPE
     assert proto.verdicts["block"]({}, "")["seen_auth"] is True       # the real answer, not the guess
     adapter = SimpleNamespace(protocol=proto, harness_supplies_guard=False)
 
     def res(mode, n):
         served = "block" if mode == "block_retry" else mode
         return Result(Scenario("i01", "input", mode, "es", "u", "r"), "stopped", "stopped", None, policy="held",
-                      evidence={"scanner_events": [{"mode": served, "body": {"messages": [{}] * n}}]})
+                      evidence={"scanner_events": [{"mode": served, "path": "/v1/check",
+                                                    "body": {"messages": [{"content": "x"}] * n}}]})
 
     same, longer, retry = res("block", 1), res("block", 3), res("block_retry", 1)
     _stand_in_confidence([same, longer, retry], adapter)
@@ -100,7 +102,7 @@ def test_to_spec_refuses_records_that_cannot_stand_for_a_verdict(tmp_path):
         to_spec(recs, SPEC, allow=1, block=1)
     with pytest.raises(ValueError, match="no record"):
         to_spec(recs, SPEC, allow=1, block=9)
-    two = [*recs, dict(recs[1], n=3, request_shape={"messages": 2})]
+    two = [*recs, dict(recs[1], n=3, request_shape={**recs[1]["request_shape"], "messages": 2})]
     with pytest.raises(ValueError, match="same, known shape"):
         to_spec(two, SPEC, allow=1, block=3)
     failed = [*recs, dict(recs[1], n=4, status=500)]
@@ -122,4 +124,4 @@ def test_cli_to_spec(tmp_path):
     res = CliRunner().invoke(app, ["record", "to-spec", str(out), "--spec", str(spec), "--allow", "1",
                                    "--block", "2", "--out", str(tmp_path / "acme.recorded.json")])
     assert res.exit_code == 0, res.output
-    assert json.loads((tmp_path / "acme.recorded.json").read_text())["recorded"]["request_shape"] == {"messages": 1}
+    assert json.loads((tmp_path / "acme.recorded.json").read_text())["recorded"]["request_shape"] == SHAPE

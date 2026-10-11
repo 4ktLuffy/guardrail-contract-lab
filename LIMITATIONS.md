@@ -80,6 +80,14 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
     launcher because its plugin manager passes no config)
   - Agno `OpenAIModerationGuardrail` (input only)
   - the bundled reference gateway
+- LlamaFirewall returns a decision and leaves enforcement to the caller: gcl's driver
+  refuses on BLOCK and calls the model otherwise, as the README shows, so its results test
+  the library's decision under judge failures. Only the PII check is driven (the other
+  LLM scanners hard-code their endpoint). Coralogix is driven through `invoke` and
+  `stream` of a wrapped ChatOpenAI; its guard API is rebuilt from the client's schema, so
+  verdict-shape results are labelled guessed.
+- When gcl releases a stalled guard call (the scenario ended) and the integration only
+  then reacts, the timeout result is unverified: it reacted to a closed connection.
 - Where a framework ships no guard of its own (Pydantic AI, Google ADK, Semantic Kernel, Guardrails AI), the driver supplies the
   strictest guard (allow only on an explicit allow, raise on anything else), so those
   runs test the framework's enforcement, not a vendor's guard.
@@ -184,6 +192,23 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   two different gcl versions may plan different scenarios, listed as "only in old/new".
 - The GitHub Action and the version-watch workflow are tested for their structure, not run
   on GitHub from this repository.
+
+## Blind spots, standards, table
+- Streaming and history scenarios are opt-in and only for adapters that pass a message list
+  and a `stream` flag through (LiteLLM, Portkey, the reference gateway). A guard that sees
+  the earlier turn under a different text (summarised, truncated) still counts as "shown
+  the attack" only if the marker survives. Generic retry is two separate calls; it is
+  judged only after a first refusal (a 4xx, or an answer carrying the stand-in's block
+  reason).
+- The OWASP mapping is gcl's judgement, versioned per list, and names a risk only for
+  violated results; the lists themselves change.
+- A disclosure unhides exactly the finding's own scenario (stage, behaviour, role,
+  language, latency, stream/history, attack) on the versions its runs were made on;
+  other versions stay withheld until disclosed. Contradicted or retracted findings unhide
+  nothing.
+- A history scenario whose conversation reached the model without the earlier turn in
+  recognisable form (dropped or summarised) is unverified: gcl cannot tell a safe drop
+  from a summary of the blocked text.
 
 ## Findings ledger
 - Severity is a fixed, published rule over a few fields, not a CVSS score. "Documented"

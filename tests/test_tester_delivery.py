@@ -91,3 +91,25 @@ def test_a_truthiness_gateway_is_caught_by_null_verdict(tmp_path):
     run = run_contracts(_Fake(tmp_path, truthy), 5, settle_s=0.3)
     assert _by(run, "input", "unknown_verdict")["policy"] == "held"     # absorbed by accident
     assert _by(run, "input", "null_verdict")["policy"] == "violated"    # the twin it cannot absorb
+
+
+def test_a_leak_that_follows_gcl_releasing_a_stall_is_not_a_timeout_result(tmp_path):
+    # The integration waits on the guard far longer than the client; once gcl lets the
+    # stalled call go (the connection closes), it fails open. That is the error path, not
+    # a guard that timed out: the timeout scenario must not be credited with the leak.
+    def patient(g, m):
+        req = urllib.request.Request(g.scanner.base_for("input") + g.protocol.path, data=json.dumps(
+            {"texts": [m[0]["content"]], "input_type": "request"}).encode())
+        try:
+            v = json.loads(urllib.request.urlopen(req, timeout=120).read())
+        except Exception:
+            v = {"action": "NONE"}                       # any failure: let it through
+        if v.get("action") == "BLOCKED":
+            return 400, {"error": "blocked"}
+        reply = g.forward(m)
+        return 200, {"choices": [{"message": {"role": "assistant", "content": reply}}]}
+
+    run = run_contracts(_Fake(tmp_path, patient), 3, settle_s=0.3, only={"i05"})
+    r = _by(run, "input", "timeout")
+    assert r["evidence"]["after_gcl_released_stall"] is True
+    assert r["policy"] == "unverified" and any("closed connection" in n for n in r["notes"])

@@ -153,7 +153,8 @@ Drives a **real** guardrail integration end to end, offline: LiteLLM's proxy gua
 jailbreak-detection and self-check rails, openai-guardrails' LLM checks in Python and JavaScript (a small driver serves the
 library over HTTP), the Portkey gateway's webhook guardrails (Node: `--env DIR`), LangChain's
 OpenAI moderation middleware, Mastra's model-backed processors, the OpenAI Agents SDK (Python and JavaScript) with
-openai-guardrails' `GuardrailAgent`, Pydantic AI's harness guardrails, Google ADK's model callbacks, Semantic Kernel's filters, CrewAI's `LLMGuardrail`, Guardrails AI's `Guard` (Python API and RAIL), Invariant Gateway's MCP proxy and Lasso's
+openai-guardrails' `GuardrailAgent`, Pydantic AI's harness guardrails, Google ADK's model callbacks, Semantic Kernel's filters, CrewAI's `LLMGuardrail`, Guardrails AI's `Guard` (Python API and RAIL), Coralogix (Aporia) guardrails for LangChain models (`coralogix-langchain`, Node), Meta
+LlamaFirewall's LLM-judged PII check (`llamafirewall`), Invariant Gateway's MCP proxy and Lasso's
 mcp-gateway (gcl plays the MCP client and a mock MCP server, over HTTP or stdio), Agno's built-in guardrails, or the bundled
 reference gateway. A report notes when one request ran a tool more than once (retries that
 re-execute side effects). The Invariant MCP adapter also runs a retry scenario (the same
@@ -245,6 +246,28 @@ gcl record to-spec rec.jsonl --spec vendor.json --allow 1 --block 2 --out vendor
 The proxy forwards everything unchanged and never stores request headers; secret-looking
 JSON fields are redacted. The spec then serves the vendor's real answers, and results on
 them are "recorded", not "guessed" — for requests shaped like the recorded ones.
+
+#### Blind spots, opt-in
+
+`--extra stream,history,retry` adds, after the usual plan: output checks on a **streamed**
+answer (an output guard that blocks after the text was already streamed is a leak), the
+attack in an **earlier turn** behind a benign follow-up (a guard that checks only the last
+message is caught: the stand-in blocks only when it is shown the attack), and a blocked
+request **sent twice** for any integration. Streaming and history run where the adapter
+can send them (LiteLLM, Portkey, the reference gateway).
+
+#### Which OWASP risk a failure is evidence about
+
+Every violated result names the OWASP risks it is evidence about — OWASP Top 10 for LLM
+Applications 2025, Top 10 for Agentic Applications 2026, MCP Top 10 — in the report and
+as SARIF tags. The mapping is a short, explicit table ([gcl/standards.py](gcl/standards.py)).
+
+#### A compatibility table
+
+`gcl table RUNS/` turns a folder of reports into integration × guard behaviour × version.
+It is private by default (it shows everything). `--public --ledger L` shows a failure
+only if a finding in the ledger covers it and was marked disclosed
+(`gcl findings disclose ID --where URL`); every other failure prints as "withheld".
 
 #### In CI
 

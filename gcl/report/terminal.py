@@ -202,6 +202,8 @@ def render_enforce(run: dict) -> str:
                      f"observed {r['observed']}{tag}")
         for n in r["notes"]:
             lines.append(c(f"             {n}", "dim"))
+        if r["evidence"].get("owasp"):
+            lines.append(c(f"             OWASP: {', '.join(r['evidence']['owasp'])}", "dim"))
     sm = run["summary"]
     lines.append("")
     lines.append(f"Policy: {sm['policy_held']} held, {sm['policy_violated']} violated, {sm['unverified']} unverified "
@@ -225,7 +227,8 @@ def render_enforce(run: dict) -> str:
             lines.append(c(f"  {row['attack']:<22} [{row['lang']}] {'flagged' if row['flagged'] else 'missed '}  "
                            f"{cells}", kind))
         if am.get("dropped"):
-            lines.append(c(f"  the detector gave no answer for: {', '.join(am['dropped'])} (not sent)", "warning"))
+            lines.append(c(f"  the detector gave no answer for: {', '.join(map(str, am['dropped']))} (not sent)",
+                           "warning"))
     sw = run.get("latency_sweep")
     if sw:
         lines.append(f"Guard latency sweep {sw['latencies']} s: {sw['unstable']} result(s) change with timing"

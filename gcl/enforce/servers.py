@@ -521,7 +521,7 @@ class StandInScanner:
         # Snapshot everything the answer depends on now: the scenario this request belongs
         # to (by its markers) if known, else the current configuration.
         text = raw.decode("utf-8", "replace")
-        ids = set(re.findall(r"GCL-[UMRT]-([io]\d{2})\b", text))
+        ids = set(re.findall(r"GCL-[UMRTH]-([io]\d{2})\b", text))
         modes, modify_text = (self.by_sid[next(iter(ids))] if len(ids) == 1 and next(iter(ids)) in self.by_sid
                               else (self.modes, self.modify_text))
         mode = modes.get(stage, "allow") if valid else "rejected"
@@ -553,7 +553,13 @@ class StandInScanner:
             fn = proto.verdicts[name]
             return fn(body, modify_text, stage) if fn.__code__.co_argcount >= 3 else fn(body, modify_text)
 
-        if mode in VERDICTS:
+        if mode == "history_block":
+            # Blocks only when the guard is shown the earlier, attacking turn: a guard that
+            # checks just the last message lets the conversation through.
+            resp = verdict("block" if "GCL-U-" in ev["body_text"] else "allow")
+            ev["answered"] = resp
+            content(resp if isinstance(resp, str) else json.dumps(resp, ensure_ascii=False))
+        elif mode in VERDICTS:
             resp = verdict(mode)
             ev["answered"] = resp
             content(resp if isinstance(resp, str) else json.dumps(resp, ensure_ascii=False))
@@ -579,7 +585,7 @@ class StandInScanner:
                     if h is not None and _peer_gone(h):
                         ended = "integration gave up"
                         break
-                ev["stall"] = {"ended": ended, "s": round(time.monotonic() - t0, 3)}
+                ev["stall"] = {"ended": ended, "s": round(time.monotonic() - t0, 3), "released_at": time.monotonic()}
             finally:
                 with self._lock:
                     self.stalled -= 1

@@ -309,6 +309,9 @@ def enforce(
     judge_latency: str = typer.Option("", help="Comma-separated guard latencies in seconds (e.g. "
                                       "0,0.2,1): run the whole contract once per latency and report "
                                       "results that change with timing as unstable."),
+    extra: str = typer.Option("", help="Opt-in blind spots, comma-separated: stream (output checks on "
+                              "streamed answers), history (the attack in an earlier turn), retry (a "
+                              "blocked request sent twice)."),
     attacks: Path | None = typer.Option(None, exists=True, dir_okay=False,
                                         help="Attack mode: JSON-lines attack cases (rows with label 1). Each is "
                                              "sent with a real detector's verdict and under each fault."),
@@ -316,6 +319,9 @@ def enforce(
                                          help="Attack mode: a coverage adapter manifest for the real detector."),
     attack_faults: str = typer.Option("error,timeout", help="Attack mode: faults to send each attack under."),
     attack_limit: int = typer.Option(8, help="Attack mode: at most this many attacks (spread over languages)."),
+    attack_plan_file: Path | None = typer.Option(None, "--attack-plan", exists=True, dir_okay=False,
+                                                 help="Attack mode from a frozen plan (attacks and the detector's "
+                                                      "verdicts) written by an earlier run: replays exactly that."),
     sarif_anchor: str | None = typer.Option(None, help="With --format sarif: a repository file to attach "
                                             "results to (code scanning needs one; default: the spec)."),
     force: bool = typer.Option(False, help="Write into a non-empty --out folder (default: refuse, so "
@@ -358,8 +364,19 @@ def enforce(
         raise typer.BadParameter("numbers in seconds, comma-separated", param_hint="--judge-latency") from None
     if len(set(lats)) != len(lats) or any(x < 0 for x in lats):
         raise typer.BadParameter("each latency once, none negative", param_hint="--judge-latency")
+    from .enforce.contracts import EXTRAS
+
+    extras = tuple(x.strip() for x in extra.split(",") if x.strip())
+    if any(x not in EXTRAS for x in extras):
+        raise typer.BadParameter(f"choose from {', '.join(EXTRAS)}", param_hint="--extra")
     attack_plan = None
-    if attacks or detector:
+    if attack_plan_file:
+        import json
+
+        if attacks or detector:
+            raise typer.BadParameter("--attack-plan replaces --attacks and --detector", param_hint="--attack-plan")
+        attack_plan = json.loads(attack_plan_file.read_text(encoding="utf-8"))
+    elif attacks or detector:
         if not (attacks and detector):
             raise typer.BadParameter("attack mode needs both --attacks and --detector", param_hint="--attacks")
         from .enforce.attacks import prepare
@@ -383,14 +400,14 @@ def enforce(
             from .enforce.contracts import latency_sweep
 
             sweep = latency_sweep(adapter, lats, timeout or adapter.default_timeout_s, progress=_say,
-                                  only=set(scenario) or None)
+                                  only=set(scenario) or None, extra=extras)
             slowest = max(range(len(lats)), key=lambda k: lats[k])  # where races show
             run = sweep["runs"][slowest]
             run["latency_sweep"] = {k: v for k, v in sweep.items() if k != "runs"}
             run["latency_sweep"]["summaries"] = [r["summary"] for r in sweep["runs"]]
         else:
             run = run_contracts(adapter, timeout or adapter.default_timeout_s, progress=_say,
-                                only=set(scenario) or None)
+                                only=set(scenario) or None, extra=extras)
     except RuntimeError as e:
         typer.echo(f"error: {e}", err=True)
         raise typer.Exit(2) from None
@@ -398,23 +415,33 @@ def enforce(
     doc["enforce"] = run
     if lats:  # every latency's full run is part of the record, not only the one shown
         doc["enforce_by_latency"] = sweep["runs"]
-    typer.echo(render_enforce(run))
-    if out:
+    if out:  # the evidence is written before anything is rendered: a display bug cannot lose it
+        import json
+        import shlex
+
         _write_outputs(doc, out, _formats(format), render_html)
         if "sarif" in _formats(format):
             from .report.sarif import enforce_sarif
 
-            R.write_json(enforce_sarif(run, sarif_anchor or (str(spec) if spec else f"{integration}.gcl")),
+            R.write_json(enforce_sarif(sweep["runs"] if lats else run,
+                                       sarif_anchor or (str(spec) if spec else f"{integration}.gcl")),
                          out / "report.sarif")
         flag = "--env" if cls.runtime == "node" else "--python"
-        extra = f" --spec {spec}" if spec else ""
-        replay = (f"gcl enforce {integration} {flag} {where} --profile {profile}{extra} "
-                  f"--timeout {run['timeout_s']:g}")
+        extra_spec = f" --spec {shlex.quote(str(spec.resolve()))}" if spec else ""
+        replay = (f"gcl enforce {shlex.quote(integration)} {flag} {shlex.quote(str(Path(str(where)).resolve()))} "
+                  f"--profile {shlex.quote(profile)}{extra_spec} --timeout {run['timeout_s']:g}"
+                  + (f" --extra {','.join(extras)}" if extras else ""))
+        if attack_plan:  # the plan is frozen next to the report; a replay sends exactly it
+            frozen = out / "attack-plan.json"
+            frozen.write_text(json.dumps(attack_plan, ensure_ascii=False, indent=2), encoding="utf-8")
+            replay += f" --attack-plan {shlex.quote(str(frozen.resolve()))}"
         if lats:
             bundles = [b for r in sweep["runs"] for b in write_bundles(
                 r, out / f"latency-{r['judge_latency_s']:g}", f"{replay} --judge-latency {r['judge_latency_s']:g}")]
         else:
             bundles = write_bundles(run, out, replay)
+    typer.echo(render_enforce(run))
+    if out:
         typer.echo(f"\nReports: {out}/" + (f"  ({len(bundles)} repro bundle(s) in {out}/repro/)" if bundles else ""))
     sw = run.get("latency_sweep")
     if sw:
@@ -627,6 +654,35 @@ def compare(old: Path = typer.Argument(..., exists=True, dir_okay=False, help="E
     if json_out:
         json_out.write_text(json.dumps(d, ensure_ascii=False, indent=2))
     raise typer.Exit(1 if d["regressions"] else 0)
+
+
+@findings_app.command("disclose")
+def findings_disclose(ledger: Path, fid: str, where: str = typer.Option(..., help="Issue URL, advisory, or a "
+                                                                          "dated reference to the report.")):
+    """Mark a finding disclosed to its maintainers; only those appear in a public table."""
+    from . import findings as F
+
+    _, f = _ledger_do(ledger, lambda d: F.disclose(d, fid, where))
+    typer.echo(f"{f['id']} disclosed ({where})")
+
+
+@app.command()
+def table(runs: Path = typer.Argument(..., exists=True, file_okay=False, help="Folder of enforce reports."),
+          ledger: Path | None = typer.Option(None, exists=True, dir_okay=False, help="Findings ledger."),
+          public: bool = typer.Option(False, help="Show only violations of disclosed findings; withhold the rest."),
+          out: Path | None = typer.Option(None, help="Write the Markdown table here.")):
+    """Integration × guard behaviour × version, from stored runs. Private unless --public."""
+    import json
+
+    from .table import build, render
+
+    if public and ledger is None:
+        raise typer.BadParameter("a public table needs --ledger (to know what was disclosed)", param_hint="--public")
+    doc = json.loads(ledger.read_text()) if ledger else None
+    text = render(build(runs, doc, public))
+    if out:
+        out.write_text(text + "\n", encoding="utf-8")
+    typer.echo(text)
 
 
 # Last, so every command above is registered when run as `python -m gcl.cli`.

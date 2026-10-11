@@ -31,7 +31,9 @@ inputs:
     required: false
     default: policy
   extra-args:
-    description: Any other gcl enforce arguments (e.g. --judge-latency 0,1)
+    description: >
+      Any other gcl enforce arguments, ONE PER LINE (no shell quoting is interpreted; a
+      value with spaces is simply one line), e.g. "--judge-latency" then "0,1"
     required: false
     default: ""
 outputs:
@@ -59,5 +61,6 @@ runs:
               --format json,html,sarif --fail-on "$GCL_FAIL_ON")
         if [ -n "$GCL_ENV" ]; then args+=(--env "$GCL_ENV"); else args+=(--python "$GCL_PYTHON"); fi
         if [ -n "$GCL_SPEC" ]; then args+=(--spec "$GCL_SPEC"); fi
-        read -r -a extra <<< "$GCL_EXTRA"
+        extra=()
+        while IFS= read -r line; do [ -n "$line" ] && extra+=("$line"); done <<< "$GCL_EXTRA"
         gcl "${args[@]}" "${extra[@]}"

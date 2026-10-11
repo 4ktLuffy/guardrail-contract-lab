@@ -98,7 +98,8 @@ def _runs_in(report: Path) -> list[dict]:
 def _key(run: dict, r: dict) -> dict:
     i, s = run["integration"], r["scenario"]
     return {"integration": i["integration"], "profile": i["profile"], "stage": s["stage"], "mode": s["mode"],
-            "role": s.get("role") or "", "lang": s["lang"], "judge_latency_s": run.get("judge_latency_s")}
+            "role": s.get("role") or "", "lang": s["lang"], "judge_latency_s": run.get("judge_latency_s"),
+            "stream": bool(s.get("stream")), "history": bool(s.get("history")), "attack": s.get("attack") or ""}
 
 
 # Fields of a run's evidence that are derived from the report: `check` recomputes them all.
@@ -248,6 +249,20 @@ def confirm(doc: dict, fid: str, repro: Path, answer_source: str, note: str) -> 
     f["evidence_level"] = "end-to-end run + independent reproduction"
     _move(f, "confirmed", f"hand reproduction with {answer_source} answers: {note}")
     f["severity"] = S.score(f)
+    return f
+
+
+def disclose(doc: dict, fid: str, where: str) -> dict:
+    """Mark a finding as disclosed to its maintainers (where: an issue URL, an advisory,
+    a dated email reference). Only disclosed findings appear in a public table."""
+    f = _get(doc, fid)
+    if not where.strip():
+        raise LedgerError("say where it was disclosed (issue URL, advisory, dated reference)")
+    if f["status"] == "retracted":
+        raise LedgerError(f"{fid} is retracted")
+    f["disclosed"] = {"where": where, "at": _now()}
+    f["history"].append({"at": _now(), "from": f["status"], "to": f["status"], "why": f"disclosed: {where}",
+                         "runs": []})
     return f
 
 

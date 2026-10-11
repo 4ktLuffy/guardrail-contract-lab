@@ -111,6 +111,15 @@ else is labelled.
   scenarios' markers prevent a clean hold; the mock MCP server rejects unknown sessions
   and tools; JS drivers serialise exception state and results — checked.
 
+## Review pins (tests/test_review_pins.py)
+- Five earlier review fixes that had no test of their own are pinned: no output "refused"
+  scenario for a single-listener guard; a slow stand-in answer keeps the configuration it
+  arrived under, and quiet time counts from completion and tool runs; tool runs are
+  attributed by exact marker, then by time window, and agent runs need the probe tool to
+  fire; the JS drivers' serialiser keeps nested state, cycles and bigints; one deadline
+  covers a whole MCP session. Each test was run against the code before its fix and
+  failed there — checked.
+
 ## Independent review
 - Ten adversarial review rounds by independent models (nine by an OpenAI model, one by a
   separate Claude instance) before release. Every issue they reproduced — wrong verdicts,

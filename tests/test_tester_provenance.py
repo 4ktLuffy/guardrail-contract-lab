@@ -25,7 +25,7 @@ def test_every_built_in_stand_in_says_how_it_was_built():
         p = cls.protocol
         assert p.provenance in KINDS and p.provenance_source, name
     harness = {n for n, c in ADAPTERS.items() if c.harness_supplies_guard}
-    assert harness == {"pydantic-ai", "guardrails-ai", "google-adk", "semantic-kernel"}
+    assert harness == {"pydantic-ai", "guardrails-ai", "google-adk", "semantic-kernel", "contextforge"}
 
 
 class _Rebuilt(ReferenceGateway):

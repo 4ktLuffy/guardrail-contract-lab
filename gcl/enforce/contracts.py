@@ -154,7 +154,7 @@ class Result:
         return d
 
 
-EXTRAS = ("stream", "history", "retry")
+EXTRAS = ("stream", "history", "retry", "mcp")
 FOLLOW_UP = "Thanks. Anything else?"
 
 
@@ -625,6 +625,11 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
     plan instead (see build_attack_scenarios)."""
     say = progress or (lambda *_: None)
     run_id = run_id or new_run_id()
+    if "mcp" in extra and not adapter.mcp_transport:
+        from .adapters import ADAPTERS
+
+        raise ValueError(f"--extra mcp needs an MCP gateway: {adapter.name} has no MCP transport (try "
+                         + ", ".join(n for n, a in ADAPTERS.items() if a.mcp_transport) + ")")
     plan = (build_attack_scenarios(adapter, attacks["cases"], attacks["flagged"], attacks["faults"],
                                    attacks["benign"], run_id) if attacks else build_scenarios(adapter, run_id, extra))
     scenarios = [s for s in plan if not only or s.control or s.id in only]
@@ -634,6 +639,8 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
     started = time.time()
     t0 = time.monotonic()
     background: dict = {}
+    surfaces: list[dict] = []
+    mcp_error = ""
     with StandInScanner(adapter.protocol) as scanner, \
             MockModel("…", judge=scanner if adapter.protocol.shared_endpoint else None,
                       host=getattr(adapter, "model_host", "127.0.0.1")) as model:
@@ -666,11 +673,22 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
                 windows[s.id] = (begin, time.monotonic())
             scanner.release_stalled()
             _settle(model, scanner, settle_s, 10.0)  # catch late calls before the run ends
+            # The ordinary verdicts are read from this snapshot: unlabelled events are charged
+            # to a scenario by time window and the last window is open-ended, so the MCP
+            # surfaces' traffic (below) must not be visible to them.
+            model_events = list(model.events)
+            tool_events = list(model.tool_events)
+            scanner_events = list(scanner.events)
+            if "mcp" in extra:
+                from .mcp_surfaces import run_surfaces, unverified_surfaces
+
+                try:
+                    surfaces = run_surfaces(adapter, model, scanner, run_id, timeout_s, say, only=only)
+                except Exception as e:  # the ordinary results are already measured: keep them
+                    mcp_error = f"{type(e).__name__}: {e}"
+                    surfaces = unverified_surfaces(run_id, only, f"error: {mcp_error}")
         finally:
             adapter.stop()
-        model_events = list(model.events)
-        tool_events = list(model.tool_events)
-        scanner_events = list(scanner.events)
         config_files = adapter.config_files()
 
     starts = sorted((w[0], sid) for sid, w in windows.items())
@@ -817,13 +835,22 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         "timeout_s": timeout_s,
         "started_at": started,
         "results": [r.to_dict() for r in results],
-        "summary": _summary(results),
+        "summary": _summary(results, surfaces),
         "known_issues": getattr(adapter, "known_issues", {}),
         "config_files": config_files,
         "unattributed_scanner_events": sum(
             1 for e in scanner_events
             if not _owner_ids(e["body_text"], run_id) and not any(w[0] <= e["t"] < nxt[k] for k, w in windows.items())),
     }
+    if "mcp" in extra:
+        from .mcp_surfaces import PROTOCOL, summarize
+
+        _gate_surfaces(surfaces, results)
+        _label_surfaces(surfaces, adapter)
+        out["summary"] = _summary(results, surfaces)
+        out["results"] += surfaces
+        out["mcp_surfaces"] = {"summary": summarize(surfaces), "protocol": PROTOCOL,
+                               **({"error": mcp_error} if mcp_error else {})}
     if attacks:
         out["attack_matrix"] = {**attack_matrix(out["results"]), "detector": attacks.get("detector"),
                                 "faults": attacks["faults"], "dropped": attacks.get("dropped", [])}
@@ -959,13 +986,7 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
             why = "the input allow control did not hold, so nothing else is observable"
         verdict(r, why)
 
-    def usable(r: Result | None) -> bool:
-        """Usable as a control: it held the strict policy, or it did exactly what the
-        docs say for this configuration (e.g. a block that is documented to arrive after
-        the model call). Either way the integration is shown to act on verdicts."""
-        if r is not None and r.observed == "retained" and r.scenario.mode == "block" and r.policy != "unverified":
-            return True  # the answer was refused; the leftover is reported on the control itself
-        return r is not None and (r.policy == "held" or r.documented == "conforms")
+    usable = _usable
 
     def held(key) -> bool:
         return usable(controls.get(key))
@@ -986,7 +1007,7 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
     allow_langs = {r.scenario.lang for r in results
                    if r.scenario.phase in ("open", "lang") and r.scenario.stage == "input"
                    and r.scenario.mode == "allow" and usable(r)}
-    broken_close = [r for r in later if r.scenario.phase == "close" and not usable(r)]
+    broken_close = _broken_controls(results)[1]
     broken_observe = [r for r in later if r.scenario.phase == "observe" and not usable(r)]
 
     for r in results:
@@ -1011,6 +1032,38 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
         verdict(r, why or own_problem(r))
 
 
+def _usable(r: Result | None) -> bool:
+    """Usable as a control: it held the strict policy, or it did exactly what the docs say
+    for this configuration (e.g. a block that is documented to arrive after the model call).
+    Either way the integration is shown to act on verdicts."""
+    if r is not None and r.observed == "retained" and r.scenario.mode == "block" and r.policy != "unverified":
+        return True  # the answer was refused; the leftover is reported on the control itself
+    return r is not None and (r.policy == "held" or r.documented == "conforms")
+
+
+def _gate_surfaces(surfaces: list[dict], results: list[Result]) -> None:
+    """Surfaces are judged against the ordinary controls too, as _judge does for every
+    scenario: opening controls that are not usable put the whole setup in doubt, and closing
+    controls that broke mean the setup changed during the run (a proven leak survives that, a
+    clean result or "not carried" does not). Such rows become unverified, which also clears
+    their OWASP tags: no evidence either way."""
+    opening, closing = _broken_controls(results)
+    for d in surfaces:
+        if d["policy"] == "unverified" or not (opening or (d["policy"] in ("held", "n/a") and closing)):
+            continue
+        d["policy"] = d["documented"] = "unverified"
+        d["evidence"]["owasp"] = []
+        d["notes"].append("the ordinary opening controls did not hold: not evidence" if opening else
+                          "an ordinary control did not hold when repeated at the end of the run: not evidence")
+
+
+def _broken_controls(results: list[Result]) -> tuple[list[Result], list[Result]]:
+    """(opening controls that are not usable, closing controls that are not usable): what
+    _judge gates every scenario on, shared with the MCP surface results."""
+    return ([r for r in results if r.scenario.phase == "open" and not _usable(r)],
+            [r for r in results if r.scenario.phase == "close" and not _usable(r)])
+
+
 # Modes whose result depends on the exact shape of the stand-in's answer: a correct verdict
 # the integration mishandled (or handled), or a verdict field the fault was aimed at. The
 # transport faults (error, timeout, malformed, empty, refused), wrong_schema (the whole
@@ -1030,34 +1083,53 @@ def _stand_in_confidence(results: list[Result], adapter: Adapter) -> None:
     "guessed", held or violated alike: it says what this integration did with that
     answer, not what it does with the real vendor's."""
     proto = adapter.protocol
+    for r in results:
+        s = r.scenario
+        _label(adapter, r.evidence, r.notes, r.policy, s.mode in SHAPE_DEPENDENT or s.mode in proto.extra_faults,
+               _BUILT_FROM.get(s.mode), "block" if s.mode == "block_retry" else s.mode, s.mode == "block_retry")
+
+
+def _label_surfaces(surfaces: list[dict], adapter: Adapter) -> None:
+    """The same labelling for MCP surface result dicts: a control is answered allow, an attack
+    allow or block (mode surface_block), so both depend on the exact shape of those answers.
+    Harness-supplied guards (adapter.harness_supplies_guard) are labelled as the ordinary
+    path labels them."""
+    for d in surfaces:
+        control = bool(d["scenario"]["role"])
+        _label(adapter, d["evidence"], d["notes"], d["policy"] if d["policy"] != "n/a" else "unverified", True,
+               ("allow",) if control else ("allow", "block"), "allow" if control else "surface_block", False)
+
+
+def _label(adapter: Adapter, ev: dict, notes: list[str], policy: str, dependent: bool, built: tuple | None,
+           served: str, retry: bool) -> None:
+    """Set ev["stand_in"] and ev["confidence"]; a guess is also said in `notes`. `built`: the
+    verdict answers the scenario's stand-in answers are made of; `served`: the mode its
+    events carry; `dependent`: the result depends on the exact shape of those answers."""
+    proto = adapter.protocol
     harness = getattr(adapter, "harness_supplies_guard", False)
     base = "harness" if harness else proto.provenance
     shape = proto.recorded_shape or {}
-    for r in results:
-        s, ev = r.scenario, r.evidence
-        dependent = s.mode in SHAPE_DEPENDENT or s.mode in proto.extra_faults
-        recorded = (not harness and dependent and s.mode in _BUILT_FROM
-                    and all(m in proto.recorded_modes for m in _BUILT_FROM[s.mode]))
-        ev["stand_in"] = "recorded" if recorded else base
-        if r.policy == "unverified":
-            ev["confidence"] = None
-            continue
-        why = None
-        if recorded:
-            served = "block" if s.mode == "block_retry" else s.mode
-            events = [e for e in ev.get("scanner_events") or [] if e.get("mode") == served]
-            if s.mode == "block_retry":
-                why = f"the recorded reply was captured for {shape}, this scenario is a retry"
-            else:
-                why = _shape_mismatch(shape, events)
-            if why:
-                why += ": fields that depend on the request (locations, indexes) may not match the real vendor's"
-        elif dependent and base in ("client_code", "guessed"):
-            how = {"client_code": "not a real vendor reply", "guessed": "a guess"}[base]
-            why = f"the stand-in's answer is {how} ({proto.provenance_source})"
-        ev["confidence"] = "guessed" if why else "verified"
+    recorded = (not harness and dependent and built is not None
+                and all(m in proto.recorded_modes for m in built))
+    ev["stand_in"] = "recorded" if recorded else base
+    if policy == "unverified":
+        ev["confidence"] = None
+        return
+    why = None
+    if recorded:
+        events = [e for e in ev.get("scanner_events") or [] if e.get("mode") == served]
+        if retry:
+            why = f"the recorded reply was captured for {shape}, this scenario is a retry"
+        else:
+            why = _shape_mismatch(shape, events)
         if why:
-            r.notes.append(f"guessed — {why}; confirm against a recorded real reply before reporting")
+            why += ": fields that depend on the request (locations, indexes) may not match the real vendor's"
+    elif dependent and base in ("client_code", "guessed"):
+        how = {"client_code": "not a real vendor reply", "guessed": "a guess"}[base]
+        why = f"the stand-in's answer is {how} ({proto.provenance_source})"
+    ev["confidence"] = "guessed" if why else "verified"
+    if why:
+        notes.append(f"guessed — {why}; confirm against a recorded real reply before reporting")
 
 
 def _shape_mismatch(shape: dict, events: list[dict]) -> str | None:
@@ -1109,17 +1181,21 @@ def _crash_not_block(r: Result) -> str | None:
     return None
 
 
-def _summary(results: list[Result]) -> dict:
-    count = lambda key, val: sum(1 for r in results if getattr(r, key) == val)  # noqa: E731
+def _summary(results: list[Result], surfaces: list[dict] = ()) -> dict:
+    """Counts over the ordinary results and the MCP surface results (dicts): a violated
+    surface is a violation and an unverified one is unverified; "n/a" (the gateway does not
+    carry that surface) is neither."""
+    rows = [(r.policy, r.documented, r.evidence.get("confidence")) for r in results] + [
+        (d["policy"], d["documented"], d["evidence"].get("confidence")) for d in surfaces]
+    count = lambda i, val: sum(1 for row in rows if row[i] == val)  # noqa: E731
     return {
-        "scenarios": len(results),
-        "policy_held": count("policy", "held"),
-        "policy_violated": count("policy", "violated"),
-        "unverified": count("policy", "unverified"),
-        "guessed": sum(1 for r in results if r.evidence.get("confidence") == "guessed"),
-        "documented_deviates": count("documented", "deviates"),
-        "documented_unspecified_violations": sum(
-            1 for r in results if r.policy == "violated" and r.documented == "unspecified"),
+        "scenarios": len(rows),
+        "policy_held": count(0, "held"),
+        "policy_violated": count(0, "violated"),
+        "unverified": count(0, "unverified"),
+        "guessed": count(2, "guessed"),
+        "documented_deviates": count(1, "deviates"),
+        "documented_unspecified_violations": sum(1 for p, d, _ in rows if p == "violated" and d == "unspecified"),
     }
 
 
@@ -1133,7 +1209,7 @@ def write_bundles(run: dict, out: Path, replay: str = "") -> list[Path]:
     controls = [{"id": c["scenario"]["id"], "stage": c["scenario"]["stage"], "mode": c["scenario"]["mode"],
                  "observed": c["observed"], "policy": c["policy"]} for c in run["results"] if c["scenario"]["control"]]
     for r in run["results"]:
-        if r["policy"] == "held" and r["documented"] != "deviates":
+        if r["policy"] in ("held", "n/a") and r["documented"] != "deviates":
             continue
         s = r["scenario"]
         i = run["integration"]

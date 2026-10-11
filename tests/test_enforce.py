@@ -509,7 +509,8 @@ def test_adapters_registry():
                              "invariant-mcp", "agno",
                              "openai-guardrails-js", "google-adk",
                              "lasso-mcp-gateway", "openai-agents-js",
-                             "semantic-kernel", "reference", "coralogix-langchain", "llamafirewall"}
+                             "semantic-kernel", "reference", "reference-mcp", "coralogix-langchain", "llamafirewall",
+                             "contextforge"}
 
 
 # Real integrations (opt-in): each points at an environment with the integration

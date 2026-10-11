@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+**New**
+- `--extra mcp`: 16 MCP surfaces (tool results, errors, metadata, resources, prompts,
+  notifications, sampling, SSE, nested arguments, unlisted tools, batches), each with a
+  benign carry control that must arrive intact before the attack is judged.
+- `reference-mcp`: the bundled MCP reference gateway, profiles `naive` and `strict`.
+- A raw MCP client (standard library only) and mock MCP server surfaces: resources,
+  prompts, SSE, sampling, `list_changed`, batches. The stdio bridge forwards every message.
+- `surface_block` stand-in mode: blocks only text that carries an attack marker.
+- `invariant-mcp` and `lasso-mcp-gateway` run the surfaces.
+- `contextforge`: IBM ContextForge MCP gateway (profiles `default`, `enforce`, `ignore_error`,
+  `permissive`), with a gcl-supplied scanner plugin loaded through ContextForge's own plugin framework.
+- Surface results in the terminal, HTML, SARIF, `gcl compare`, `gcl table` and findings.
+
+**Standards**
+- OWASP MCP02:2025 and MCP03:2025 added to the mapping.
+
 ## 0.3.0
 
 gcl now checks the tester as well as the guardrail: a result it cannot back with evidence

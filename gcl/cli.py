@@ -311,7 +311,8 @@ def enforce(
                                       "results that change with timing as unstable."),
     extra: str = typer.Option("", help="Opt-in blind spots, comma-separated: stream (output checks on "
                               "streamed answers), history (the attack in an earlier turn), retry (a "
-                              "blocked request sent twice)."),
+                              "blocked request sent twice), mcp (MCP gateways: the baseline plus 16 more "
+                              "places a message can carry text, each run with a benign control and an attack)."),
     attacks: Path | None = typer.Option(None, exists=True, dir_okay=False,
                                         help="Attack mode: JSON-lines attack cases (rows with label 1). Each is "
                                              "sent with a real detector's verdict and under each fault."),
@@ -369,6 +370,10 @@ def enforce(
     extras = tuple(x.strip() for x in extra.split(",") if x.strip())
     if any(x not in EXTRAS for x in extras):
         raise typer.BadParameter(f"choose from {', '.join(EXTRAS)}", param_hint="--extra")
+    if "mcp" in extras and not cls.mcp_transport:
+        mcp_names = ", ".join(n for n, a in ADAPTERS.items() if a.mcp_transport)
+        raise typer.BadParameter(f"{integration} is not an MCP gateway; mcp surfaces run on: {mcp_names}",
+                                 param_hint="--extra")
     attack_plan = None
     if attack_plan_file:
         import json
@@ -408,7 +413,7 @@ def enforce(
         else:
             run = run_contracts(adapter, timeout or adapter.default_timeout_s, progress=_say,
                                 only=set(scenario) or None, extra=extras)
-    except RuntimeError as e:
+    except (RuntimeError, OSError) as e:  # OSError: URLError and friends from an adapter that failed to start
         typer.echo(f"error: {e}", err=True)
         raise typer.Exit(2) from None
     doc = R.envelope("enforce", {"integration": integration, "profile": profile})

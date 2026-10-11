@@ -99,7 +99,8 @@ def _key(run: dict, r: dict) -> dict:
     i, s = run["integration"], r["scenario"]
     return {"integration": i["integration"], "profile": i["profile"], "stage": s["stage"], "mode": s["mode"],
             "role": s.get("role") or "", "lang": s["lang"], "judge_latency_s": run.get("judge_latency_s"),
-            "stream": bool(s.get("stream")), "history": bool(s.get("history")), "attack": s.get("attack") or ""}
+            "stream": bool(s.get("stream")), "history": bool(s.get("history")), "attack": s.get("attack") or "",
+            **({"surface": s["id"]} if s.get("surface") else {})}  # an MCP surface: one finding per surface
 
 
 # Fields of a run's evidence that are derived from the report: `check` recomputes them all.
@@ -381,7 +382,8 @@ def render(doc: dict) -> str:
         k, last = f["key"], f["runs"][-1]
         vers = ", ".join(f"{a} {b}" for a, b in (last["versions"] or {}).items() if b)
         lines.append(f"| {f['id']} | {f['status']} | {f['title']} | {k['integration']} ({k['profile']}) | "
-                     f"{k['stage']} / {k['mode']}{' (' + k['role'] + ')' if k['role'] else ''} | "
+                     f"{k['stage']} / {k['mode']}{' ' + k['surface'] if k.get('surface') else ''}"
+                     f"{' (' + k['role'] + ')' if k['role'] else ''} | "
                      f"{last['observed']} / {last['policy']} | "
                      f"{'GUESSED ' if f['guessed'] else ''}{last['stand_in']} | {len(f['runs'])} | {vers} | "
                      f"{f['evidence_level']} | {_sev(f)} |")

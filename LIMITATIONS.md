@@ -74,8 +74,9 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
     CrewAI `LLMGuardrail`
     (output only)
   - Guardrails AI `Guard` (Python API and RAIL)
-  - Invariant Gateway MCP proxy (streamable HTTP with JSON responses; SSE and stdio
-    transports are not modelled)
+  - Invariant Gateway MCP proxy (streamable HTTP; the ordinary contract gets JSON replies,
+    and SSE replies are exercised only under `--extra mcp`, by m08, m11, m12 and m13; the
+    stdio transport is not modelled)
   - Lasso mcp-gateway `lasso` plugin (stdio MCP; the plugin's API URL is set by a
     launcher because its plugin manager passes no config)
   - Agno `OpenAIModerationGuardrail` (input only)
@@ -209,6 +210,35 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
 - A history scenario whose conversation reached the model without the earlier turn in
   recognisable form (dropped or summarised) is unverified: gcl cannot tell a safe drop
   from a summary of the blocked text.
+
+## MCP surfaces (`--extra mcp`)
+- Shapes of protocol versions 2025-03-26 to 2025-11-25 only. gcl negotiates 2025-03-26, while
+  some surfaces were introduced later (m02 `structuredContent` and `outputSchema` in
+  2025-06-18): a gateway that enforces the negotiated version may legitimately not carry
+  them, and the surface is then "not carried" (n/a), not a failure. The 2026-07-28 specification
+  (no `initialize`, no sessions, multi-round-trip requests in place of server-to-client
+  requests, sampling and logging deprecated) is not covered yet.
+- Encodings and obfuscation (zero-width characters, Unicode tags, base64) are not tested
+  here. They are a detector question for `gcl coverage`.
+- OAuth and authorization flows are not tested.
+- Tool pinning, a changed tool reaching the client unscanned, is seen only through m08.
+- Names of proxied tools, prompts and resources are read back from the same session's own
+  `tools/list`, `prompts/list` and `resources/list` (the entry ending in `gcl_probe` /
+  `gcl-probe`, `gcl_prompt`, `note`), with the adapter's `mcp_name` as the fallback when the
+  list is not a proper result. m15 uses `mcp_name` for its unlisted tool by design. A
+  proper list that does not show the item makes the surface "not carried".
+- The attack is judged on its marker. A gateway that forwards the sentence without the marker
+  is counted as "stopped" when the stand-in was shown it, and "dropped unscanned" otherwise.
+- The stdio adapter (`lasso-mcp-gateway`) starts a gateway per session.
+- `contextforge` caches a backend's tools, prompts and resources at registration; the adapter
+  re-registers the mock server when the surface or payload changes (provisioning, not a
+  scenario). Rate limiting is switched off so registration is not refused with 429. A block
+  arrives as HTTP 200 with `isError: true`, which the retry check does not read as a refusal:
+  `block_retry` is unverified there.
+- "not carried" is not a pass. It means the gateway did not carry the surface at all, so no
+  claim is made about its scanning. The attack is not sent in that case.
+- Real-gateway surface runs are opt-in (`GCL_INTEG_INVARIANT_PYTHON`, `GCL_INTEG_LASSO_PYTHON`)
+  and are not in CI.
 
 ## Findings ledger
 - Severity is a fixed, published rule over a few fields, not a CVSS score. "Documented"

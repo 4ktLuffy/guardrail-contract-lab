@@ -104,6 +104,10 @@ class Scenario:
     # language no opening control used), "observe" (an allow with a long reply: the
     # driver must pass the whole answer). "" for an ordinary scenario.
     role: str = ""
+    # Attack mode: the attack case this scenario sends, and what the real detector said
+    # about it (None outside attack mode).
+    attack: str = ""
+    attack_flagged: bool | None = None
 
     @property
     def phase(self) -> str:
@@ -201,6 +205,76 @@ def build_scenarios(adapter: Adapter, run: str = "") -> list[Scenario]:
 
 
 OBSERVE_CHARS = 6000  # past the 300- and 2000-character cuts drivers have had
+REPLY_FALLBACK = "Here is the summary of the document."
+MAX_SCENARIOS = 100  # scenario ids are two digits
+
+
+def build_attack_scenarios(adapter: Adapter, attacks: list[dict], flagged: dict, faults: list[str],
+                           benign: dict[str, str], run: str = "") -> list[Scenario]:
+    """Attack × fault: every attack case is sent once with the stand-in answering what a
+    real detector decided about that text (block if it flagged it, allow if it missed it),
+    and once per fault (the guard is down or misbehaves while a real attack is in flight).
+    The usual controls open and close the run; the language controls use a benign text in
+    each attack language, so a failure on a script is not mistaken for a block."""
+    if "input" not in adapter.capabilities:
+        raise ValueError("attack mode sends attacks as user input: this integration checks only the output")
+    replies = {lang: r for lang, _, r in LANGS}
+    out = [s for s in build_scenarios(adapter, run) if s.phase == "open"]
+    for case in attacks:
+        lang = str(case.get("lang") or "en")
+        for cond in ["verdict", *faults]:
+            mode = ("block" if flagged[case["id"]] else "allow") if cond == "verdict" else cond
+            s = _scenario(len(out), "input", mode, lang, case["text"], replies.get(lang, REPLY_FALLBACK), run, "")
+            s.attack, s.attack_flagged = str(case["id"]), flagged[case["id"]]
+            out.append(s)
+    tail = [("input", "allow", lang, "lang") for lang in dict.fromkeys(str(c.get("lang") or "en") for c in attacks)
+            if lang in benign]
+    tail.append(("input", "block", "es", "close"))
+    if "output" in adapter.capabilities:
+        tail += [("output", "allow", "fr", "close"), ("output", "block", "pt", "close")]
+    texts = {lang: (u, r) for lang, u, r in LANGS}
+    for stage, mode, lang, role in tail:
+        user, reply = (benign[lang], replies.get(lang, REPLY_FALLBACK)) if role == "lang" else texts[lang]
+        out.append(_scenario(len(out), stage, mode, lang, user, reply, run, role))
+    user, reply = texts["es"]
+    out.append(_scenario(len(out), "input", "allow", "es", user,
+                         " ".join([reply] * (OBSERVE_CHARS // len(reply) + 1)), run, "observe"))
+    if len(out) > MAX_SCENARIOS:
+        raise ValueError(f"{len(out)} scenarios; at most {MAX_SCENARIOS}: use fewer attacks or faults")
+    return out
+
+
+def attack_matrix(results: list[dict]) -> dict:
+    """One row per attack case: what the detector said, and what reached the model with a
+    healthy guard and under each fault. Cells: enforced, NOT ENFORCED (the detector flagged
+    it and it still reached the model), missed (the detector let it through — a detector
+    problem, not an enforcement one), stopped / LEAKED under a fault, or unverified."""
+    rows: dict[str, dict] = {}
+    for r in results:
+        s = r["scenario"]
+        if not s.get("attack"):
+            continue
+        row = rows.setdefault(s["attack"], {"attack": s["attack"], "lang": s["lang"], "flagged": s["attack_flagged"],
+                                            "text": s["user_text"][:80], "cells": {}})
+        leaked = r["observed"] in ("passed", "altered", "blocked after send", "failed after send",
+                                   "tool executed", "retained")
+        if r["policy"] == "unverified":
+            cell = "unverified"
+        elif s["mode"] in ("block", "allow"):
+            cell = ("NOT ENFORCED" if leaked else "enforced") if s["attack_flagged"] else \
+                ("missed" if leaked else "missed, stopped anyway")
+        else:
+            cell = "LEAKED" if leaked else "stopped"
+        row["cells"]["verdict" if s["mode"] in ("block", "allow") else s["mode"]] = cell
+    rows_l = list(rows.values())
+    count = lambda pred: sum(1 for x in rows_l for k, v in x["cells"].items() if pred(k, v))  # noqa: E731
+    return {"rows": rows_l, "summary": {
+        "attacks": len(rows_l),
+        "detected": sum(1 for x in rows_l if x["flagged"]),
+        "detected_not_enforced": count(lambda k, v: k == "verdict" and v == "NOT ENFORCED"),
+        "missed_by_detector": count(lambda k, v: k == "verdict" and v.startswith("missed")),
+        "leaked_under_fault": count(lambda k, v: k != "verdict" and v == "LEAKED"),
+        "unverified": count(lambda k, v: v == "unverified")}}
 
 
 def _scenario(k: int, stage: str, mode: str, lang: str, user: str, reply: str, run: str, role: str) -> Scenario:
@@ -471,11 +545,16 @@ def _current_texts(texts: list[str], s: Scenario) -> tuple[list[str], int]:
 
 
 def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
-                  only: set[str] | None = None, settle_s: float = 0.6, run_id: str | None = None) -> dict:
-    """Run every scenario (or the controls plus `only`) against `adapter`."""
+                  only: set[str] | None = None, settle_s: float = 0.6, run_id: str | None = None,
+                  attacks: dict | None = None) -> dict:
+    """Run every scenario (or the controls plus `only`) against `adapter`. With
+    `attacks` ({"cases", "flagged", "faults", "benign", "detector"}), run the attack × fault
+    plan instead (see build_attack_scenarios)."""
     say = progress or (lambda *_: None)
     run_id = run_id or new_run_id()
-    scenarios = [s for s in build_scenarios(adapter, run_id) if not only or s.control or s.id in only]
+    plan = (build_attack_scenarios(adapter, attacks["cases"], attacks["flagged"], attacks["faults"],
+                                   attacks["benign"], run_id) if attacks else build_scenarios(adapter, run_id))
+    scenarios = [s for s in plan if not only or s.control or s.id in only]
     obs_by: dict[str, object] = {}
     windows: dict[str, tuple[float, float]] = {}
     unsettled: set[str] = set()
@@ -640,7 +719,7 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
     _judge(results, adapter)
     _stand_in_confidence(results, adapter)
     integration = adapter.describe()
-    return {
+    out = {
         "integration": integration,
         "receipt": {**_receipt(adapter, integration, run_id, timeout_s), "background_before_run": background},
         "timeout_s": timeout_s,
@@ -653,6 +732,10 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
             1 for e in scanner_events
             if not _owner_ids(e["body_text"], run_id) and not any(w[0] <= e["t"] < nxt[k] for k, w in windows.items())),
     }
+    if attacks:
+        out["attack_matrix"] = {**attack_matrix(out["results"]), "detector": attacks.get("detector"),
+                                "faults": attacks["faults"], "dropped": attacks.get("dropped", [])}
+    return out
 
 
 def latency_sweep(adapter: Adapter, latencies: list[float], timeout_s: float = 20.0, **kw) -> dict:

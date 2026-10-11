@@ -309,6 +309,15 @@ def enforce(
     judge_latency: str = typer.Option("", help="Comma-separated guard latencies in seconds (e.g. "
                                       "0,0.2,1): run the whole contract once per latency and report "
                                       "results that change with timing as unstable."),
+    attacks: Path | None = typer.Option(None, exists=True, dir_okay=False,
+                                        help="Attack mode: JSON-lines attack cases (rows with label 1). Each is "
+                                             "sent with a real detector's verdict and under each fault."),
+    detector: Path | None = typer.Option(None, exists=True, dir_okay=False,
+                                         help="Attack mode: a coverage adapter manifest for the real detector."),
+    attack_faults: str = typer.Option("error,timeout", help="Attack mode: faults to send each attack under."),
+    attack_limit: int = typer.Option(8, help="Attack mode: at most this many attacks (spread over languages)."),
+    sarif_anchor: str | None = typer.Option(None, help="With --format sarif: a repository file to attach "
+                                            "results to (code scanning needs one; default: the spec)."),
     force: bool = typer.Option(False, help="Write into a non-empty --out folder (default: refuse, so "
                                "reports and repro bundles of different runs never mix)."),
 ):
@@ -349,8 +358,28 @@ def enforce(
         raise typer.BadParameter("numbers in seconds, comma-separated", param_hint="--judge-latency") from None
     if len(set(lats)) != len(lats) or any(x < 0 for x in lats):
         raise typer.BadParameter("each latency once, none negative", param_hint="--judge-latency")
+    attack_plan = None
+    if attacks or detector:
+        if not (attacks and detector):
+            raise typer.BadParameter("attack mode needs both --attacks and --detector", param_hint="--attacks")
+        from .enforce.attacks import prepare
+        from .enforce.servers import FAULTS
+
+        afaults = [f.strip() for f in attack_faults.split(",") if f.strip()]
+        if any(f not in FAULTS for f in afaults):
+            raise typer.BadParameter(f"choose from {', '.join(FAULTS)}", param_hint="--attack-faults")
+        try:
+            attack_plan = prepare(attacks, detector, afaults, attack_limit)
+        except ValueError as e:
+            typer.echo(f"error: {e}", err=True)
+            raise typer.Exit(2) from None
     try:
-        if lats:
+        if lats and attack_plan:
+            raise typer.BadParameter("use --judge-latency or attack mode, not both", param_hint="--judge-latency")
+        if attack_plan:
+            run = run_contracts(adapter, timeout or adapter.default_timeout_s, progress=_say,
+                                only=set(scenario) or None, attacks=attack_plan)
+        elif lats:
             from .enforce.contracts import latency_sweep
 
             sweep = latency_sweep(adapter, lats, timeout or adapter.default_timeout_s, progress=_say,
@@ -372,6 +401,11 @@ def enforce(
     typer.echo(render_enforce(run))
     if out:
         _write_outputs(doc, out, _formats(format), render_html)
+        if "sarif" in _formats(format):
+            from .report.sarif import enforce_sarif
+
+            R.write_json(enforce_sarif(run, sarif_anchor or (str(spec) if spec else f"{integration}.gcl")),
+                         out / "report.sarif")
         flag = "--env" if cls.runtime == "node" else "--python"
         extra = f" --spec {spec}" if spec else ""
         replay = (f"gcl enforce {integration} {flag} {where} --profile {profile}{extra} "
@@ -415,8 +449,6 @@ def main():  # pragma: no cover
     app()
 
 
-if __name__ == "__main__":  # pragma: no cover
-    app()
 
 
 # --------------------------------------------------------------------------- findings
@@ -528,3 +560,75 @@ def findings_override(ledger: Path, fid: str, score: int = typer.Option(...), re
 
     _, f = _ledger_do(ledger, lambda d: F.override(d, fid, score, reason))
     typer.echo(f"{f['id']} computed {f['severity']['score']}, overridden {score}")
+
+
+# --------------------------------------------------------------------------- record
+record_app = typer.Typer(no_args_is_help=True, help="Capture real vendor replies for stand-in specs.")
+app.add_typer(record_app, name="record")
+
+
+@record_app.command("serve")
+def record_serve(upstream: str = typer.Option(..., help="The real vendor's base URL."),
+                 out: Path = typer.Option(..., help="JSON-lines file to append exchanges to."),
+                 port: int = typer.Option(8899, help="Local port; point the integration here.")):
+    """Forward everything to the vendor and record each exchange (no request headers,
+    secret-looking fields redacted). Stop with Ctrl-C."""
+    import time
+
+    from .record import RecordingProxy
+
+    with RecordingProxy(upstream, out, port=port) as p:
+        typer.echo(f"recording {upstream} at {p.url} into {out} (Ctrl-C to stop)")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            typer.echo(f"\n{p.count} exchange(s) recorded")
+
+
+@record_app.command("to-spec")
+def record_to_spec(records: Path = typer.Argument(..., exists=True, dir_okay=False),
+                   spec: Path = typer.Option(..., exists=True, dir_okay=False, help="The vendor spec to extend."),
+                   allow: int = typer.Option(..., help="Record number of a real allow answer."),
+                   block: int = typer.Option(..., help="Record number of a real block answer."),
+                   out: Path = typer.Option(..., help="Where to write the spec with recorded replies.")):
+    """Put a recorded allow and block answer into a vendor spec ("recorded" block)."""
+    import json
+
+    from .record import load, to_spec
+
+    try:
+        new = to_spec(load(records), json.loads(spec.read_text()), allow, block)
+    except ValueError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2) from None
+    out.write_text(json.dumps(new, ensure_ascii=False, indent=2))
+    shape = new["recorded"]["request_shape"]
+    typer.echo(f"wrote {out}: recorded allow #{allow}, block #{block}, request shape {shape}")
+
+
+@app.command()
+def compare(old: Path = typer.Argument(..., exists=True, dir_okay=False, help="Earlier report.json."),
+            new: Path = typer.Argument(..., exists=True, dir_okay=False, help="Later report.json."),
+            json_out: Path | None = typer.Option(None, "--json", help="Also write the comparison as JSON.")):
+    """What changed between two enforce reports (e.g. before and after an upgrade).
+    Exit 1 if anything that held is now violated."""
+    import json
+
+    from .compare import compare as cmp
+    from .compare import render
+
+    try:
+        d = cmp(old, new)
+    except ValueError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2) from None
+    typer.echo(render(d))
+    if json_out:
+        json_out.write_text(json.dumps(d, ensure_ascii=False, indent=2))
+    raise typer.Exit(1 if d["regressions"] else 0)
+
+
+# Last, so every command above is registered when run as `python -m gcl.cli`.
+if __name__ == "__main__":  # pragma: no cover
+    app()

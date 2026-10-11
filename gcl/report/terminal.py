@@ -211,6 +211,21 @@ def render_enforce(run: dict) -> str:
         lines.append(c(f"{sm['guessed']} result(s) rest on a guessed stand-in answer "
                        f"({run['integration'].get('stand_in', {}).get('source', '')}): not findings until "
                        "confirmed against a real reply.", "warning"))
+    am = run.get("attack_matrix")
+    if am:
+        sm2 = am["summary"]
+        lines.append(f"Attack × fault ({am['detector']['name']}; faults {', '.join(am['faults'])}): "
+                     f"{sm2['attacks']} attacks, {sm2['detected']} flagged by the detector; "
+                     f"{sm2['detected_not_enforced']} flagged but NOT enforced, {sm2['missed_by_detector']} missed "
+                     f"by the detector, {sm2['leaked_under_fault']} leaked under a fault, "
+                     f"{sm2['unverified']} unverified")
+        for row in am["rows"]:
+            cells = ", ".join(f"{k}: {v}" for k, v in row["cells"].items())
+            kind = "error" if ("NOT ENFORCED" in cells or "LEAKED" in cells) else "dim"
+            lines.append(c(f"  {row['attack']:<22} [{row['lang']}] {'flagged' if row['flagged'] else 'missed '}  "
+                           f"{cells}", kind))
+        if am.get("dropped"):
+            lines.append(c(f"  the detector gave no answer for: {', '.join(am['dropped'])} (not sent)", "warning"))
     sw = run.get("latency_sweep")
     if sw:
         lines.append(f"Guard latency sweep {sw['latencies']} s: {sw['unstable']} result(s) change with timing"

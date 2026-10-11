@@ -220,6 +220,41 @@ The real integration code runs unmodified; only the vendor's API is replaced. Ne
 name the input/output flows and the `rails.config` block, with `STANDIN_URL` where the
 endpoint goes.
 
+#### Real attacks, a real detector, and faults at the same time
+
+```bash
+gcl enforce litellm --python /path/to/venv/bin/python --attacks attacks.jsonl \
+    --detector my-detector.yaml --attack-faults error,timeout --attack-limit 8
+```
+
+Each attack (JSON lines, the `coverage` format) is sent once with the stand-in answering
+what your detector decided about that exact text, and once per fault. The detector is a
+`coverage` adapter: wrap Prompt Guard, LlamaFirewall or a vendor API in a small script.
+The report separates what the detector missed (a detector problem), what it flagged but
+the integration let through (an enforcement problem) and what leaked while the guard was
+failing (fail-open), per attack.
+
+#### Record real vendor replies
+
+```bash
+gcl record serve --upstream https://api.vendor.example --out rec.jsonl --port 8899
+# point the integration's vendor URL at http://127.0.0.1:8899, send one clean and one bad request
+gcl record to-spec rec.jsonl --spec vendor.json --allow 1 --block 2 --out vendor.recorded.json
+```
+
+The proxy forwards everything unchanged and never stores request headers; secret-looking
+JSON fields are redacted. The spec then serves the vendor's real answers, and results on
+them are "recorded", not "guessed" — for requests shaped like the recorded ones.
+
+#### In CI
+
+`--format json,html,sarif` writes SARIF for code scanning (`--sarif-anchor FILE` names the
+repository file results attach to). `gcl compare old/report.json new/report.json` lists
+what changed between two runs — typically before and after an upgrade — and exits 1 on a
+regression (held → violated). The repository is also a GitHub Action
+([action.yml](action.yml)); [examples/ci/version-watch.yml](examples/ci/version-watch.yml)
+re-runs an integration on its latest release every week and fails on a regression.
+
 ### `gcl findings` — a ledger that only holds what runs can back
 
 ```bash

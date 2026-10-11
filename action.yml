@@ -1,0 +1,63 @@
+name: guardrail-contract-lab enforce
+description: >
+  Run gcl enforce against a guardrail integration installed in this job, write the
+  report, repro bundles and SARIF, and fail the job on violations or an incomplete run.
+inputs:
+  integration:
+    description: gcl integration name (e.g. litellm, nemo, portkey, litellm-vendor)
+    required: true
+  python:
+    description: Python interpreter of the environment where the integration is installed
+    required: false
+    default: python
+  env:
+    description: For Node integrations, the directory holding its node_modules
+    required: false
+    default: ""
+  profile:
+    description: Integration profile
+    required: false
+    default: default
+  spec:
+    description: Vendor spec file (litellm-vendor / nemo-vendor)
+    required: false
+    default: ""
+  out:
+    description: Output folder (must not exist yet)
+    required: false
+    default: gcl-out
+  fail-on:
+    description: policy | documented | never
+    required: false
+    default: policy
+  extra-args:
+    description: Any other gcl enforce arguments (e.g. --judge-latency 0,1)
+    required: false
+    default: ""
+outputs:
+  sarif:
+    description: Path to the SARIF file
+    value: ${{ inputs.out }}/report.sarif
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: python -m pip install "${{ github.action_path }}"
+    - shell: bash
+      env:  # inputs reach the script as data, never as script text
+        GCL_INTEGRATION: ${{ inputs.integration }}
+        GCL_PYTHON: ${{ inputs.python }}
+        GCL_ENV: ${{ inputs.env }}
+        GCL_PROFILE: ${{ inputs.profile }}
+        GCL_SPEC: ${{ inputs.spec }}
+        GCL_OUT: ${{ inputs.out }}
+        GCL_FAIL_ON: ${{ inputs.fail-on }}
+        GCL_EXTRA: ${{ inputs.extra-args }}
+      run: |
+        set -euo pipefail
+        args=(enforce "$GCL_INTEGRATION" --profile "$GCL_PROFILE" --out "$GCL_OUT"
+              --format json,html,sarif --fail-on "$GCL_FAIL_ON")
+        if [ -n "$GCL_ENV" ]; then args+=(--env "$GCL_ENV"); else args+=(--python "$GCL_PYTHON"); fi
+        if [ -n "$GCL_SPEC" ]; then args+=(--spec "$GCL_SPEC"); fi
+        read -r -a extra <<< "$GCL_EXTRA"
+        gcl "${args[@]}" "${extra[@]}"

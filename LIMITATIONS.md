@@ -172,6 +172,19 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
 - `null_verdict` sets the verdict field to null (unknown and falsy) where the protocol's
   block answer is JSON; plain-text judges do not get it.
 
+## Attack mode, recording, CI
+- Attack mode sends attacks as user input only, one request each, at most 100 scenarios per
+  run (`--attack-limit`). The detector's verdict is computed once per attack text, before
+  the run; the stand-in serves it in the integration's protocol, so the result shows how
+  the integration enforces that verdict — the detector itself is not called in the loop.
+- `gcl record` forwards HTTP(S) requests and JSON or text answers; streaming answers,
+  websockets and request signing that covers the Host header are not handled. Redaction is
+  by field name; a secret in a field with an innocent name is stored.
+- `gcl compare` matches scenarios by stage, guard behaviour, role and language; runs of
+  two different gcl versions may plan different scenarios, listed as "only in old/new".
+- The GitHub Action and the version-watch workflow are tested for their structure, not run
+  on GitHub from this repository.
+
 ## Findings ledger
 - Severity is a fixed, published rule over a few fields, not a CVSS score. "Documented"
   comes from gcl's own map of each integration's docs (quoted in every report); "default

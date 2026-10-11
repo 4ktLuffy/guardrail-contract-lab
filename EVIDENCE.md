@@ -145,6 +145,25 @@ else is labelled.
   recall are reported apart and a large gap is called out; unanswered held-out rows are not counted as
   misses — checked.
 
+## Attack mode, recording, CI (tests/test_attacks.py, test_record.py, test_ci.py)
+- Attack × fault: with the bundled keyword detector, a strict gateway shows only detector
+  misses; a gateway that passes anything but an explicit block leaks every attack under
+  error and timeout; a gateway that ignores the detector's block on attack text is "not
+  enforced"; the CLI refuses half a configuration — checked. Real run: LiteLLM 1.104.2,
+  profile fail_open, five bundled attacks: the flagged attack is enforced, every attack
+  leaks under a guard timeout and stops under a guard error, as LiteLLM documents; all
+  controls hold — checked locally, not in CI.
+- Recording: the proxy is transparent, stores no request headers and redacts secret
+  fields; recorded allow/block replies become a spec whose block results are "recorded" for
+  the recorded request shape and "guessed" otherwise; `to-spec` refuses identical,
+  failed, redacted or differently shaped records — checked (against a fake vendor; no real
+  vendor credentials were used).
+- CI: SARIF has one result per scenario that did not cleanly hold, with stable
+  fingerprints; `gcl compare` reports regressions, fixes and unverified changes and exits
+  1 on a regression; every command is registered under `python -m gcl.cli`; the Action
+  passes its inputs as environment data, not script text — checked. Real run: LiteLLM
+  1.104.2 against 1.105.0, `gcl compare`: no change — checked locally.
+
 ## Findings ledger and severity (tests/test_tester_findings.py, test_tester_severity.py)
 - A finding comes only from a violated or deviating result in a stored run with a clean
   receipt; a repeat needs another run id; a different outcome contradicts it; confirmation

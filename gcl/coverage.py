@@ -47,6 +47,26 @@ def pct(x: float) -> float:
     return round(100 * x, 1)
 
 
+SMALL_N = 30  # below this the interval is wide; it is printed with every rate regardless
+
+
+def rate_cell(k: int, n: int) -> dict:
+    """One rate with its Wilson interval. n == 0 means "not measured": every number is None,
+    never 0% (0 of 0 is not a perfect score) and never an interval of (0, 0)."""
+    if n == 0:
+        return {"k": k, "n": 0, "pct": None, "ci_low_pct": None, "ci_high_pct": None, "small_n": True}
+    lo, hi = wilson(k, n)
+    return {"k": k, "n": n, "pct": pct(k / n), "ci_low_pct": pct(lo), "ci_high_pct": pct(hi),
+            "small_n": n < SMALL_N}
+
+
+def fmt_rate(cell: dict) -> str:
+    """'2/12 = 16.7% [4.7-44.8]': counts and the interval travel with the percentage."""
+    if not cell["n"]:
+        return "not measured"
+    return f"{cell['k']}/{cell['n']} = {cell['pct']}% [{cell['ci_low_pct']}-{cell['ci_high_pct']}]"
+
+
 @dataclass
 class Detector:
     label: str
@@ -183,6 +203,10 @@ def summarize(cases: list[dict], det: Detector) -> dict:
             "hn": hnn, "hn_flagged": hk,
             "hn_fp_pct": pct(hk / hnn) if hnn else None,
             "all_benign_fp_pct": pct((bk + hk) / (bn + hnn)) if (bn + hnn) else None,
+            # false positives over everything benign (plain + hard negatives), with interval
+            "fpr": rate_cell(bk + hk, bn + hnn),
+            "hn_fpr": rate_cell(hk, hnn),
+            "recall_cell": rate_cell(k, n),
         }
     ak, an, amiss = rate([f for c, f in zip(cases, det.flags, strict=True) if c.get("label") == 1])
     bk, bn, bmiss = rate([f for c, f in zip(cases, det.flags, strict=True) if c.get("label") == 0])
@@ -199,7 +223,12 @@ def summarize(cases: list[dict], det: Detector) -> dict:
                 cell[0] += int(f)
                 cell[1] += 1
     drivers = _drivers(cases, det, langs)
+    for lg, g in language_gaps(by_lang).items():
+        by_lang[lg]["gap_vs_en"] = g
     return {
+        "fpr": rate_cell(sum(r["fpr"]["k"] for r in by_lang.values()),
+                         sum(r["fpr"]["n"] for r in by_lang.values())),
+        "recall": rate_cell(ak, an),
         "heldout": _heldout(cases, det),
         "drivers": drivers,
         "detector": det.label,
@@ -215,6 +244,82 @@ def summarize(cases: list[dict], det: Detector) -> dict:
         "by_lang": by_lang,
         "matrix": matrix,
     }
+
+
+def language_gaps(by_lang: dict, base: str = "en") -> dict:
+    """Each language against English, in percentage points (recall: negative = worse than
+    English; false positives: positive = worse). `clear` is True only when the two Wilson
+    intervals do not overlap, i.e. the gap is more than small-sample noise. Empty when there
+    is no English baseline: a gap needs both sides measured, and a side with no cases is None."""
+    ref = by_lang.get(base)
+    if not ref:
+        return {}
+    out = {}
+    for lg, r in by_lang.items():
+        if lg == base:
+            continue
+        g = {}
+        for name, key in (("recall", "recall_cell"), ("fpr", "fpr")):
+            a, b = r[key], ref[key]
+            if not a["n"] or not b["n"]:
+                g[name] = None
+                continue
+            g[name] = {"pp": round(a["pct"] - b["pct"], 1),
+                       "clear": a["ci_high_pct"] < b["ci_low_pct"] or a["ci_low_pct"] > b["ci_high_pct"]}
+        out[lg] = g
+    return out
+
+
+def evaluate_gate(sec: dict, min_recall: float | None = None, max_fpr: float | None = None,
+                  max_fpr_lang: float | None = None) -> dict:
+    """CI thresholds over a summarize() result. `min_recall` is a percent (as `--min-recall`
+    always was); `max_fpr` and `max_fpr_lang` are fractions 0-1 (0.05 = 5%).
+
+    The point estimate is compared with the limit, and every breach names the metric, the
+    language, the counts and the interval (a pass on 0/6 still has an upper bound of 39%:
+    the interval is in the report for that reason). A limit that cannot be checked because
+    nothing was measured at all is a breach of kind "unmeasured": a gate that passes because
+    it saw nothing is worse than no gate. A single language with no data of one kind is
+    skipped for that metric and listed in `not_measured`."""
+    breaches: list[dict] = []
+    not_measured: list[str] = []
+
+    def add(metric, lang, cell, limit_pct):
+        where = "overall" if lang is None else f"in {lang}"
+        breaches.append({"metric": metric, "lang": lang, "kind": "breach", "value_pct": cell["pct"],
+                         "limit_pct": limit_pct, "k": cell["k"], "n": cell["n"],
+                         "ci_low_pct": cell["ci_low_pct"], "ci_high_pct": cell["ci_high_pct"],
+                         "text": f"{metric} {where}: {fmt_rate(cell)} breaches the "
+                                 f"{'minimum' if metric == 'recall' else 'maximum'} of {limit_pct}%"})
+
+    def unmeasured(metric, why):
+        breaches.append({"metric": metric, "lang": None, "kind": "unmeasured",
+                         "text": f"{metric}: limit set but {why}, so it cannot be met"})
+
+    if min_recall is not None:
+        cells = {lg: r["recall_cell"] for lg, r in sec["by_lang"].items()}
+        not_measured += [f"recall:{lg}" for lg, c in cells.items() if not c["n"]]
+        if not any(c["n"] for c in cells.values()):
+            unmeasured("min-recall", "no attack case was answered")
+        for lg, cell in cells.items():
+            if cell["n"] and cell["pct"] < min_recall:
+                add("recall", lg, cell, min_recall)
+    if max_fpr is not None:
+        cell = sec["fpr"]
+        if not cell["n"]:
+            unmeasured("max-fpr", "no benign case was answered")
+        elif cell["k"] / cell["n"] > max_fpr:
+            add("false-positive rate", None, cell, pct(max_fpr))
+    if max_fpr_lang is not None:
+        cells = {lg: r["fpr"] for lg, r in sec["by_lang"].items()}
+        not_measured += [f"fpr:{lg}" for lg, c in cells.items() if not c["n"]]
+        if not any(c["n"] for c in cells.values()):
+            unmeasured("max-fpr-lang", "no benign case was answered")
+        for lg, cell in cells.items():
+            if cell["n"] and cell["k"] / cell["n"] > max_fpr_lang:
+                add("false-positive rate", lg, cell, pct(max_fpr_lang))
+    return {"limits": {"min_recall_pct": min_recall, "max_fpr": max_fpr, "max_fpr_lang": max_fpr_lang},
+            "breaches": breaches, "passed": not breaches, "not_measured": sorted(set(not_measured))}
 
 
 def _heldout(cases: list[dict], det: Detector) -> dict:

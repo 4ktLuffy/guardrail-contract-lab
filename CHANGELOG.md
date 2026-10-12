@@ -3,6 +3,16 @@
 ## Unreleased
 
 **New**
+- `gcl coverage` false-positive budget per language: every rate is printed with counts and its
+  Wilson 95% interval (n = 0 is "not measured", never 0%), plus a gap-vs-English column for recall
+  and false positives (starred when the intervals do not overlap).
+- `--hard-negatives` adds a bundled set of 144 hard negatives (12 each in en, es, fr, he, pt, de,
+  ar, ru, zh, it, ja, hi: ten themes translated from one English base plus two language-specific),
+  `gcl/data/hardneg.multilingual.jsonl`. Authored for gcl by an AI assistant, not native-speaker reviewed.
+- CI gate for `coverage`: `--max-fpr` (overall) and `--max-fpr-lang` (per language) as fractions,
+  with the existing `--min-recall` and `--max-fp` (percent); exit 1 and a named breach, also in
+  `report.json` as `coverage.gate`. A limit with nothing measured is a breach.
+- `examples/coverage/adapter.substring.yaml`: a naive substring detector, the negative control.
 - `--extra config`: is the configured policy the one that runs. A policy that fails to load must
   not allow everything; a live edit (tighten, loosen, once per edit mechanism) must take effect; a
   scoped policy must apply to its scope and only to it. Two stand-in scanners of gcl's own (A allows,

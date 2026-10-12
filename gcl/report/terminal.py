@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import sys
 
+from ..coverage import fmt_rate
+
 _COLOR = {"error": "31", "warning": "33", "note": "36", "ok": "32", "dim": "2"}
 
 
@@ -114,15 +116,28 @@ def render_coverage(sec: dict) -> str:
     if ho.get("note"):
         lines.append(c(f"  {ho['note']}", "warning"))
     lines.append("")
-    lines.append(f"  {'lang':<9}{'recall':>18}   {'95% CI':>12}   {'FP benign':>12}   {'FP hard-neg':>12}")
+    if "fpr" in sec and sec["fpr"]["n"]:
+        lines.append(f"False positives, all benign + hard negatives: {fmt_rate(sec['fpr'])}")
+    lines.append(f"  {'lang':<8}{'recall k/n [95% CI]':<30}{'false pos. k/n [95% CI]':<30}"
+                 f"{'gap vs en (pp)':<22}")
     for lg, r in sec["by_lang"].items():
-        rec = f"{r['recall_pct']}% ({r['caught']}/{r['attacks']})" if r["attacks"] else "—"
         kind = "ok" if (r["recall"] or 0) >= 0.8 else ("warning" if (r["recall"] or 0) >= 0.4 else "error")
-        fp = f"{r['fp_pct']}% ({r['flagged_benign']}/{r['benign']})" if r["benign"] else "—"
-        hn = f"{r['hn_fp_pct']}% ({r['hn_flagged']}/{r['hn']})" if r["hn"] else "—"
-        ci = (f"{r['ci_low_pct']:>5}–{r['ci_high_pct']:<5}%" if r["ci_low_pct"] is not None
-              else f"{'—':>12}")
-        lines.append(f"  {lg:<9}{c(f'{rec:>18}', kind)}   {ci}   {fp:>12}   {hn:>12}")
+        rec = fmt_rate(r["recall_cell"]).replace(" = ", " ").replace("not measured", "no attacks")
+        fp = fmt_rate(r["fpr"]).replace(" = ", " ").replace("not measured", "no benign")
+        g = r.get("gap_vs_en") or {}
+        gap = " ".join(f"{n} {'+' if v['pp'] > 0 else ''}{v['pp']}{'*' if v['clear'] else ''}"
+                       for n, v in (("rec", g.get("recall")), ("fp", g.get("fpr"))) if v)
+        lines.append(f"  {lg:<8}{c(f'{rec:<30}', kind)}{fp:<30}{gap}")
+    lines.append(c("  (* = interval does not overlap English's; otherwise the gap may be noise. "
+                   "Every rate shows its interval: samples per language are small.)", "dim"))
+    gate = sec.get("gate")
+    if gate:
+        if gate["passed"]:
+            lines.append(c("Thresholds met (on the observed rate; see the intervals above).", "ok"))
+        for b in gate["breaches"]:
+            lines.append(c(f"THRESHOLD BREACHED: {b['text']}", "error"))
+        if gate["not_measured"]:
+            lines.append(c(f"  not measured, so not gated: {', '.join(gate['not_measured'])}", "warning"))
     for cmp in sec.get("compare", [])[1:]:
         lines.append("")
         lines.append(f"Same rules, {cmp['detector']}: recall {cmp['aggregate']['recall_pct']}% "

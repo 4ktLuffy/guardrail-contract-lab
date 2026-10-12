@@ -19,6 +19,7 @@ app = typer.Typer(add_completion=False, no_args_is_help=True,
 
 DATA = Path(__file__).parent / "data"
 BUNDLED_CASES = DATA / "cases.multilingual.jsonl"
+BUNDLED_HARDNEG = DATA / "hardneg.multilingual.jsonl"
 LEVELS = {"note": 0, "warning": 1, "error": 2}
 
 
@@ -152,18 +153,37 @@ def coverage(
     min_recall: float | None = typer.Option(None, help="Fail if any language is below this %."),
     max_fp: float | None = typer.Option(None, help="Fail if any language's false-positive rate "
                                         "(plain benign + hard negatives) is above this %."),
+    max_fpr: float | None = typer.Option(
+        None, help="Fail if the overall false-positive rate (a fraction, 0.05 = 5%) is above this."),
+    max_fpr_lang: float | None = typer.Option(
+        None, help="Fail if any language's false-positive rate (a fraction, 0.05 = 5%) is above this."),
+    hard_negatives: bool = typer.Option(
+        False, "--hard-negatives", help="Add gcl's per-language hard-negative set (benign text that "
+        "looks risky; 12 per language, authored for gcl, not native-reviewed) to the cases."),
     loader_drops_broken: bool = typer.Option(
         False, help="Measure as a loader that silently skips rules it cannot compile "
                     "(otherwise such rules make the run incomplete)."),
 ):
-    """Per-language recall and false-positive rate, with intervals."""
-    from .coverage import detect_with_adapter, detect_with_rules, load_adapter, summarize
+    """Per-language recall and false-positive rate, with intervals and a CI gate."""
+    from .coverage import (
+        detect_with_adapter,
+        detect_with_rules,
+        evaluate_gate,
+        load_adapter,
+        summarize,
+    )
     from .report.html import render_html
     from .report.terminal import render_coverage
 
     if bool(rules) == bool(adapter):
         raise typer.BadParameter("give exactly one of --rules or --adapter")
+    for opt, v in (("--max-fpr", max_fpr), ("--max-fpr-lang", max_fpr_lang)):
+        if v is not None and not 0 <= v <= 1:
+            raise typer.BadParameter(f"{opt} is a fraction between 0 and 1 (0.05 = 5%), got {v}")
     case_list = load_cases(cases)
+    if hard_negatives:
+        have = {c["id"] for c in case_list}
+        case_list += [c for c in load_cases(BUNDLED_HARDNEG) if c["id"] not in have]
     texts = [c["text"] for c in case_list]
     if rules:
         _load_rules_or_exit(rules)
@@ -174,6 +194,8 @@ def coverage(
     secs = [summarize(case_list, d) for d in dets]
     for s in secs:
         label = "bundled: cases.multilingual.jsonl" if cases == BUNDLED_CASES else str(cases)
+        if hard_negatives:
+            label += " + bundled: hardneg.multilingual.jsonl"
         s["cases"] = {"path": label, "n": len(case_list)}
         s["fixtures_note"] = _fixture_note(case_list)
     sec = secs[0]
@@ -184,18 +206,16 @@ def coverage(
     doc = R.envelope("coverage", {"rules": str(rules) if rules else None,
                                   "adapter": str(adapter) if adapter else None,
                                   "cases": "bundled" if cases == BUNDLED_CASES else str(cases)})
+    caps = [x for x in (max_fpr_lang, None if max_fp is None else max_fp / 100) if x is not None]
+    lang_cap = min(caps) if caps else None  # --max-fp (percent, older spelling) = --max-fpr-lang
+    gates = [evaluate_gate(s, min_recall, max_fpr, lang_cap) for s in secs]
+    if any(v is not None for v in (min_recall, max_fpr, lang_cap)):
+        sec["gate"] = gates[0]
     doc["coverage"] = sec
     typer.echo(render_coverage(sec))
     _write_outputs(doc, out, _formats(format), render_html)
     complete = all(d.complete for d in dets)
-    bad = []
-    for s in secs:
-        for r in s["by_lang"].values():
-            if min_recall is not None and r["recall_pct"] is not None and r["recall_pct"] < min_recall:
-                bad.append("error")
-            if max_fp is not None and r["all_benign_fp_pct"] is not None \
-                    and r["all_benign_fp_pct"] > max_fp:
-                bad.append("error")
+    bad = ["error" for g in gates for _ in g["breaches"]]
     raise typer.Exit(_exit(bad, complete, "error"))
 
 

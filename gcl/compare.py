@@ -4,7 +4,9 @@ integration before and after an upgrade.
 Scenarios are matched by what they test (stage, guard behaviour, role, language), not by
 id. A result that held before and is violated now is a regression; violated → held is a
 fix; anything that became or stopped being unverified is listed separately, because it
-says the run, not the integration, changed.
+says the run, not the integration, changed. MCP surfaces (`--extra mcp`) are matched by
+surface id; a surface that became or stopped being carried ("n/a") is a change, except that
+one that became carried and is violated now (n/a -> violated) is a regression: a new leak.
 """
 
 from __future__ import annotations
@@ -24,7 +26,9 @@ def _runs(path: Path) -> list[dict]:
 
 def _key(run: dict, r: dict) -> tuple:
     s = r["scenario"]
-    return (run.get("judge_latency_s"), s["stage"], s["mode"], s.get("role") or "", s["lang"], s.get("attack") or "")
+    # A surface is told apart by its id (m01, m01c): stage, mode and role are shared by many.
+    return (run.get("judge_latency_s"), s["stage"], s["mode"], s["id"] if s.get("surface") else "",
+            s.get("role") or "", s["lang"], s.get("attack") or "")
 
 
 def _index(runs: list[dict], path) -> dict:
@@ -69,7 +73,11 @@ def compare(old_path: Path, new_path: Path) -> dict:
         if x["policy"] == y["policy"] and x["observed"] == y["observed"]:
             continue
         row = {"scenario": name, "old": f"{x['observed']}/{x['policy']}", "new": f"{y['observed']}/{y['policy']}"}
-        if "unverified" in (x["policy"], y["policy"]):
+        if x["policy"] == "n/a" and y["policy"] == "violated":
+            out["regressions"].append(row)  # newly carried and unscanned: a new leak
+        elif "n/a" in (x["policy"], y["policy"]):
+            out["changed"].append(row)  # carried or not is a change of the gateway; violated -> n/a too
+        elif "unverified" in (x["policy"], y["policy"]):
             out["unverified_changes"].append(row)
         elif x["policy"] == "held" and y["policy"] == "violated":
             out["regressions"].append(row)

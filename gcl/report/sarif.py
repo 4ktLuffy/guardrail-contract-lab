@@ -77,18 +77,28 @@ def enforce_sarif(runs, anchor: str) -> dict:
         i, lat = run["integration"], run.get("judge_latency_s")
         for r in run["results"]:
             s, ev = r["scenario"], r["evidence"]
-            if r["policy"] == "held" and r["documented"] != "deviates":
+            if r["policy"] in ("held", "n/a") and r["documented"] != "deviates":
                 continue
-            rid = f"GCL-E-{s['stage']}-{s['mode']}"
-            rules.setdefault(rid, {"id": rid, "name": f"{s['stage']} {s['mode']}",
-                                   "shortDescription": {"text": f"{s['stage']} stage, guard behaviour: {s['mode']}"}})
+            surface = s.get("surface")
+            if surface:  # an MCP surface: one rule per surface, named for where the text sat
+                rid = f"GCL-E-mcp-{surface['id']}"
+                text = f"MCP surface {surface['id']} ({surface['direction']}): {surface['description']}"
+                rules.setdefault(rid, {"id": rid, "name": f"MCP surface: {surface['name']}",
+                                       "shortDescription": {"text": text}})
+            else:
+                rid = f"GCL-E-{s['stage']}-{s['mode']}"
+                text = f"{s['stage']} stage, guard behaviour: {s['mode']}"
+                rules.setdefault(rid, {"id": rid, "name": f"{s['stage']} {s['mode']}",
+                                       "shortDescription": {"text": text}})
             level = "error" if r["policy"] == "violated" else ("warning" if r["documented"] == "deviates" else "note")
             ident = "/".join(str(x) for x in (i["integration"], i["profile"], s["stage"], s["mode"],
+                                              s["id"] if surface else "",
                                               s.get("role") or "", s["lang"], s.get("attack") or "",
                                               "" if lat is None else f"{lat:g}s"))
             guessed = " Rests on a guessed stand-in answer: confirm before reporting." \
                 if ev.get("confidence") == "guessed" else ""
-            what = f"attack {s['attack']} " if s.get("attack") else ""
+            what = f"attack {s['attack']} " if s.get("attack") else (
+                f"MCP surface {surface['id']} ({surface['name']}) " if surface else "")
             at = f" at guard latency {lat:g}s" if lat is not None else ""
             msg = (f"{i['integration']} ({i['profile']}): {what}{s['stage']} {s['mode']} [{s['lang']}]{at} "
                    f"observed {r['observed']}, policy {r['policy']}, docs {r['documented']}.{guessed} "

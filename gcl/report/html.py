@@ -11,7 +11,7 @@ import html
 import json
 
 from ..coverage import lang_name
-from .terminal import show
+from .terminal import _na, show
 
 CSS = """
 :root{--bg:#fbfbfa;--fg:#1d1d1b;--mute:#6b6b66;--line:#e4e3de;--card:#fff;
@@ -262,6 +262,8 @@ def _enforce(sec: dict) -> str:
            "deviates": "error", "unspecified": ""}
     for r in sec["results"]:
         s, ev = r["scenario"], r["evidence"]
+        if s["mode"] == "surface":
+            continue  # their own table below
         notes = "".join(f"<br><small>{e(n)}</small>" for n in r["notes"])
         evidence = (f"client {e(ev['client_status'])} · model requests {e(ev['model_requests'])} · "
                     f"scanner calls {e(ev['scanner_consulted_stage'])}")
@@ -273,7 +275,41 @@ def _enforce(sec: dict) -> str:
                    f'<td class="lv {cls[r["documented"]]}">{e(r["documented"])}</td>'
                    f"<td><small>{evidence}</small>{notes}</td></tr>")
     out.append("</table></div>")
+    out.append(_surfaces(sec))
     return "\n".join(out)
+
+
+def _surfaces(sec: dict) -> str:
+    """MCP surfaces (`--extra mcp`): one row per surface, from its carry control and its attack."""
+    if not sec.get("mcp_surfaces"):
+        return ""
+    rows: dict = {}
+    for r in sec["results"]:
+        sc = r["scenario"]
+        if sc["mode"] == "surface":
+            rows.setdefault(sc["surface"]["id"], {})["control" if sc["role"] else "attack"] = r
+    sm = sec["mcp_surfaces"]["summary"]
+    out = [(f"<h3>MCP surfaces</h3><p class='sub'>Protocol {e(sec['mcp_surfaces']['protocol'])}: "
+           f"{sm['held']} held, {sm['violated']} violated, {sm['unverified']} unverified, "
+           f"{_na(sm)}, of {sm['surfaces']} surfaces. Each surface is run twice: a benign "
+           "marker that must arrive (carry control), then an attack marker the stand-in blocks.</p>"),
+           ("<div class='scroll'><table><tr><th>Id</th><th>Surface</th><th>Direction</th><th>Carried</th>"
+            "<th>Scanner shown</th><th>Outcome</th><th>Policy</th><th>OWASP</th></tr>")]
+    cls = {"held": "okc", "violated": "error", "unverified": "warning", "n/a": ""}
+    for sid, row in rows.items():
+        a, ctl = row.get("attack"), row.get("control")
+        if a is None:
+            continue
+        sf = a["scenario"]["surface"]
+        carried = ("yes" if ctl["policy"] == "held" else "no" if ctl["policy"] == "n/a" else "?") if ctl else "?"
+        shown = "-" if carried != "yes" else ("yes" if a["evidence"].get("scanner_shown") else "no")
+        notes = "".join(f"<br><small>{e(n)}</small>" for n in a["notes"])
+        out.append(f"<tr><td><code>{e(sid)}</code></td><td>{e(sf['name'])}<br><small>{e(sf['description'])}</small></td>"
+                   f"<td>{e(sf['direction'])}</td><td>{carried}</td><td>{shown}</td><td><b>{e(a['observed'])}</b></td>"
+                   f'<td class="lv {cls[a["policy"]]}">{e(a["policy"])}{notes}</td>'
+                   f"<td><small>{e(', '.join(a['evidence'].get('owasp') or []))}</small></td></tr>")
+    out.append("</table></div>")
+    return "".join(out)
 
 
 def _doc_source(src: dict) -> str:

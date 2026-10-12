@@ -45,7 +45,8 @@ On the bundled fixtures (written for the demo; see [NUMBERS.md](NUMBERS.md)):
 | **0** after `gcl fix` | 8 rules rewritten; each agrees with the original under Python on every tested input before it is written |
 | **91.7% → 0.0%** | recall in English vs Arabic for the same, reasonable, English rule set |
 | **6 of 6** scanner faults | still let the tool call run, in a fail-open tool runner (0 of 6 after the fix) |
-| **16 of 22** gateway scenarios | break a gateway's own fail-closed promise, end to end (0 of 22 for the strict build) |
+| **18 of 38** gateway scenarios | break a gateway's own fail-closed promise, end to end (0 of 38 for the strict build) |
+| **15 of 18** MCP surfaces | reach the client or server unscanned through a naive MCP gateway (0 of 18 for the strict build; 2 more not carried) |
 
 ## Commands
 
@@ -155,8 +156,10 @@ library over HTTP), the Portkey gateway's webhook guardrails (Node: `--env DIR`)
 OpenAI moderation middleware, Mastra's model-backed processors, the OpenAI Agents SDK (Python and JavaScript) with
 openai-guardrails' `GuardrailAgent`, Pydantic AI's harness guardrails, Google ADK's model callbacks, Semantic Kernel's filters, CrewAI's `LLMGuardrail`, Guardrails AI's `Guard` (Python API and RAIL), Coralogix (Aporia) guardrails for LangChain models (`coralogix-langchain`, Node), Meta
 LlamaFirewall's LLM-judged PII check (`llamafirewall`), Invariant Gateway's MCP proxy and Lasso's
-mcp-gateway (gcl plays the MCP client and a mock MCP server, over HTTP or stdio), Agno's built-in guardrails, or the bundled
-reference gateway. A report notes when one request ran a tool more than once (retries that
+mcp-gateway (gcl plays the MCP client and a mock MCP server, over HTTP or stdio), Agno's built-in guardrails, the bundled
+reference gateway (`reference`), IBM ContextForge's MCP gateway (`contextforge`: ContextForge ships no
+plugin that calls an HTTP scanner, so gcl's driver supplies one and the run tests ContextForge's plugin
+framework — hook dispatch, modes, `on_error`, timeout), Stacklok ToolHive's MCP proxy (`toolhive`: `--env DIR` is the `thv` binary or its folder; gcl's mock MCP server runs as a remote workload, so no container or image, but ToolHive needs a Docker-compatible runtime socket to start even then: `TOOLHIVE_DOCKER_SOCKET`, else `DOCKER_HOST`, else the current docker context; its webhooks see the request side only), or the reference gateway's MCP variant (`reference-mcp`, profiles `naive` and `strict`). A report notes when one request ran a tool more than once (retries that
 re-execute side effects). The Invariant MCP adapter also runs a retry scenario (the same
 blocked request sent twice in one session), and integrations that fetch their rules get
 policy-source faults (the policy is missing, or its source errors). Agent integrations run with a
@@ -256,11 +259,66 @@ message is caught: the stand-in blocks only when it is shown the attack), and a 
 request **sent twice** for any integration. Streaming and history run where the adapter
 can send them (LiteLLM, Portkey, the reference gateway).
 
+#### MCP: every place a message can carry text (`--extra mcp`)
+
+The MCP checks above test one path: `tools/call` arguments `note` going in, and
+`result.content[0].text` coming back. `--extra mcp` adds 18 more surfaces, each a place an
+MCP message can carry text to the model or out of the agent:
+
+| id | surface |
+|---|---|
+| m01 | tool result, second content item |
+| m02 | tool result, `structuredContent` |
+| m03 | tool result, embedded resource |
+| m04 | tool result, `isError` |
+| m05 | JSON-RPC error message |
+| m06 | tool description |
+| m07 | tool schema description |
+| m08 | rug pull (`tools/list_changed`, then a poisoned list) |
+| m09 | resource content |
+| m10 | prompt content |
+| m11 | log notification in the stream |
+| m12 | sampling request in the stream |
+| m13 | result as an event stream |
+| m14 | nested argument |
+| m15 | call to an unlisted tool |
+| m16 | call inside a JSON-RPC batch |
+| m17 | server `instructions` in the initialize result |
+| m18 | tool `title` |
+
+Each surface runs twice. A **carry control** puts a benign marker in the surface, with a
+stand-in that allows everything. The marker must arrive whole at the far end; if it does
+not, the gateway does not carry that surface: "not carried", policy n/a, never "held". The
+**attack** puts an injection sentence in the same place. The stand-in answers block only for
+text it is shown with an attack marker. The attack is not sent when its control was not carried.
+
+Outcomes: `stopped` and `dropped unscanned` are held; `passed unscanned` (the stand-in was never
+shown the text) and `passed despite block` (the stand-in said block and the text arrived anyway)
+are violated; no answer, a transport failure, a response cut at the byte cap, or a baseline (m00)
+that did not carry its own benign marker is unverified. "Not carried" is claimed only when the
+gateway answered every request properly. The far end is what gcl's own
+observers recorded: a raw MCP client (standard library only, so every byte is visible) and a
+mock MCP server. Gateway logs are not used.
+
+It runs on the MCP adapters only: `reference-mcp`, `invariant-mcp`, `lasso-mcp-gateway`, `contextforge` and `toolhive`.
+Any other adapter refuses `--extra mcp`. The protocol is 2025-03-26 unless `--mcp-protocol`
+(2025-06-18, 2025-11-25) asks otherwise. m02 is run in every session, although structuredContent
+came with 2025-06-18: real gateways carry it in older sessions and may leak it there, and a gateway
+that drops it gives n/a "not carried". m16 (batches) exists only in 2025-03-26, so at a later version it
+is not run and reads n/a "not in protocol".
+
+```bash
+gcl enforce reference-mcp --python python3 --profile naive --extra mcp
+gcl enforce reference-mcp --python python3 --profile strict --extra mcp --mcp-protocol 2025-06-18
+```
+
 #### Which OWASP risk a failure is evidence about
 
 Every violated result names the OWASP risks it is evidence about — OWASP Top 10 for LLM
 Applications 2025, Top 10 for Agentic Applications 2026, MCP Top 10 — in the report and
 as SARIF tags. The mapping is a short, explicit table ([gcl/standards.py](gcl/standards.py)).
+MCP surface results add MCP03:2025 Tool Poisoning and, for a call to an unlisted tool,
+MCP02:2025 Privilege Escalation via Scope Creep.
 
 #### A compatibility table
 

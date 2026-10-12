@@ -172,6 +172,45 @@ def render_fix(summary: dict) -> str:
     return "\n".join(lines)
 
 
+def _na(sm: dict) -> str:
+    """The n/a count by cause; a report written before the split has only `n/a`."""
+    if "not_in_protocol" not in sm:
+        return f"{sm['n/a']} not carried"
+    return f"{sm['not_carried']} not carried, {sm['not_in_protocol']} not in protocol"
+
+
+def _surface_table(run: dict) -> list[str]:
+    """MCP surfaces (`--extra mcp`): one row per surface, from its carry control and its attack."""
+    rows = {}
+    for r in run["results"]:
+        sc = r["scenario"]
+        if sc["mode"] == "surface":
+            rows.setdefault(sc["surface"]["id"], {})["control" if sc["role"] else "attack"] = r
+    sm = run["mcp_surfaces"]["summary"]
+    lines = ["", (f"MCP surfaces (protocol {run['mcp_surfaces']['protocol']}): {sm['held']} held, "
+                  f"{sm['violated']} violated, {sm['unverified']} unverified, {_na(sm)} of "
+                  f"{sm['surfaces']}"),
+             *([c(f"  the surface phase failed: {run['mcp_surfaces']['error']}", "error")]
+               if run["mcp_surfaces"].get("error") else []),
+             (f"  {'id':<4} {'surface':<34} {'direction':<10} {'carried':<8} {'scanner shown':<14} "
+              f"{'outcome':<20} policy")]
+    for sid, row in rows.items():
+        a, ctl = row.get("attack"), row.get("control")
+        if a is None:
+            continue
+        sf = a["scenario"]["surface"]
+        carried = ("yes" if ctl["policy"] == "held" else "no" if ctl["policy"] == "n/a" else "?") if ctl else "?"
+        shown = "-" if carried != "yes" else ("yes" if a["evidence"].get("scanner_shown") else "no")
+        pk = {"held": "ok", "violated": "error", "unverified": "warning", "n/a": "dim"}[a["policy"]]
+        lines.append(f"  {sid:<4} {sf['name']:<34} {sf['direction']:<10} {carried:<8} {shown:<14} "
+                     f"{a['observed']:<20} {c(a['policy'], pk)}")
+        for n in a["notes"]:
+            lines.append(c(f"       {n}", "dim"))
+        if a["evidence"].get("owasp"):
+            lines.append(c(f"       OWASP: {', '.join(a['evidence']['owasp'])}", "dim"))
+    return lines
+
+
 def render_enforce(run: dict) -> str:
     i = run["integration"]
     v = ", ".join(f"{k} {val}" for k, val in i["versions"].items() if val)
@@ -190,6 +229,8 @@ def render_enforce(run: dict) -> str:
     lines.append("")
     for r in run["results"]:
         s = r["scenario"]
+        if s["mode"] == "surface":
+            continue  # shown in their own table below
         pk = {"held": "ok", "violated": "error", "unverified": "warning"}[r["policy"]]
         dk = {"conforms": "ok", "deviates": "error", "unspecified": "dim", "unverified": "warning"}[r["documented"]]
         tag = " (control)" if s["control"] else ""
@@ -204,6 +245,8 @@ def render_enforce(run: dict) -> str:
             lines.append(c(f"             {n}", "dim"))
         if r["evidence"].get("owasp"):
             lines.append(c(f"             OWASP: {', '.join(r['evidence']['owasp'])}", "dim"))
+    if run.get("mcp_surfaces"):
+        lines += _surface_table(run)
     sm = run["summary"]
     lines.append("")
     lines.append(f"Policy: {sm['policy_held']} held, {sm['policy_violated']} violated, {sm['unverified']} unverified "

@@ -311,7 +311,11 @@ def enforce(
                                       "results that change with timing as unstable."),
     extra: str = typer.Option("", help="Opt-in blind spots, comma-separated: stream (output checks on "
                               "streamed answers), history (the attack in an earlier turn), retry (a "
-                              "blocked request sent twice)."),
+                              "blocked request sent twice), mcp (MCP gateways: the baseline plus 18 more "
+                              "places a message can carry text, each run with a benign control and an attack)."),
+    mcp_protocol: str = typer.Option("2025-03-26", "--mcp-protocol", help="With --extra mcp: the MCP "
+                                     "protocol version the client asks for (2025-03-26, 2025-06-18, 2025-11-25). "
+                                     "A surface the negotiated version does not have is not run (n/a)."),
     attacks: Path | None = typer.Option(None, exists=True, dir_okay=False,
                                         help="Attack mode: JSON-lines attack cases (rows with label 1). Each is "
                                              "sent with a real detector's verdict and under each fault."),
@@ -369,6 +373,16 @@ def enforce(
     extras = tuple(x.strip() for x in extra.split(",") if x.strip())
     if any(x not in EXTRAS for x in extras):
         raise typer.BadParameter(f"choose from {', '.join(EXTRAS)}", param_hint="--extra")
+    from .enforce.mcp_surfaces import PROTOCOL, PROTOCOLS
+
+    if mcp_protocol not in PROTOCOLS:
+        raise typer.BadParameter(f"choose from {', '.join(PROTOCOLS)}", param_hint="--mcp-protocol")
+    if mcp_protocol != PROTOCOL and "mcp" not in extras:
+        raise typer.BadParameter("it only applies with --extra mcp", param_hint="--mcp-protocol")
+    if "mcp" in extras and not cls.mcp_transport:
+        mcp_names = ", ".join(n for n, a in ADAPTERS.items() if a.mcp_transport)
+        raise typer.BadParameter(f"{integration} is not an MCP gateway; mcp surfaces run on: {mcp_names}",
+                                 param_hint="--extra")
     attack_plan = None
     if attack_plan_file:
         import json
@@ -400,15 +414,15 @@ def enforce(
             from .enforce.contracts import latency_sweep
 
             sweep = latency_sweep(adapter, lats, timeout or adapter.default_timeout_s, progress=_say,
-                                  only=set(scenario) or None, extra=extras)
+                                  only=set(scenario) or None, extra=extras, mcp_protocol=mcp_protocol)
             slowest = max(range(len(lats)), key=lambda k: lats[k])  # where races show
             run = sweep["runs"][slowest]
             run["latency_sweep"] = {k: v for k, v in sweep.items() if k != "runs"}
             run["latency_sweep"]["summaries"] = [r["summary"] for r in sweep["runs"]]
         else:
             run = run_contracts(adapter, timeout or adapter.default_timeout_s, progress=_say,
-                                only=set(scenario) or None, extra=extras)
-    except RuntimeError as e:
+                                only=set(scenario) or None, extra=extras, mcp_protocol=mcp_protocol)
+    except (RuntimeError, OSError) as e:  # OSError: URLError and friends from an adapter that failed to start
         typer.echo(f"error: {e}", err=True)
         raise typer.Exit(2) from None
     doc = R.envelope("enforce", {"integration": integration, "profile": profile})
@@ -430,7 +444,8 @@ def enforce(
         extra_spec = f" --spec {shlex.quote(str(spec.resolve()))}" if spec else ""
         replay = (f"gcl enforce {shlex.quote(integration)} {flag} {shlex.quote(str(Path(str(where)).resolve()))} "
                   f"--profile {shlex.quote(profile)}{extra_spec} --timeout {run['timeout_s']:g}"
-                  + (f" --extra {','.join(extras)}" if extras else ""))
+                  + (f" --extra {','.join(extras)}" if extras else "")
+                  + (f" --mcp-protocol {mcp_protocol}" if mcp_protocol != PROTOCOL else ""))
         if attack_plan:  # the plan is frozen next to the report; a replay sends exactly it
             frozen = out / "attack-plan.json"
             frozen.write_text(json.dumps(attack_plan, ensure_ascii=False, indent=2), encoding="utf-8")

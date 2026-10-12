@@ -242,6 +242,44 @@ else is labelled.
   twelve installed integrations) on Python 3.13.15 with Node 25.8.0; the demo runs
   from an installed wheel outside the checkout.
 
+## MCP surfaces (tests/test_mcp_surfaces.py, test_mcp_mock_surfaces.py, test_mcp_real_adapters.py)
+- Reference gateway, naive profile, every surface m00–m18 with its carry control: each
+  control is carried; 4 of 19 attacks are held (m00, m04, m13, m15), and the other 15
+  are "passed unscanned" and violated, with the OWASP IDs and the scanner never shown the
+  text — checked.
+- Reference gateway, strict profile: every carried surface is stopped and held, with the
+  scanner shown the text; m15 and m16 are "not carried" (n/a); nothing is violated or
+  unverified — checked.
+- Mock MCP server, each surface over streamable HTTP and over the stdio bridge, read by
+  gcl's raw MCP client: the payload arrives where the surface says, the SSE surfaces (m08,
+  m11, m12, m13) stream, a client without SSE in its Accept falls back to JSON, a sampling
+  answer is recorded, and the server records each message with its session and transport —
+  checked.
+- Classification on synthetic exchanges: each outcome (stopped, dropped unscanned, passed
+  unscanned, passed despite block), unfinished and transport-failure sessions (never held),
+  a cut or rewritten copy of the marker (counted as arrived), the carry-control cases
+  (carried, not carried, undelivered event stream), "not carried" only after a proper answer
+  to every request (an HTTP error page, a non-JSON body or a missing answer is unverified),
+  a response cut at the byte cap (unverified, never stopped), a baseline (m00) that was not
+  carried (every other surface unverified), names read back from the session's own lists,
+  and "scanner shown" counting only a valid block answer that was delivered — checked.
+- Ordinary results are the same with and without `--extra mcp`: on the reference gateway
+  (strict profile, the full ordinary plan) every ordinary scenario has the same observed
+  outcome and policy, and no surface result appears without the flag — checked. On the naive
+  profile this is checked for the opening controls and two surfaces only.
+- `--extra mcp` on an adapter without an MCP transport is refused with a clear error — checked.
+- Invariant and Lasso adapters: name mapping, and the URL, headers and argv each hands to the
+  raw client — checked without a gateway.
+- Real gateways, opt-in (`GCL_INTEG_INVARIANT_PYTHON`: Invariant Gateway 0.0.9;
+  `GCL_INTEG_LASSO_PYTHON`: Lasso mcp-gateway 1.2.1): run 2026-10-11. The results are not
+  stated here; findings go to the maintainers first, as the README says.
+- ToolHive v0.51.4 real runs, opt-in (`--env` the `thv` binary): profiles `fail` and `ignore`, with
+  and without `--extra mcp`, run 2026-10-11 — checked; results withheld, as above. Extra real
+  profiles run 2026-10-11: Invariant `push`, Lasso `no_key`, ContextForge `enforce` and
+  `ignore_error` — checked; results withheld.
+- structuredContent (m02) is run at the default protocol 2025-03-26: reference gateway, naive 15
+  of 18 violated, strict 0 of 18 violated with 2 not carried (m15, m16) — checked.
+
 ## Not yet verified
 - CI matrix (Python 3.11–3.13 × Node 20/22): the workflow is written, not run.
 - Behaviour on Windows.

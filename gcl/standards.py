@@ -18,10 +18,22 @@ the thing the risk describes:
   through an MCP proxy: requests MCP06:2025 Intent Flow Subversion; tool results and
   replies MCP10:2025 Context Injection & Over-Sharing; a missing policy that silently
   disables the guard MCP08:2025 Lack of Audit and Telemetry
+  an MCP surface (`--extra mcp`, SURFACE_RISKS below) whose attack text reached the far end
+  unstopped: tool results, errors, notifications and SSE events MCP03:2025 Tool Poisoning
+  + MCP10:2025 + LLM01:2025; tool metadata (description, title), server instructions and a
+  rug pull MCP03:2025 + LLM01:2025;
+  resources and prompts MCP10:2025 + LLM01:2025; a sampling request MCP06:2025 + LLM01:2025;
+  a nested argument or a batch MCP06:2025; a call to an unlisted tool MCP02:2025 Privilege
+  Escalation via Scope Creep + ASI02:2026 + LLM06:2025
+
+MCP06:2025 is titled "Prompt Injection via Contextual Payloads" on the OWASP project page
+and "Intent Flow Subversion" in the project's repository file; the ID is the same, and the
+repository title is kept here.
 
 Sources (read 2026-10-11): OWASP Top 10 for LLM Applications 2025; OWASP Top 10 for
-Agentic Applications 2026 (ASI01-ASI10); OWASP MCP Top 10 (2025, beta). Lists change;
-the version of each is part of every ID.
+Agentic Applications 2026 (ASI01-ASI10); OWASP MCP Top 10 (2025, beta): the project page
+and the repository files for MCP02, MCP03, MCP06, MCP08 and MCP10. Lists change; the
+version of each is part of every ID.
 """
 
 from __future__ import annotations
@@ -34,11 +46,13 @@ TITLES = {
     "ASI01:2026": "Agent Goal Hijack",
     "ASI02:2026": "Tool Misuse and Exploitation",
     "ASI08:2026": "Cascading Failures",
+    "MCP02:2025": "Privilege Escalation via Scope Creep",
+    "MCP03:2025": "Tool Poisoning",
     "MCP06:2025": "Intent Flow Subversion",
     "MCP08:2025": "Lack of Audit and Telemetry",
     "MCP10:2025": "Context Injection & Over-Sharing",
 }
-MCP_INTEGRATIONS = ("invariant-mcp", "lasso-mcp-gateway")
+MCP_INTEGRATIONS = ("invariant-mcp", "lasso-mcp-gateway", "contextforge", "toolhive")
 AGENT_INTEGRATIONS = ("openai-agents", "openai-agents-js", "pydantic-ai", "google-adk", "semantic-kernel",
                       "crewai", "agno", "mastra")
 VERDICTS = ("allow", "block", "modify", "block_retry")
@@ -72,3 +86,19 @@ def risks(integration: str, stage: str, mode: str, observed: str, policy: str) -
         if mode == "policy_missing":
             out.append("MCP08:2025")
     return list(dict.fromkeys(out))
+
+
+_RESULT = ["MCP03:2025", "MCP10:2025", "LLM01:2025"]
+# MCP surface -> OWASP IDs, applied to a violated attack result (see mcp_surfaces.py).
+SURFACE_RISKS = {
+    **{sid: _RESULT for sid in ("m00", "m01", "m02", "m03", "m04", "m05", "m11", "m13")},
+    **{sid: ["MCP03:2025", "LLM01:2025"] for sid in ("m06", "m07", "m08", "m17", "m18")},
+    **{sid: ["MCP10:2025", "LLM01:2025"] for sid in ("m09", "m10")},
+    "m12": ["MCP06:2025", "LLM01:2025"],
+    "m14": ["MCP06:2025"], "m16": ["MCP06:2025"],
+    "m15": ["MCP02:2025", "ASI02:2026", "LLM06:2025"],
+}
+
+
+def surface_risks(surface_id: str) -> list[str]:
+    return list(SURFACE_RISKS.get(surface_id, []))

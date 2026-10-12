@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
+from .mcp_client import Exchange, http_session, stdio_session
 from .receipt import probe_versions
 from .servers import MockModel, Protocol, StandInScanner
 
@@ -153,6 +154,9 @@ class Adapter:
     # The framework ships no guard of its own: gcl's driver supplies the strictest one, so
     # results test the framework's enforcement, and the stand-in answers gcl's own protocol.
     harness_supplies_guard: ClassVar[bool] = False
+    # "http" | "stdio" on gateways that can run the MCP surfaces (`--extra mcp`); None: not an
+    # MCP integration, `--extra mcp` is refused rather than silently skipped.
+    mcp_transport: ClassVar[str | None] = None
 
     def __init__(self, python: str, workdir: Path, profile: str = "default"):
         self.python, self.workdir, self.profile = python, Path(workdir), profile
@@ -176,6 +180,16 @@ class Adapter:
 
     def versions(self) -> dict:
         return {}
+
+    def mcp_exchange(self, steps: list, timeout_s: float, protocol: str = "2025-03-26") -> Exchange:
+        """One raw MCP session through the gateway: handshake, then `steps` (JSON-RPC
+        messages, or lists for a batch). Only adapters with an `mcp_transport` implement it."""
+        raise NotImplementedError(f"{self.name} has no MCP surface support")
+
+    def mcp_name(self, kind: str, base: str) -> str:
+        """The name a client uses for the mock's tool/prompt/resource `base` (kind: "tool" |
+        "prompt" | "resource"). Gateways that namespace what they proxy override it."""
+        return base
 
     def config_files(self) -> dict:
         """Generated configuration, by file name, for repro bundles."""
@@ -449,6 +463,93 @@ class ReferenceGateway(Adapter):
         return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
                      {"model": "gcl-mock", "messages": messages, **({"stream": True} if stream else {})},
                      None, timeout_s)
+
+
+def _ref_mcp_gateway_path() -> Path:
+    return _ref_gateway_path().with_name("ref_mcp_gateway.py")
+
+
+class ReferenceMCPGateway(Adapter):
+    """The bundled reference MCP gateway (examples/enforce/ref_mcp_gateway.py): a streamable-HTTP
+    proxy in front of gcl's mock MCP server. Like the reference LLM gateway it documents a
+    fail-closed contract; `strict` keeps it for every message, `naive` guards only the note going
+    in and the first text content coming back, and treats scanner failures as "allow"."""
+
+    name = "reference-mcp"
+    protocol = LITELLM_GENERIC
+    capabilities: ClassVar[set[str]] = {"input", "output", "retry"}
+    mcp_transport: ClassVar[str] = "http"
+    default_timeout_s = 15.0
+    documented: ClassVar[dict] = {p: dict(ReferenceGateway._closed) for p in ("strict", "naive")}
+    documented_sources: ClassVar[dict] = {
+        p: {"source": "examples/enforce/ref_mcp_gateway.py (module docstring)", "read_for": "this release",
+            "passage": "fail closed, as ref_gateway.py: any scanner failure stops the message"}
+        for p in ("strict", "naive")}
+
+    def config_summary(self) -> dict:
+        return {"gateway": "examples/enforce/ref_mcp_gateway.py", "policy": self.profile,
+                "transport": "MCP streamable HTTP", "documented_contract": "fail closed", "tool": "gcl_probe"}
+
+    def versions(self) -> dict:
+        return _versions(self.python, [], self.workdir)
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        self.port = _free_port()
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen(
+                [self.python, str(_ref_mcp_gateway_path()),
+                 "--scanner", f"{scanner.base_for('input')}{self.protocol.path}",
+                 "--scanner-output", f"{scanner.base_for('output')}{self.protocol.path}",
+                 "--upstream", f"{model.base}/mcp", "--port", str(self.port), "--policy", self.profile],
+                stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+        _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 30, self.log)
+
+    def mcp_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/mcp"
+
+    def mcp_headers(self) -> dict:
+        return {}
+
+    def mcp_exchange(self, steps: list, timeout_s: float, protocol: str = "2025-03-26") -> Exchange:
+        return http_session(self.mcp_url(), self.mcp_headers(), steps, timeout_s, protocol=protocol)
+
+    def call(self, messages: list[dict], timeout_s: float, repeat: int = 1) -> Observation:
+        """One MCP session under one absolute deadline, as InvariantMCP.call."""
+        url = self.mcp_url()
+        t0 = time.perf_counter()
+        deadline = t0 + timeout_s
+
+        def left() -> float:
+            return deadline - time.perf_counter()
+
+        h: dict = {}
+        try:
+            code, hdrs, _ = _mcp_post(url, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "gcl", "version": "1"}}},
+                h, left())
+            sid = next((v for k, v in hdrs.items() if k.lower() == "mcp-session-id"), None)
+            if code >= 400 or not sid:
+                return Observation(code, "", True, time.perf_counter() - t0, f"initialize failed ({code})")
+            h = {"mcp-session-id": sid}
+            _mcp_post(url, {"jsonrpc": "2.0", "method": "notifications/initialized"}, h, left())
+        except OSError as e:
+            done = left() <= 0
+            return Observation(None, "", False, time.perf_counter() - t0,
+                               "client deadline reached" if done else f"transport failure: {e}", transport=not done)
+        text = messages[-1]["content"]
+        attempts: list[Observation] = []
+        for k in range(repeat):
+            if left() <= 0:
+                attempts.append(Observation(None, "", False, time.perf_counter() - t0, "client deadline reached"))
+                break
+            attempts.append(_post(url, {"jsonrpc": "2.0", "id": 2 + k, "method": "tools/call",
+                                        "params": {"name": "gcl_probe", "arguments": {"note": text}}},
+                                  {**h, "Accept": "application/json, text/event-stream"}, left()))
+        last = attempts[-1]
+        obs = Observation(last.status, last.text, last.finished, time.perf_counter() - t0, last.error, last.transport)
+        obs.attempts = attempts  # type: ignore[attr-defined]
+        return obs
 
 
 # --------------------------------------------------------------------------- Portkey
@@ -1487,12 +1588,24 @@ def _invariant_block(body: dict) -> dict:
                                               "ranges": ["messages.0"]}]}]}
 
 
+def _invariant_stage(body: dict) -> str | None:
+    """The Guardrails API has no stage; gcl infers one from the sentinels (_stage_by_sentinel).
+    MCP surface runs also send traffic that carries no scenario sentinel (tools/list, the
+    handshake's tool listing, surface markers GCL-C-/GCL-A-, m00 as m00i/m00o): that is accepted as "input" so
+    the gateway is judged on its own handling of it. Markers of two scenarios stay rejected."""
+    text = json.dumps(body, ensure_ascii=False)
+    surface = re.search(r"GCL-[CA]-m\d{2}[io]?-", text)  # m00 markers are m00i / m00o
+    if re.search(r"GCL-[UR]-[io]\d{2}\b", text) or ("GCL-" in text and not surface):
+        return _stage_by_sentinel(body)  # ordinary scenarios keep the strict inference
+    return "input"
+
+
 INVARIANT_CHECK = Protocol(
     name="Invariant guardrails API (POST /api/v1/policy/check/batch) and Explorer policy source",
     verdicts={"allow": lambda b, m: {"result": [{"errors": []}]},
               "block": lambda b, m: _invariant_block(b),
               "modify": lambda b, m: {"result": [{"errors": []}]}},
-    stage_of=_stage_by_sentinel, routes=("/api/v1/policy/check/batch",), single_listener=True,
+    stage_of=_invariant_stage, routes=("/api/v1/policy/check/batch",), single_listener=True,
     wrong_schema={"status": "ok"},
     static_posts={"/api/v1/push/trace": {"id": ["gcl-trace"]}, "/api/v1/trace/<id>/messages": {},
                   "/api/v1/policy/load": {}},
@@ -1526,6 +1639,7 @@ class InvariantMCP(Adapter):
     protocol = INVARIANT_CHECK
     capabilities: ClassVar[set[str]] = {"input", "output", "retry"}
     model_host = "::1"  # the gateway rewrites localhost/127.0.0.1 to host.docker.internal
+    mcp_transport: ClassVar[str | None] = "http"
     default_timeout_s = 20.0
     # Gateway docs: "In case any of the checks fail, Gateway will return an HTTP error
     # response instead of the LLM response." Nothing on the Guardrails or Explorer API
@@ -1559,13 +1673,28 @@ class InvariantMCP(Adapter):
                                          env=env, start_new_session=True, cwd=str(self.workdir))
         _wait_http(f"http://127.0.0.1:{self.port}/api/v1/gateway/health", self.proc, 90, self.log)
 
+    def mcp_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/api/v1/gateway/mcp/streamable"
+
+    def mcp_headers(self) -> dict:
+        """Routing and auth headers of every request: the upstream is named per request."""
+        return {"mcp-server-base-url": self._mcp_base, "INVARIANT-PROJECT-NAME": "gcl",
+                "INVARIANT-API-KEY": "inv-gcl",
+                "PUSH-INVARIANT-EXPLORER": "true" if self.profile == "push" else "false"}
+
+    def mcp_exchange(self, steps: list, timeout_s: float, protocol: str = "2025-03-26") -> Exchange:
+        """A raw MCP session through the gateway. The gateway answers initialize with its own
+        Mcp-Session-Id (not the upstream's); the client carries that one on every later request,
+        as call() does. Names pass through unchanged (tools/list renames a tool to
+        "blocked_<name>" only when its guardrails flagged it), so mcp_name is the base."""
+        return http_session(self.mcp_url(), self.mcp_headers(), steps, timeout_s, protocol=protocol)
+
     def call(self, messages: list[dict], timeout_s: float, repeat: int = 1) -> Observation:
         """One MCP session under one absolute deadline. With repeat=2 the same tools/call
         is sent twice in it (a client or agent retrying); every attempt is kept on the
         returned observation as `attempts`, and the last one is the observation."""
-        url = f"http://127.0.0.1:{self.port}/api/v1/gateway/mcp/streamable"
-        h = {"mcp-server-base-url": self._mcp_base, "INVARIANT-PROJECT-NAME": "gcl",
-             "INVARIANT-API-KEY": "inv-gcl", "PUSH-INVARIANT-EXPLORER": "true" if self.profile == "push" else "false"}
+        url = self.mcp_url()
+        h = self.mcp_headers()
         t0 = time.perf_counter()
         deadline = t0 + timeout_s
 
@@ -1753,6 +1882,7 @@ class LassoMCPGateway(Adapter):
     name = "lasso-mcp-gateway"
     protocol = LASSO_CLASSIFY
     capabilities: ClassVar[set[str]] = {"input", "output"}
+    mcp_transport: ClassVar[str | None] = "stdio"
     default_timeout_s = 30.0
     # Plugin docstrings: process_request "Blocks the request by returning None if violations
     # are found"; the code comments say unexpected errors "let the request through (fail
@@ -1786,6 +1916,7 @@ class LassoMCPGateway(Adapter):
             env.pop("LASSO_API_KEY", None)
         else:
             env["LASSO_API_KEY"] = "lasso-gcl"
+        self._env = env
         with open(self.log, "w") as logf:
             self.proc = subprocess.Popen([self.python, str(_driver_path("lasso_mcp_driver.py")),
                                           "--port", str(self.port), "--config", str(self._cfg_path),
@@ -1798,9 +1929,270 @@ class LassoMCPGateway(Adapter):
         p = getattr(self, "_cfg_path", None)
         return {p.name: p.read_text()} if p and p.exists() else {}
 
+    def mcp_name(self, kind: str, base: str) -> str:
+        """The name a client uses at the gateway. mcp_gateway/gateway.py:45 and :152 register
+        every proxied tool and prompt as f"{server_name}_{name}" (server "gcl"); resources are
+        not registered at all (gateway.py:303), so a resource name stays the upstream's."""
+        return f"gcl_{base}" if kind in ("tool", "prompt") else base
+
+    def mcp_exchange(self, steps: list, timeout_s: float, protocol: str = "2025-03-26") -> Exchange:
+        """A raw MCP session over stdio with a gateway process of its own (the gateway is the
+        stdio server, so nothing long-running is attached to): same launcher, config and
+        environment as the HTTP driver that serves the ordinary contract."""
+        argv = [self.python, str(_driver_path("lasso_gateway_launch.py")), "--mcp-json-path", str(self._cfg_path),
+                "-p", "lasso"]
+        return stdio_session(argv, self._env, steps, timeout_s, protocol=protocol, cwd=str(self.workdir))
+
     def call(self, messages: list[dict], timeout_s: float) -> Observation:
         return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
                      {"model": "gcl-mock", "messages": messages}, None, timeout_s)
+
+
+# --------------------------------------------------------------------------- MCP: IBM ContextForge
+def _cf_stage(body: dict) -> str | None:
+    """The hook names the stage: pre hooks run before the backend is called (input), post
+    hooks after it answered (output). The plugin sends the hook name with every request."""
+    hook = str(body.get("hook") or "") if isinstance(body, dict) else ""
+    return "input" if hook.endswith(("_pre_invoke", "_pre_fetch")) else "output" if hook.endswith(
+        ("_post_invoke", "_post_fetch")) else None
+
+
+CONTEXTFORGE_SCAN = Protocol(
+    name="gcl guard plugin for ContextForge ({'hook', 'texts'} -> {'verdict': 'ALLOW' | 'BLOCK'})",
+    verdicts={"allow": lambda b, m: {"verdict": "ALLOW"},
+              "block": lambda b, m: {"verdict": "BLOCK", "reason": "GCL-BLOCKED by the stand-in"},
+              "modify": lambda b, m: {"verdict": "ALLOW"}},
+    stage_of=_cf_stage, path="/scan",
+    scanned=lambda b: "\n".join(str(t) for t in b.get("texts") or []) if isinstance(b, dict) else None,
+    provenance="integration",
+    provenance_source="gcl's own plugin (drivers/contextforge_plugin.py); ContextForge ships no HTTP-scanner plugin",
+)
+
+# Plugin-framework settings per profile. `plugin` goes into the plugin's entry in plugins.yaml
+# (absent keys keep ContextForge's defaults); `env` into the gateway's environment.
+CONTEXTFORGE_PROFILES = {
+    "default": {"plugin": {}, "env": {}},                               # what a fresh entry gives
+    "enforce": {"plugin": {"mode": "enforce"}, "env": {}},              # the config template's explicit value
+    "ignore_error": {"plugin": {"mode": "enforce_ignore_error"}, "env": {}},
+    "permissive": {"plugin": {"mode": "permissive"}, "env": {}},
+}
+
+
+def _slug(text: str) -> str:
+    """mcpgateway/utils/create_slug.py: lower case, runs of non-alphanumerics become "-"."""
+    return re.sub(r"[\W_]+", "-", re.sub(r"(\w)['\u2019](\w)", r"\1\2", text.lower())).strip("-")
+
+
+class ContextForgeMCP(Adapter):
+    """IBM ContextForge (`mcp-contextforge-gateway`) as an MCP gateway: gcl's mock MCP server is
+    registered as a federated gateway (streamable HTTP), a virtual server exposes its tool,
+    resource and prompt, and a client talks to the virtual server's `/servers/<id>/mcp`.
+    ContextForge's plugin framework is on; its entry is gcl's guard plugin (the package ships
+    no plugin that asks an HTTP scanner), registered for the tool, prompt and resource hooks,
+    so what is tested is the gateway: which messages reach a hook, and what the executor does
+    with a violation, an error or a timeout under each mode."""
+
+    name = "contextforge"
+    harness_supplies_guard: ClassVar[bool] = True
+    protocol = CONTEXTFORGE_SCAN
+    capabilities: ClassVar[set[str]] = {"input", "output", "retry"}
+    mcp_transport: ClassVar[str | None] = "http"
+    default_timeout_s = 50.0   # past plugin_timeout (30 s), so a timeout the gateway enforces is seen
+    _F = ("error", "timeout", "malformed", "empty", "wrong_schema", "unknown_verdict", "verdict_type", "refused",
+          "null_verdict")
+    # cpex/framework/models.py: PluginMode (SEQUENTIAL "can halt the pipeline", TRANSFORM "blocking
+    # results are suppressed") and OnError ("fail: Pipeline halts, error propagates (default)",
+    # "ignore: Error logged; pipeline continues").
+    documented: ClassVar[dict] = {
+        "default": {**_BASE, "block_retry": "stopped", **{f: "stopped" for f in _F}},
+        "enforce": {**_BASE, "block_retry": "stopped", **{f: "stopped" for f in _F}},
+        "ignore_error": {**_BASE, "block_retry": "stopped", **{f: "passed" for f in _F}},
+        "permissive": {**_BASE, "block": "passed", "block_retry": "passed", **{f: "stopped" for f in _F}},
+    }
+    documented_sources: ClassVar[dict] = {}
+    _PASSAGES: ClassVar[dict] = {
+        "default": "PluginConfig.mode defaults to SEQUENTIAL and on_error to FAIL in the code (models.py:1238-1239); "
+                   "its docstring says 'mode ... Default: CONCURRENT', which conflicts. PluginMode: SEQUENTIAL 'Can "
+                   "halt the pipeline'. OnError.FAIL: 'Pipeline halts, error propagates (default)'. The "
+                   "PLUGINS_FAIL_ON_PLUGIN_ERROR setting is described as 'Globally halt the pipeline on any plugin "
+                   "error' but the code reads it only when a plugin is loaded (manager.py:1768).",
+        "enforce": "Config template: 'mode: \"enforce\"  # enforce | permissive | disabled'; legacy 'enforce' is "
+                   "migrated to SEQUENTIAL (models.py _migrate_legacy_modes). Same expectation as the default.",
+        "ignore_error": "Legacy 'enforce_ignore_error' is migrated to SEQUENTIAL with on_error=ignore (models.py "
+                        "_migrate_legacy_modes). OnError.IGNORE: 'Error logged; pipeline continues.'",
+        "permissive": "Legacy 'permissive' is migrated to TRANSFORM. PluginMode.TRANSFORM: 'Can modify payloads but "
+                      "cannot halt the pipeline - blocking results are suppressed.' on_error stays FAIL, so errors "
+                      "still halt.",
+    }
+    for _p, _t in _PASSAGES.items():
+        documented_sources[_p] = {"source": "mcp-contextforge-gateway 1.0.11 / cpex 0.1.4: cpex/framework/models.py "
+                                            "and settings.py docstrings",
+                                  "read_for": "mcp-contextforge-gateway 1.0.11", "passage": _t}
+
+    def __init__(self, python: str, workdir: Path, profile: str = "default"):
+        super().__init__(python, workdir, profile)
+        if profile not in CONTEXTFORGE_PROFILES:
+            raise ValueError(f"unknown contextforge profile {profile!r}; one of {sorted(CONTEXTFORGE_PROFILES)}")
+        self.server_id = ""
+        self.gateway_id = ""
+        self._model: MockModel | None = None
+        self._synced: tuple | None = None
+        self._tok = ""
+
+    def config_summary(self) -> dict:
+        return {"gateway": "mcpgateway.main:app (uvicorn), SQLite", "transport": "MCP streamable HTTP",
+                "backend": "gcl mock MCP server registered as a federated gateway",
+                "client_endpoint": "/servers/<virtual server id>/mcp (JWT bearer)",
+                "plugin": "gcl guard plugin (tool, prompt and resource hooks)",
+                "plugin_entry": CONTEXTFORGE_PROFILES[self.profile]["plugin"] or "mode and on_error unset (defaults)",
+                "plugin_timeout_s": 30, "fail_on_plugin_error": False, "ssrf_allow_localhost": True,
+                "rate_limiting_enabled": False}
+
+    def versions(self) -> dict:
+        return _versions(self.python, ["mcp-contextforge-gateway", "cpex", "mcp", "uvicorn"], self.workdir)
+
+    def _plugins_yaml(self, scanner: StandInScanner) -> dict:
+        hooks = ["tool_pre_invoke", "tool_post_invoke", "prompt_pre_fetch", "prompt_post_fetch",
+                 "resource_pre_fetch", "resource_post_fetch"]
+        entry = {"name": "GclScan", "kind": "contextforge_plugin.GclScanPlugin", "description": "gcl guard",
+                 "version": "1", "author": "gcl", "hooks": hooks, "priority": 10,
+                 "config": {"input_url": f"{scanner.base_for('input')}{self.protocol.path}",
+                           "output_url": f"{scanner.base_for('output')}{self.protocol.path}"},
+                 **CONTEXTFORGE_PROFILES[self.profile]["plugin"]}
+        return {"plugins": [entry], "plugin_dirs": [], "plugin_settings": {}}
+
+    def _api(self, method: str, path: str, body: dict | None = None, timeout_s: float = 60.0):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", method=method,
+                                     data=None if body is None else json.dumps(body).encode(),
+                                     headers={**self.mcp_headers(), "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_s) as r:
+                return r.status, json.loads(r.read() or b"null")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "replace")
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        import secrets
+
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        self.port = _free_port()
+        self._model = model
+        self._cfg_path = self.workdir / "plugins.yaml"
+        self._cfg_path.write_text(json.dumps(self._plugins_yaml(scanner), indent=2))  # JSON is YAML
+        # Throw-away credentials for this one local instance; the gateway refuses weak ones.
+        pw = f"Gcl-{secrets.token_urlsafe(18)}"
+        env = dict(os.environ, NO_PROXY="127.0.0.1,localhost,::1", no_proxy="127.0.0.1,localhost,::1",
+                   DATABASE_URL=f"sqlite:///{self.workdir / 'contextforge.db'}",
+                   JWT_SECRET_KEY=secrets.token_urlsafe(40), AUTH_ENCRYPTION_SECRET=secrets.token_urlsafe(40),
+                   PLATFORM_ADMIN_EMAIL="admin@example.com",
+                   PLATFORM_ADMIN_PASSWORD=pw, DEFAULT_USER_PASSWORD=pw, BASIC_AUTH_PASSWORD=pw,
+                   SSRF_ALLOW_LOCALHOST="true",           # the backend is on 127.0.0.1; blocked by default
+                   RATE_LIMITING_ENABLED="false",         # 100 requests/min by default; gcl is a test client, not load
+                   MCPGATEWAY_UI_ENABLED="false", PLUGINS_ENABLED="true", PLUGINS_CONFIG_FILE=str(self._cfg_path),
+                   PYTHONPATH=str(_driver_path("contextforge_plugin.py").parent),
+                   **CONTEXTFORGE_PROFILES[self.profile]["env"])
+        self._env = env
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen([self.python, "-m", "uvicorn", "mcpgateway.main:app", "--host", "127.0.0.1",
+                                          "--port", str(self.port)], stdout=logf, stderr=subprocess.STDOUT, env=env,
+                                         start_new_session=True, cwd=str(self.workdir))
+        _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 150, self.log)
+        tok = subprocess.run([self.python, "-m", "mcpgateway.utils.create_jwt_token", "-u", "admin@example.com",
+                              "--admin", "-e", "720"], env=env, cwd=str(self.workdir), capture_output=True, text=True)
+        self._tok = (tok.stdout.strip().splitlines() or [""])[-1]
+        if tok.returncode or not self._tok:
+            raise RuntimeError(f"could not mint a ContextForge token: {tok.stderr[-400:]}")
+        self.sync(self._mock_state())
+
+    def _mock_state(self) -> tuple:
+        return (self._model.mcp_surface, self._model.mcp_payload)
+
+    def sync(self, state: tuple) -> None:
+        """(Re-)register the mock as a federated gateway and expose it as a virtual server, so
+        the registry holds what the mock offers now (a federated gateway caches its tools,
+        prompts and resources when it is registered). A new surface or payload is a new backend state."""
+        if self.gateway_id:
+            self._api("DELETE", f"/servers/{self.server_id}")
+            self._api("DELETE", f"/gateways/{self.gateway_id}")
+        code, gw = self._api("POST", "/gateways", {"name": "gcl", "url": f"{self._model.base}/mcp",
+                                                   "transport": "STREAMABLEHTTP"})
+        if code >= 300 or not isinstance(gw, dict):
+            raise RuntimeError(f"ContextForge refused the backend gateway ({code}): {str(gw)[:400]}")
+        self.gateway_id = gw["id"]
+        ids = {}
+        for kind in ("tools", "resources", "prompts"):
+            code, rows = self._api("GET", f"/{kind}")
+            ids[kind] = [r["id"] for r in rows if isinstance(r, dict) and r.get("gatewayId") == self.gateway_id] \
+                if code == 200 else []
+        code, srv = self._api("POST", "/servers", {"server": {
+            "name": "gcl", "associated_tools": ids["tools"], "associated_resources": ids["resources"],
+            "associated_prompts": ids["prompts"]}})
+        if code >= 300 or not isinstance(srv, dict):
+            raise RuntimeError(f"ContextForge refused the virtual server ({code}): {str(srv)[:400]}")
+        self.server_id = srv["id"]
+        self._synced = state
+
+    def config_files(self) -> dict:
+        p = getattr(self, "_cfg_path", None)
+        return {p.name: p.read_text()} if p and p.exists() else {}
+
+    def mcp_name(self, kind: str, base: str) -> str:
+        """The name a client uses at the gateway. A federated gateway's tools are exposed as
+        "<gateway slug>-<tool slug>" (mcpgateway/services/tool_service.py:4115, utils/create_slug.py)."""
+        return f"gcl-{_slug(base)}" if kind in ("tool", "prompt") else base
+
+    def mcp_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/servers/{self.server_id}/mcp"
+
+    def mcp_headers(self) -> dict:
+        return {"Authorization": f"Bearer {self._tok}"}
+
+    def mcp_exchange(self, steps: list, timeout_s: float, protocol: str = "2025-03-26") -> Exchange:
+        """A raw MCP session. When the mock's surface or payload changed since the registry was filled, the
+        backend is registered again first (what an operator does after the backend changes)."""
+        if self._model is not None and self._mock_state() != self._synced:
+            self.sync(self._mock_state())
+        return http_session(self.mcp_url(), self.mcp_headers(), steps, timeout_s, protocol=protocol)
+
+    def call(self, messages: list[dict], timeout_s: float, repeat: int = 1) -> Observation:
+        """One MCP session under one absolute deadline, as InvariantMCP.call; the session id is
+        carried when the gateway issues one."""
+        url = self.mcp_url()
+        h = self.mcp_headers()
+        t0 = time.perf_counter()
+        deadline = t0 + timeout_s
+
+        def left() -> float:
+            return deadline - time.perf_counter()
+
+        try:
+            code, hdrs, _ = _mcp_post(url, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "gcl", "version": "1"}}},
+                h, left())
+            if code >= 400:
+                return Observation(code, "", True, time.perf_counter() - t0, f"initialize failed ({code})")
+            sid = next((v for k, v in hdrs.items() if k.lower() == "mcp-session-id"), None)
+            if sid:
+                h = {**h, "mcp-session-id": sid}
+            _mcp_post(url, {"jsonrpc": "2.0", "method": "notifications/initialized"}, h, left())
+        except OSError as e:
+            done = left() <= 0
+            return Observation(None, "", False, time.perf_counter() - t0,
+                               "client deadline reached" if done else f"transport failure: {e}", transport=not done)
+        text = messages[-1]["content"]
+        tool = self.mcp_name("tool", "gcl_probe")
+        attempts: list[Observation] = []
+        for k in range(repeat):
+            if left() <= 0:
+                attempts.append(Observation(None, "", False, time.perf_counter() - t0, "client deadline reached"))
+                break
+            attempts.append(_post(url, {"jsonrpc": "2.0", "id": 2 + k, "method": "tools/call",
+                                        "params": {"name": tool, "arguments": {"note": text}}},
+                                  {**h, "Accept": "application/json, text/event-stream"}, left()))
+        last = attempts[-1]
+        obs = Observation(last.status, last.text, last.finished, time.perf_counter() - t0, last.error, last.transport)
+        obs.attempts = attempts  # type: ignore[attr-defined]
+        return obs
 
 
 # --------------------------------------------------------------------------- OpenAI Agents SDK (JS)
@@ -1891,6 +2283,236 @@ class SemanticKernel(GoogleADK):
         _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 120, self.log)
 
 
+# --------------------------------------------------------------------------- MCP: Stacklok ToolHive
+def _th_uid(body) -> str:
+    return str(body.get("uid") or "") if isinstance(body, dict) else ""
+
+
+def _th_answer(body, allowed: bool, **more) -> dict:
+    """pkg/webhook/types.go `Response` (version, uid echoed back, allowed, message, reason). A mutating
+    webhook's `MutatingResponse` embeds it, so one body can answer both webhook types."""
+    return {"version": "v0.1.0", "uid": _th_uid(body), "allowed": allowed, **more}
+
+
+def _th_modify(body, text: str) -> dict:
+    """The rewrite a mutating webhook can express: an RFC 6902 patch under /mcp_request/ (the root is
+    refused, pkg/webhook/mutating/patch.go). The note of a tools/call is replaced; any other message
+    (initialize, tools/list, notifications) has none to replace and is allowed as it is."""
+    req = body.get("mcp_request") if isinstance(body, dict) else None
+    args = ((req or {}).get("params") or {}).get("arguments") if isinstance(req, dict) else None
+    if not (isinstance(req, dict) and req.get("method") == "tools/call" and isinstance(args, dict) and "note" in args):
+        return _th_answer(body, True)
+    return _th_answer(body, True, patch_type="json_patch",
+                      patch=[{"op": "replace", "path": "/mcp_request/params/arguments/note", "value": text}])
+
+
+TOOLHIVE_WEBHOOK = Protocol(
+    name="ToolHive webhook API v0.1.0 ({version, uid, timestamp, principal, mcp_request, context} -> "
+         "{version, uid, allowed, ...})",
+    verdicts={"allow": lambda b, m: _th_answer(b, True),
+              "block": lambda b, m: _th_answer(b, False, message="GCL-BLOCKED by the stand-in", reason="gcl_policy"),
+              "modify": _th_modify},
+    # The webhooks see only what a client sends to the server: every verdict is for the input side.
+    stage_of=lambda body: "input", routes=("/validate", "/mutate"), allow_unmarked=True,
+    provenance="integration",
+    provenance_source="ToolHive's own webhook API, defined in pkg/webhook/types.go (Request, Response, "
+                      "MutatingResponse) and pkg/webhook/{validating,mutating}/middleware.go, v0.51.4",
+)
+
+# failure_policy per profile (pkg/webhook/types.go FailurePolicy); the same on both webhooks.
+TOOLHIVE_PROFILES = {"fail": "fail", "ignore": "ignore"}
+
+
+def _thv_binary(where: str) -> Path:
+    p = Path(where).expanduser()
+    return p if p.is_file() else p / "thv"
+
+
+def _docker_socket() -> str | None:
+    """The socket ToolHive should use, found the way a Docker user would: its own variable, DOCKER_HOST,
+    else the current `docker context`. ToolHive reads none of the last two (it probes fixed paths
+    under $HOME, which the adapter moves), so without this it reports "no container runtime available"
+    on a Colima profile other than "default"."""
+    for v in (os.environ.get("TOOLHIVE_DOCKER_SOCKET"), os.environ.get("DOCKER_HOST")):
+        if v:
+            return v.removeprefix("unix://")
+    try:
+        r = subprocess.run(["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}"],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    host = r.stdout.strip()
+    return host.removeprefix("unix://") if r.returncode == 0 and host.startswith("unix://") else None
+
+
+class ToolHiveMCP(Adapter):
+    """Stacklok ToolHive (`thv`) as an MCP gateway: `thv run <URL>` runs gcl's mock MCP server as a
+    remote workload, i.e. a transparent proxy on a local port, with its dynamic webhook middleware on
+    (`--webhook-config`). No container is started and no image pulled; ToolHive still wants a
+    container runtime to exist (its workload manager is built on one), so it is pointed at the
+    Docker socket (TOOLHIVE_DOCKER_SOCKET, else DOCKER_HOST, else the current docker context).
+
+    `--env` is the `thv` binary or the directory holding it. All state (config, run configs,
+    status files) is kept in the run's own folder via HOME and XDG_*_HOME; update checks and usage
+    metrics are switched off (TOOLHIVE_SKIP_UPDATE_CHECK, TOOLHIVE_USAGE_METRICS_ENABLED).
+
+    Both webhook types point at the stand-in: a mutating one (it applies the stand-in's rewrite, so
+    "modify" is testable) and a validating one, with the same failure_policy. Only what the client
+    sends is shown to a webhook; ToolHive never sends a server reply to one, so the output side is
+    not applicable (no "output" capability). The client is an MCP client, as InvariantMCP's."""
+
+    name = "toolhive"
+    runtime = "node"  # --env points at the thv binary (or its folder), not at a Python environment
+    harness_supplies_guard: ClassVar[bool] = False
+    protocol = TOOLHIVE_WEBHOOK
+    # modify_input: the mutating webhook rewrites the note, the mock receives the stand-in's text, and
+    # run_contracts judges a tool that ran with exactly that rewrite (and none of the original) "modified".
+    capabilities: ClassVar[set[str]] = {"input", "modify_input", "retry"}
+    mcp_transport: ClassVar[str | None] = "http"
+    default_timeout_s = 40.0   # two webhooks x 3 s, on each of three requests, when both time out
+    _FAULTS = ("error", "timeout", "malformed", "empty", "unknown_verdict", "verdict_type", "refused")
+    documented: ClassVar[dict] = {
+        "fail": {**_BASE, "modify": "modified", "block_retry": "stopped", **{f: "stopped" for f in _FAULTS}},
+        "ignore": {**_BASE, "modify": "modified", "block_retry": "stopped", **{f: "passed" for f in _FAULTS}},
+    }
+    documented_sources: ClassVar[dict] = {
+        p: {"source": "toolhive v0.51.4: pkg/webhook/types.go (FailurePolicy), pkg/webhook/errors.go, "
+                      "docs/operator/crd-api.md (WebhookFailurePolicy), docs/middleware.md (dynamic webhooks)",
+            "read_for": "toolhive v0.51.4",
+            "passage": ("FailurePolicyFail: 'denies the request on webhook error (fail-closed)'; the webhook errors "
+                        "are timeouts, network errors and unparsable or invalid responses. Mutating webhooks "
+                        "'transform the parsed MCP request' (so a note rewritten by the webhook is what the "
+                        "server receives: modify, expected 'modified'); validating ones approve or deny it. "
+                        "Not documented, and decided by the code regardless of the policy: a body that decodes "
+                        "but lacks 'allowed' (wrong_schema), or has it null (null_verdict), reads as allowed=false "
+                        "and is an explicit denial (validating/middleware.go: 'if !resp.Allowed'); HTTP 422 "
+                        "always denies.") if p == "fail" else
+                       ("FailurePolicyIgnore: 'allows the request on webhook error (fail-open)'; the webhook "
+                        "errors are timeouts, network errors and unparsable or invalid responses. An explicit "
+                        "denial is honoured whatever the policy (mutating/middleware.go: 'Explicit denial from a "
+                        "mutating webhook is always honored, regardless of failure policy'). Not documented: a "
+                        "body that decodes but lacks 'allowed' (wrong_schema) or has it null (null_verdict) reads "
+                        "as allowed=false, an explicit denial.")} for p in ("fail", "ignore")}
+    known_issues: ClassVar[dict] = {}
+
+    def __init__(self, python: str, workdir: Path, profile: str = "fail"):
+        super().__init__(python, workdir, profile)
+        if profile not in TOOLHIVE_PROFILES:
+            raise ValueError(f"unknown toolhive profile {profile!r}; one of {sorted(TOOLHIVE_PROFILES)}")
+        self.thv = _thv_binary(python)
+        self._cfg_path = self.workdir / "webhooks.json"
+        self.port = 0
+        self._mcp_base = ""
+
+    def _env(self) -> dict:
+        """ToolHive's whole footprint under the run's folder; nothing is written to the real home."""
+        home = self.workdir / "toolhive-home"
+        for d in ("config", "data", "state"):
+            (home / d).mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / "config"),
+                   XDG_DATA_HOME=str(home / "data"), XDG_STATE_HOME=str(home / "state"),
+                   TOOLHIVE_SKIP_UPDATE_CHECK="true", TOOLHIVE_USAGE_METRICS_ENABLED="false",
+                   NO_PROXY="127.0.0.1,localhost,::1", no_proxy="127.0.0.1,localhost,::1")
+        sock = _docker_socket()
+        if sock:
+            env["TOOLHIVE_DOCKER_SOCKET"] = sock
+        return env
+
+    def config_summary(self) -> dict:
+        return {"gateway": "thv run <remote URL> (transparent proxy, no container)", "transport": "MCP streamable HTTP",
+                "webhooks": {"mutating": "gcl-mutate", "validating": "gcl-validate"},
+                "failure_policy": TOOLHIVE_PROFILES[self.profile], "webhook_timeout": "3s",
+                "tls_config": {"insecure_skip_verify": True}, "tool": "gcl_probe"}
+
+    def versions(self) -> dict:
+        import hashlib
+
+        try:
+            r = subprocess.run([str(self.thv), "version"], capture_output=True, text=True, timeout=60,
+                               env=self._env(), cwd=str(self.workdir))
+            digest = hashlib.sha256(self.thv.read_bytes()).hexdigest()
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return {"error": str(e)}
+        m = re.search(r"ToolHive v?(\S+)", r.stdout)
+        commit = re.search(r"Commit: (\w+)", r.stdout)
+        return {"toolhive": m.group(1) if m else None, "commit": commit.group(1) if commit else None,
+                "executable": str(self.thv), "sha256": digest}
+
+    def _webhooks(self, scanner: StandInScanner) -> dict:
+        base = scanner.base_for("input")
+        one = lambda name, route: {  # noqa: E731
+            "name": name, "url": f"{base}{route}", "timeout": "3s", "failure_policy": TOOLHIVE_PROFILES[self.profile],
+            # types.go: plain http is accepted only together with insecure_skip_verify
+            "tls_config": {"insecure_skip_verify": True}}
+        return {"mutating": [one("gcl-mutate", "/mutate")], "validating": [one("gcl-validate", "/validate")]}
+
+    def config_files(self) -> dict:
+        return {self._cfg_path.name: self._cfg_path.read_text()} if self._cfg_path.exists() else {}
+
+    def start(self, model: MockModel, scanner: StandInScanner) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        self.port = _free_port()
+        self._mcp_base = model.base
+        self._cfg_path.write_text(json.dumps(self._webhooks(scanner), indent=2))
+        argv = [str(self.thv), "run", f"{model.base}/mcp", "--foreground", "--name", "gcl", "--transport",
+                "streamable-http", "--proxy-port", str(self.port), "--webhook-config", str(self._cfg_path), "--debug"]
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen(argv, stdout=logf, stderr=subprocess.STDOUT, env=self._env(),
+                                         start_new_session=True, cwd=str(self.workdir))
+        _wait_http(f"http://127.0.0.1:{self.port}/health", self.proc, 60, self.log)
+
+    def mcp_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/mcp"
+
+    def mcp_headers(self) -> dict:
+        return {}
+
+    def mcp_exchange(self, steps: list, timeout_s: float, protocol: str = "2025-03-26") -> Exchange:
+        """A raw MCP session through the proxy. Names pass through unchanged (mcp_name is the base)."""
+        return http_session(self.mcp_url(), self.mcp_headers(), steps, timeout_s, protocol=protocol)
+
+    def call(self, messages: list[dict], timeout_s: float, repeat: int = 1) -> Observation:
+        """One MCP session under one absolute deadline, as InvariantMCP.call. A denial is HTTP 403 (or
+        500/422, by webhook type and cause) with a JSON-RPC error body, on whichever request it hits."""
+        url = self.mcp_url()
+        h: dict = {}
+        t0 = time.perf_counter()
+        deadline = t0 + timeout_s
+
+        def left() -> float:
+            return deadline - time.perf_counter()
+
+        try:
+            code, hdrs, _ = _mcp_post(url, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "gcl", "version": "1"}}},
+                h, left())
+            if code >= 400:
+                return Observation(code, "", True, time.perf_counter() - t0, f"initialize failed ({code})")
+            sid = next((v for k, v in hdrs.items() if k.lower() == "mcp-session-id"), None)
+            if sid:
+                h = {"mcp-session-id": sid}
+            code, _, _ = _mcp_post(url, {"jsonrpc": "2.0", "method": "notifications/initialized"}, h, left())
+            if code >= 400:
+                return Observation(code, "", True, time.perf_counter() - t0, f"initialized refused ({code})")
+        except OSError as e:
+            done = left() <= 0
+            return Observation(None, "", False, time.perf_counter() - t0,
+                               "client deadline reached" if done else f"transport failure: {e}", transport=not done)
+        text = messages[-1]["content"]
+        attempts: list[Observation] = []
+        for k in range(repeat):
+            if left() <= 0:
+                attempts.append(Observation(None, "", False, time.perf_counter() - t0, "client deadline reached"))
+                break
+            attempts.append(_post(url, {"jsonrpc": "2.0", "id": 2 + k, "method": "tools/call",
+                                        "params": {"name": "gcl_probe", "arguments": {"note": text}}},
+                                  {**h, "Accept": "application/json, text/event-stream"}, left()))
+        last = attempts[-1]
+        obs = Observation(last.status, last.text, last.finished, time.perf_counter() - t0, last.error, last.transport)
+        obs.attempts = attempts  # type: ignore[attr-defined]
+        return obs
+
+
 ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": OpenAIGuardrails,
             "nemo-selfcheck": NemoSelfCheck, "portkey": PortkeyGateway,
             "langchain-moderation": LangChainModeration, "mastra": MastraAgent, "openai-agents": OpenAIAgents,
@@ -1900,4 +2522,6 @@ ADAPTERS = {"litellm": LiteLLMProxy, "nemo": NemoServer, "openai-guardrails": Op
             "agno": AgnoAgent, "openai-guardrails-js": OpenAIGuardrailsJS,
             "google-adk": GoogleADK, "lasso-mcp-gateway": LassoMCPGateway,
             "openai-agents-js": OpenAIAgentsJS, "semantic-kernel": SemanticKernel, "reference": ReferenceGateway,
-            "coralogix-langchain": CoralogixLangChain, "llamafirewall": LlamaFirewallPII}
+            "contextforge": ContextForgeMCP, "toolhive": ToolHiveMCP,
+            "reference-mcp": ReferenceMCPGateway, "coralogix-langchain": CoralogixLangChain,
+            "llamafirewall": LlamaFirewallPII}

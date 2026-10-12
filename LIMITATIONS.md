@@ -191,6 +191,14 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   by field name; a secret in a field with an innocent name is stored.
 - `gcl compare` matches scenarios by stage, guard behaviour, role and language; runs of
   two different gcl versions may plan different scenarios, listed as "only in old/new".
+- `gcl upgrade-check` runs the two installs one after the other, each with its own run id (so a cache
+  that outlives an install cannot answer for the other), on one machine; a difference can be a flaky
+  scenario rather than the upgrade, and nothing re-runs a regressed row to tell. It cannot read an
+  integration's effective defaults: a changed default is visible only through a scenario that exercises
+  it, and the "docs re-read due" list only compares version numbers against the version each
+  expectation was read for (a version that cannot be ordered is reported as "differs"). "Guard
+  consulted" counts valid scanner requests on the controls per stage; it does not show the guard was
+  consulted for every request, or that it is the same guard. Latency sweeps and attack mode are not supported.
 - The GitHub Action and the version-watch workflow are tested for their structure, not run
   on GitHub from this repository.
 

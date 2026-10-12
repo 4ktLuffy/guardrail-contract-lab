@@ -383,6 +383,30 @@ regression (held → violated). The repository is also a GitHub Action
 ([action.yml](action.yml)); [examples/ci/version-watch.yml](examples/ci/version-watch.yml)
 re-runs an integration on its latest release every week and fails on a regression.
 
+#### Before you upgrade: `gcl upgrade-check`
+
+```bash
+gcl upgrade-check litellm --before /envs/now/bin/python --after /envs/next/bin/python --out out/upgrade
+```
+
+Runs the same enforce plan (same options, same scenarios) against both installs, one after the
+other, and writes one report: per scenario before → after (outcome, policy, documented), the
+regressions, the improvements and what did not change. Exit 1 on any regression: held → violated,
+held → unverified (the run can no longer show what it showed), or a guard that is no longer
+consulted. Exit 2 when no regression was found but the comparison could not be made (a side's
+controls were not usable, the guard was never asked in either run, scenarios on one side only).
+`--before-profile` / `--after-profile` run a different profile on one side (the reference gateway:
+strict → naive is an upgrade that broke fail-closed). `--extra`, `--scenario`, `--spec`, `--timeout`
+work as in `gcl enforce`; `out/upgrade/before` and `after` hold the two full reports.
+
+Two checks come from the receipts, not the diff. *Guard consulted*: the controls send a message
+through each stage, so a stage whose controls reached the guard before the upgrade and did not after
+means the guard went silently absent, which is a regression even when nothing in the later scenarios
+needed it. *Docs due*: each adapter's documented expectations were read for a stated version; the
+report lists, per package, whether the version you are moving to is past it. gcl does not read the
+integration's effective defaults, so a changed default (a new `default_on`, a flipped fail-open
+setting) shows up only as a changed scenario result, never as a line of its own.
+
 ### `gcl findings` — a ledger that only holds what runs can back
 
 ```bash

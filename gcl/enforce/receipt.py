@@ -133,3 +133,31 @@ def docs_version_problems(documented_source: dict, versions: dict) -> list[str]:
         if m and m.group(1).rstrip(".,;)") != ver:
             out.append(f"docs were read for {name} {m.group(1).rstrip('.,;)')}, installed is {ver}")
     return out
+
+
+def _vtuple(v: str) -> tuple | None:
+    """Leading numeric release of a version ("1.105.0rc1" -> (1, 105, 0)); None if it has none.
+    Only used to say "past" or "before"; a version that cannot be read is reported as "differs"."""
+    m = re.match(r"v?(\d+(?:\.\d+)*)", v)
+    return tuple(int(x) for x in m.group(1).split(".")) if m else None
+
+
+def docs_versions(documented_source: dict, versions: dict) -> list[dict]:
+    """For each package the expectations name a docs version for: the version the docs were
+    read for, the installed one, and how they relate ("matches", "past" the docs, "before" them,
+    "differs" when the order cannot be read). The same match rule as docs_version_problems, but it
+    keeps the matches too, so an upgrade report can say which docs are due for a re-read."""
+    read_for = (documented_source or {}).get("read_for") or ""
+    out = []
+    for name, ver in versions.items():
+        if name in ("python", "executable", "dists", "node", "error") or not isinstance(ver, str):
+            continue
+        m = re.search(rf"(?<![\w@/-]){re.escape(name)}\s+v?(\d[\w.+-]*)", read_for)
+        if not m:
+            continue
+        doc = m.group(1).rstrip(".,;)")
+        a, b = _vtuple(doc), _vtuple(ver)
+        rel = ("matches" if doc == ver else "differs" if a is None or b is None or a == b
+               else "past" if b > a else "before")
+        out.append({"package": name, "docs_read_for": doc, "installed": ver, "relation": rel})
+    return out

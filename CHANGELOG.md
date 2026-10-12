@@ -3,6 +3,13 @@
 ## Unreleased
 
 **New**
+- `gcl upgrade-check ADAPTER --before PY --after PY`: the same enforce plan against the installed and the
+  next version, one report (per scenario before -> after, regressions, improvements, unchanged); exit 1 on
+  held -> violated, held -> unverified or a guard no longer consulted at a stage, exit 2 if the comparison
+  could not be made (unusable controls on a side, guard never consulted, scenarios on one side only).
+  `--before-profile` / `--after-profile` per side. Reports which documented expectations were read for an
+  older version than the one installed (re-read due). `gcl compare` now shares its classification
+  (`compare.classify`) with it.
 - `--extra config`: is the configured policy the one that runs. A policy that fails to load must
   not allow everything; a live edit (tighten, loosen, once per edit mechanism) must take effect; a
   scoped policy must apply to its scope and only to it. Two stand-in scanners of gcl's own (A allows,

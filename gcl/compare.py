@@ -50,9 +50,34 @@ def _name(k: tuple) -> str:
     return f"{name} @{lat:g}s" if lat is not None else name
 
 
+def classify(x: dict, y: dict) -> str | None:
+    """How one scenario moved between two results: regressions | fixes | changed |
+    unverified_changes, or None when nothing moved. `gcl compare` and `gcl upgrade-check` share this,
+    so the two commands can never disagree about what a regression is."""
+    if x["policy"] == y["policy"] and x["observed"] == y["observed"]:
+        return None
+    if x["policy"] == "n/a" and y["policy"] == "violated":
+        return "regressions"  # newly carried and unscanned: a new leak
+    if "n/a" in (x["policy"], y["policy"]):
+        return "changed"  # carried or not is a change of the gateway; violated -> n/a too
+    if "unverified" in (x["policy"], y["policy"]):
+        return "unverified_changes"
+    if x["policy"] == "held" and y["policy"] == "violated":
+        return "regressions"
+    if x["policy"] == "violated" and y["policy"] == "held":
+        return "fixes"
+    return "changed"
+
+
 def compare(old_path: Path, new_path: Path) -> dict:
-    old, new = _runs(old_path), _runs(new_path)
-    ids = {(r["integration"]["integration"], r["integration"]["profile"]) for r in old + new}
+    return compare_runs(_runs(old_path), _runs(new_path), old_path, new_path)
+
+
+def compare_runs(old: list[dict], new: list[dict], old_path="old", new_path="new",
+                 same_profile: bool = True) -> dict:
+    """The comparison on loaded runs. `same_profile=False` lets two profiles of one integration
+    be compared (an upgrade check may switch the profile on one side to simulate a break)."""
+    ids = {(r["integration"]["integration"], r["integration"]["profile"] if same_profile else "") for r in old + new}
     if len(ids) != 1:
         raise ValueError("the two reports are for different integrations or profiles")
     a, b = _index(old, old_path), _index(new, new_path)
@@ -72,21 +97,10 @@ def compare(old_path: Path, new_path: Path) -> dict:
             out["only_new"].append(name)
             continue
         x, y = a[k], b[k]
-        if x["policy"] == y["policy"] and x["observed"] == y["observed"]:
-            continue
-        row = {"scenario": name, "old": f"{x['observed']}/{x['policy']}", "new": f"{y['observed']}/{y['policy']}"}
-        if x["policy"] == "n/a" and y["policy"] == "violated":
-            out["regressions"].append(row)  # newly carried and unscanned: a new leak
-        elif "n/a" in (x["policy"], y["policy"]):
-            out["changed"].append(row)  # carried or not is a change of the gateway; violated -> n/a too
-        elif "unverified" in (x["policy"], y["policy"]):
-            out["unverified_changes"].append(row)
-        elif x["policy"] == "held" and y["policy"] == "violated":
-            out["regressions"].append(row)
-        elif x["policy"] == "violated" and y["policy"] == "held":
-            out["fixes"].append(row)
-        else:
-            out["changed"].append(row)
+        cat = classify(x, y)
+        if cat:
+            out[cat].append({"scenario": name, "old": f"{x['observed']}/{x['policy']}",
+                             "new": f"{y['observed']}/{y['policy']}"})
     return out
 
 

@@ -706,6 +706,56 @@ def table(runs: Path = typer.Argument(..., exists=True, file_okay=False, help="F
     typer.echo(text)
 
 
+@app.command("evidence-pack")
+def evidence_pack(
+    reports: list[Path] = typer.Argument(..., exists=True, dir_okay=False,
+                                         help="gcl report.json files (enforce, coverage, probe)."),
+    out: Path = typer.Option(..., help="Directory for pack.json, pack.html, manifest.json and copies of the inputs."),
+    sign_key: Path | None = typer.Option(None, "--sign-key", exists=True, dir_okay=False,
+                                         help="File holding an HMAC key. Adds manifest.hmac: proves integrity "
+                                              "to whoever holds the key, not who made the pack."),
+):
+    """Map stored run reports to framework provisions, with hashes and an honest coverage matrix.
+
+    Technical test evidence only: not a conformity assessment, not legal advice."""
+    from . import evidence as E
+
+    try:
+        res = E.build(reports, out, sign_key)
+    except E.PackError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2) from None
+    p = res["pack"]
+    c = p["cell_summary"]
+    typer.echo(E.FW.DISCLAIMER)
+    typer.echo(f"\n{len(reports)} report(s); {p['totals']['total']} results mapped: {p['totals']['held']} held, "
+               f"{p['totals']['violated']} violated, {p['totals']['unverified']} unverified, {p['totals']['n/a']} n/a")
+    typer.echo(f"matrix cells: {c['held']} held, {c['violated']} violated, {c['unverified']} unverified, "
+               f"{c['not tested']} not tested, {c['n/a']} not applicable")
+    for w in p["warnings"]:
+        typer.echo(f"warning: {w}")
+    typer.echo("signing: " + res["manifest"]["signing"]["statement"])
+    typer.echo(f"\nPack: {out}/  ({', '.join(res['files'][:3])} ...)")
+
+
+@app.command("evidence-verify")
+def evidence_verify(
+    pack_dir: Path = typer.Argument(..., exists=True, file_okay=False,
+                                    help="A directory written by `gcl evidence-pack`."),
+    sign_key: Path | None = typer.Option(None, "--sign-key", exists=True, dir_okay=False,
+                                         help="HMAC key file to check manifest.hmac with."),
+):
+    """Re-hash every file in the manifest and check the HMAC. Exit 1 on any difference."""
+    from . import evidence as E
+
+    r = E.verify(pack_dir, sign_key)
+    typer.echo(f"{r['checked']} file(s) checked; signature: {r['signature']}")
+    for pr in r["problems"]:
+        typer.echo(f"PROBLEM: {pr}")
+    typer.echo("OK: every listed file matches the manifest" if r["ok"] else "NOT OK")
+    raise typer.Exit(0 if r["ok"] else 1)
+
+
 # Last, so every command above is registered when run as `python -m gcl.cli`.
 if __name__ == "__main__":  # pragma: no cover
     app()

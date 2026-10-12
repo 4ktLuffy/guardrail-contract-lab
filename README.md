@@ -407,6 +407,30 @@ has to misbehave, default configuration, documented — by a fixed rule
 person's own number (`findings override`) are kept with their reasons. The ledger may not
 live inside gcl's own checkout.
 
+### `gcl evidence-pack REPORT.json ... --out DIR` — stored runs as hashed, honest compliance evidence
+
+```bash
+gcl evidence-pack strict/report.json naive/report.json mcp/report.json --out pack/ --sign-key key.bin
+gcl evidence-verify pack/ --sign-key key.bin        # exit 1 on any changed, missing or unlisted file
+```
+
+Takes stored `enforce`, `coverage` and `probe` reports and writes `pack.json` (machine-readable),
+`pack.html`, a copy of every input, and `manifest.json`: the SHA-256 of every input and output and each
+run's receipt (run id, gcl commit, uncommitted files, integration versions). The pack maps each kind of
+check (allow/block controls, fail-closed faults, attack corpus, streaming and history, MCP surfaces,
+`--extra config`, coverage recall, scanner probe, latency) to provisions of the EU AI Act (Regulation (EU)
+2024/1689 as amended by 2026/1744), NIST AI RMF 1.0, NIST AI 600-1 and the OWASP lists, each row with a
+one-line reason and a strength (*direct* or *supporting*). The coverage matrix shows, per provision and
+check family, **held**, **violated**, **unverified**, **not tested** (no input covers it) or **not
+applicable**, with counts; a cell shows the worst state in it, so an unverified result is never reported
+as held and a family nobody ran is never blank. Provisions gcl considered and left out are listed with
+the reason ([gcl/frameworks.py](gcl/frameworks.py) holds the mapping and the list of provisions read from
+primary sources, with URLs), and so are the AI Act application dates (with the Digital Omnibus changes).
+`--sign-key FILE` adds an HMAC-SHA256 over the manifest: it proves the manifest is unchanged to whoever
+holds the key, not who made it. Without it nothing is called signed. This is technical test evidence,
+not a conformity assessment and not legal advice. ISO/IEC 42001 is listed as not mapped (control text
+not read).
+
 ## What the static checks mean
 
 | Code | Level | Hazard |

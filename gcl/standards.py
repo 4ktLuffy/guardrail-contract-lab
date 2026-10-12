@@ -25,6 +25,11 @@ the thing the risk describes:
   resources and prompts MCP10:2025 + LLM01:2025; a sampling request MCP06:2025 + LLM01:2025;
   a nested argument or a batch MCP06:2025; a call to an unlisted tool MCP02:2025 Privilege
   Escalation via Scope Creep + ASI02:2026 + LLM06:2025
+  a configuration check (`--extra config`, CONFIG_RISKS below) whose policy did not apply, so the
+  request the guard should have stopped reached the model: LLM01:2025 (a policy that failed to load,
+  a tightening edit, the scope itself); a failing component that disabled the protection (the load
+  failure only) also ASI08:2026 Cascading Failures. A stricter-than-configured outcome (loosening,
+  outside the scope) leaked nothing and has no tags.
 
 MCP06:2025 is titled "Prompt Injection via Contextual Payloads" on the OWASP project page
 and "Intent Flow Subversion" in the project's repository file; the ID is the same, and the
@@ -102,3 +107,13 @@ SURFACE_RISKS = {
 
 def surface_risks(surface_id: str) -> list[str]:
     return list(SURFACE_RISKS.get(surface_id, []))
+
+
+# Config check -> OWASP IDs, applied to a violated result (see config_checks.py).
+# Keyed on the check kind (the part before ":"), not on an id number: ids depend on the adapter.
+CONFIG_RISKS = {"load_failure": ["LLM01:2025", "ASI08:2026"], "live_tighten": ["LLM01:2025"],
+                "scope_in": ["LLM01:2025"]}
+
+
+def config_risks(kind: str) -> list[str]:
+    return list(CONFIG_RISKS.get(kind.split(":")[0], []))

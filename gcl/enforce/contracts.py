@@ -155,7 +155,7 @@ class Result:
         return d
 
 
-EXTRAS = ("stream", "history", "retry", "mcp")
+EXTRAS = ("stream", "history", "retry", "mcp", "config")
 FOLLOW_UP = "Thanks. Anything else?"
 
 
@@ -627,6 +627,8 @@ def _receipt(adapter: Adapter, integration: dict, run_id: str, timeout_s: float)
     problems = _rc.integrity_problems({"dists": install.get("dists") or {}})
     problems += _rc.docs_version_problems(integration.get("documented_source") or {},
                                           integration.get("versions") or {})
+    for cs in integration.get("config_documented_source") or []:  # --extra config's passages
+        problems += [p for p in _rc.docs_version_problems(cs, integration.get("versions") or {}) if p not in problems]
     src = _rc.gcl_source()
     if src["dirty_files"]:
         problems.append(f"gcl has {len(src['dirty_files'])} uncommitted or untracked file(s)")
@@ -671,7 +673,7 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
     """Run every scenario (or the controls plus `only`) against `adapter`. With
     `attacks` ({"cases", "flagged", "faults", "benign", "detector"}), run the attack × fault
     plan instead (see build_attack_scenarios). `mcp_protocol` is the MCP version the surfaces ask
-    for (`--extra mcp`)."""
+    for (`--extra mcp`). `--extra config` runs after everything else, see config_checks.py."""
     say = progress or (lambda *_: None)
     run_id = run_id or new_run_id()
     if "mcp" in extra and not adapter.mcp_transport:
@@ -679,6 +681,11 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
 
         raise ValueError(f"--extra mcp needs an MCP gateway: {adapter.name} has no MCP transport (try "
                          + ", ".join(n for n, a in ADAPTERS.items() if a.mcp_transport) + ")")
+    if "config" in extra and not adapter.config_checks:
+        from .adapters import ADAPTERS
+
+        raise ValueError(f"--extra config needs an adapter that can start with a given policy: {adapter.name} "
+                         "has none (try " + ", ".join(n for n, a in ADAPTERS.items() if a.config_checks) + ")")
     plan = (build_attack_scenarios(adapter, attacks["cases"], attacks["flagged"], attacks["faults"],
                                    attacks["benign"], run_id) if attacks else build_scenarios(adapter, run_id, extra))
     scenarios = [s for s in plan if not only or s.control or s.id in only]
@@ -690,6 +697,8 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
     background: dict = {}
     surfaces: list[dict] = []
     mcp_error = ""
+    config_results: list[dict] = []
+    config_error = ""
     with StandInScanner(adapter.protocol) as scanner, \
             MockModel("…", judge=scanner if adapter.protocol.shared_endpoint else None,
                       host=getattr(adapter, "model_host", "127.0.0.1")) as model:
@@ -737,6 +746,15 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
                 except Exception as e:  # the ordinary results are already measured: keep them
                     mcp_error = f"{type(e).__name__}: {e}"
                     surfaces = unverified_surfaces(run_id, only, f"error: {mcp_error}")
+            if "config" in extra:
+                from .config_checks import run_config, unverified_checks
+
+                adapter.stop()  # the ordinary integration is done; the checks start their own
+                try:
+                    config_results = run_config(adapter, model, run_id, timeout_s, say, only=only)
+                except Exception as e:  # the ordinary results are already measured: keep them
+                    config_error = f"{type(e).__name__}: {e}"
+                    config_results = unverified_checks(adapter, run_id, only, f"error: {config_error}")
         finally:
             adapter.stop()
         config_files = adapter.config_files()
@@ -887,7 +905,7 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         "timeout_s": timeout_s,
         "started_at": started,
         "results": [r.to_dict() for r in results],
-        "summary": _summary(results, surfaces),
+        "summary": _summary(results, surfaces + config_results),
         "known_issues": getattr(adapter, "known_issues", {}),
         "config_files": config_files,
         "unattributed_scanner_events": sum(
@@ -903,6 +921,14 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         out["results"] += surfaces
         out["mcp_surfaces"] = {"summary": summarize(surfaces), "protocol": negotiated_protocol(surfaces, mcp_protocol),
                                **({"error": mcp_error} if mcp_error else {})}
+    if "config" in extra:
+        from .config_checks import summarize as summarize_config
+
+        _gate_surfaces(config_results, results)  # the same opening / closing controls gate these results
+        out["summary"] = _summary(results, surfaces + config_results)
+        out["results"] += config_results
+        out["config_checks"] = {"summary": summarize_config(config_results),
+                                **({"error": config_error} if config_error else {})}
     if attacks:
         out["attack_matrix"] = {**attack_matrix(out["results"]), "detector": attacks.get("detector"),
                                 "faults": attacks["faults"], "dropped": attacks.get("dropped", [])}

@@ -20,6 +20,7 @@ import textwrap
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -127,6 +128,33 @@ def _wait_http(url: str, proc: subprocess.Popen, deadline_s: float, log: Path) -
     raise RuntimeError(f"integration did not come up within {deadline_s:.0f}s; log tail:\n{_tail(log)}")
 
 
+class StartRefused(Exception):
+    """The integration exited, or never became healthy, while starting with a policy gcl gave it
+    (`--extra config`). Not an error of gcl's: with a policy it could not load, refusing to start
+    is one of the honest answers. A missing binary or an unwritable workdir stays an OSError."""
+
+    def __init__(self, log_tail: str):
+        super().__init__(f"the integration did not start: {log_tail}")
+        self.log_tail = log_tail
+
+
+class CheckUnavailable(Exception):
+    """Raised by start_policy when the adapter knows before starting that this setup cannot run
+    the check (e.g. a live edit that needs a database URL): the check is unverified with the
+    reason, never held and never violated."""
+
+
+def _refusal_tail(log: Path, n: int = 15) -> str:
+    """The end of a log plus the lines that say why a process stopped (its last lines are often a
+    banner printed after the error)."""
+    try:
+        lines = log.read_text(errors="replace").splitlines()
+    except OSError:
+        return ""
+    why = [ln[:300] for ln in lines if re.search(r"Error|Exception|startup failed|Skipping", ln)][-6:]
+    return "\n".join([*why, "...", *(ln[:300] for ln in lines[-n:])])
+
+
 def _tail(log: Path, n: int = 15) -> str:
     try:
         return "\n".join(log.read_text(errors="replace").splitlines()[-n:])
@@ -157,6 +185,26 @@ class Adapter:
     # "http" | "stdio" on gateways that can run the MCP surfaces (`--extra mcp`); None: not an
     # MCP integration, `--extra mcp` is refused rather than silently skipped.
     mcp_transport: ClassVar[str | None] = None
+    # `--extra config` ("the configured guardrail policy is the one that runs"): which of
+    # "load_failure", "live_edit", "scope" this adapter can test; () refuses the extra. An adapter
+    # that has them also implements start_policy, edit_policy and call_scope, and names two scopes
+    # (routes it keeps apart, e.g. model names) and the documented time an edit takes to apply.
+    config_checks: ClassVar[tuple[str, ...]] = ()
+    config_scopes: ClassVar[tuple[str, str]] = ("", "")
+    propagation_s: ClassVar[float] = 0.0
+    # Ways a policy can fail to load, variant id -> plain description; the policy's "broken" takes
+    # one of these ids and one check is planned per variant, in declaration order.
+    load_failures: ClassVar[dict[str, str]] = {}
+    # Ways to edit a running policy (e.g. an API route); tighten and loosen run once per mechanism.
+    edit_mechanisms: ClassVar[tuple[str, ...]] = ()
+    # What the docs promise for the config checks: profile -> {check kind -> expected observed
+    # outcome(s)}. A kind is "load_failure", "live_tighten", "live_loosen", "scope_in", "scope_out",
+    # or the full "live_tighten:PATCH" / "load_failure:unknown_guard" (the full kind wins). A kind
+    # the docs say nothing about is left out: the result's documented verdict is "unspecified".
+    config_documented: ClassVar[dict] = {}
+    # profile -> [{"source", "read_for", "passage", "kinds"?}]: the passages those expectations
+    # rest on, shown beside the config results like documented_sources beside the ordinary ones.
+    config_documented_sources: ClassVar[dict] = {}
 
     def __init__(self, python: str, workdir: Path, profile: str = "default"):
         self.python, self.workdir, self.profile = python, Path(workdir), profile
@@ -173,7 +221,9 @@ class Adapter:
                                         if self.harness_supplies_guard else self.protocol.provenance_source),
                              "recorded_modes": list(self.protocol.recorded_modes),
                              "recorded_shape": self.protocol.recorded_shape},
-                "documented_source": self.documented_sources.get(self.profile, {})}
+                "documented_source": self.documented_sources.get(self.profile, {}),
+                **({"config_documented_source": self.config_documented_sources.get(self.profile, [])}
+                   if self.config_checks else {})}
 
     def config_summary(self) -> dict:
         return {}
@@ -185,6 +235,25 @@ class Adapter:
         """One raw MCP session through the gateway: handshake, then `steps` (JSON-RPC
         messages, or lists for a batch). Only adapters with an `mcp_transport` implement it."""
         raise NotImplementedError(f"{self.name} has no MCP surface support")
+
+    def start_policy(self, model: MockModel, scanners: dict[str, StandInScanner], policy: dict) -> None:
+        """Start the integration with gcl's neutral `policy` ({"guards": [{"name", "scanner": "A" |
+        "B", "scope": "*" | a config_scopes name}], "broken": None | one of
+        the adapter's load_failures ids, "editable": True for the live-edit checks}) translated into
+        its own configuration. Raises StartRefused if it exits while starting, RuntimeError if it
+        stays up but never becomes healthy, and
+        CheckUnavailable if this setup cannot run the check (e.g. an editable policy without a database)."""
+        raise NotImplementedError(f"{self.name} has no policy support")
+
+    def edit_policy(self, policy: dict, mechanism: str) -> dict:
+        """Apply a new policy to the RUNNING integration by `mechanism` (one of edit_mechanisms). Returns
+        {"mechanism", "acknowledged", "detail"}; acknowledged False is the integration refusing
+        the edit with a proper error."""
+        raise NotImplementedError(f"{self.name} has no policy support")
+
+    def call_scope(self, scope: str, messages: list[dict], timeout_s: float) -> Observation:
+        """One chat request addressed to the route `scope`."""
+        raise NotImplementedError(f"{self.name} has no policy support")
 
     def mcp_name(self, kind: str, base: str) -> str:
         """The name a client uses for the mock's tool/prompt/resource `base` (kind: "tool" |
@@ -319,6 +388,174 @@ class LiteLLMProxy(Adapter):
                      {"model": "gcl-model", "messages": messages, **({"stream": True} if stream else {})},
                      {"Authorization": f"Bearer {self.master_key}"}, timeout_s)
 
+    # ---- `--extra config`. Scope = the model name: two model_list entries ("gcl-x", "gcl-y") that
+    # both point at the mock model. A "*" guard is a plain guardrail with default_on true; a scoped
+    # guard is default_on false plus a policy that adds it plus an attachment `models: [<scope>]`
+    # (LiteLLM 1.99.0 and 1.105.0 both have `policies` / `policy_attachments`). The controls use
+    # "*" guards, the scope checks the policy mechanism: a scope check that goes red could in
+    # principle be the policy engine rather than the scope match, which is what the check is about.
+    config_checks: ClassVar[tuple[str, ...]] = ("load_failure", "live_edit", "scope")
+    config_scopes: ClassVar[tuple[str, str]] = ("gcl-x", "gcl-y")
+    load_failures: ClassVar[dict[str, str]] = {
+        "missing_file": "the --config file does not exist",
+        "unknown_guard": "a guardrail of an unknown type",
+        "no_api_base": "generic_guardrail_api without api_base",
+        "malformed_entry": "a guardrails entry without litellm_params"}
+    # Both routes of the management API: PATCH /guardrails/{id} and PUT /guardrails/{id}. Only
+    # guardrails created through POST /guardrails can be edited (config-file ones answer 404),
+    # and the management API needs a database: opt in with GCL_LITELLM_DATABASE_URL, a Postgres
+    # URL of a database used only by gcl (each live-edit start deletes every guardrail in it).
+    edit_mechanisms: ClassVar[tuple[str, ...]] = ("PATCH", "PUT")
+    database_env: ClassVar[str] = "GCL_LITELLM_DATABASE_URL"
+    # litellm/proxy/guardrails/guardrail_endpoints.py (update_guardrail, patch_guardrail): the
+    # endpoint updates the live guardrail in memory ("Immediate sync") before it answers. The
+    # periodic database sync (proxy_config_reload_interval_seconds, default 30 s) is for OTHER
+    # instances of the proxy; gcl runs one. So: applied by the time the call returns; 1 s of grace.
+    propagation_s: ClassVar[float] = 1.0
+    config_documented: ClassVar[dict] = {p: {"scope_in": "stopped"} for p in ("default", "fail_open")}
+    config_documented_sources: ClassVar[dict] = {p: [{
+        "source": "https://docs.litellm.ai/docs/proxy/guardrails/guardrail_policies",
+        "read_for": "litellm 1.105.0 (docs page read 2026-10-12)",
+        "passage": "Policies don't do anything until you attach them. Attachment matches are additive: every "
+                   "attachment whose scope matches the request contributes its policy; an attachment's models "
+                   "field takes model names. The docs say nothing on whether a config or database change to a "
+                   "guardrail applies without a restart, nor on what a guardrail that fails to load does."}]
+        for p in ("default", "fail_open")}
+
+    def _policy_config(self, model: MockModel, scanners: dict, policy: dict) -> dict:
+        """The proxy's config.yaml (JSON) for gcl's neutral `policy`. An editable policy's guard is
+        not in the file: start_policy creates it through the management API."""
+        broken = policy.get("broken")
+        guardrails, policies, attachments = [], {}, []
+        for g in [] if policy.get("editable") else policy["guards"]:
+            params = {"guardrail": "gcl-unknown-type" if broken == "unknown_guard" else "generic_guardrail_api",
+                      "mode": "pre_call", "default_on": g["scope"] == "*"}
+            if broken != "no_api_base":
+                params["api_base"] = scanners[g["scanner"]].base_for("input")
+            guardrails.append({"guardrail_name": g["name"]} if broken == "malformed_entry"
+                              else {"guardrail_name": g["name"], "litellm_params": params})
+            if g["scope"] != "*":
+                policies[f"policy-{g['name']}"] = {"guardrails": {"add": [g["name"]]}}
+                attachments.append({"policy": f"policy-{g['name']}", "models": [g["scope"]]})
+        return {
+            "model_list": [{"model_name": scope, "litellm_params": {
+                "model": f"openai/{model.model}", "api_base": model.openai_base, "api_key": "sk-gcl"}}
+                for scope in self.config_scopes],
+            "guardrails": guardrails,
+            **({"policies": policies, "policy_attachments": attachments} if policies else {}),
+            "general_settings": {"master_key": self.master_key},
+        }
+
+    def _api(self, method: str, path: str, body: dict | None = None, timeout_s: float = 30.0) -> tuple[int, str]:
+        """One management API call (the admin key); (status, body text)."""
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}", method=method,
+            data=None if body is None else json.dumps(body).encode(),
+            headers={"Authorization": f"Bearer {self.master_key}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_s) as r:
+                return r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "replace")
+
+    @staticmethod
+    def _db_name(url: str) -> str:
+        """The database name in a Postgres URL (path after the host, without query)."""
+        return urllib.parse.urlsplit(url).path.lstrip("/")
+
+    @staticmethod
+    def _guard_params(api_base: str) -> dict:
+        return {"guardrail": "generic_guardrail_api", "mode": "pre_call", "default_on": True, "api_base": api_base}
+
+    def start_policy(self, model: MockModel, scanners: dict[str, StandInScanner], policy: dict) -> None:
+        db = os.environ.get(self.database_env, "")
+        if policy.get("editable") and not db:
+            raise CheckUnavailable(f"needs a database: set {self.database_env}")
+        if policy.get("editable") and "gcl" not in self._db_name(db).lower():
+            # gcl deletes every guardrail in this database: refuse one that is not plainly its own.
+            raise CheckUnavailable(f"{self.database_env} names database {self._db_name(db)!r}: gcl deletes every "
+                                   "guardrail in it, so the name must contain 'gcl'")
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        self._scanners, self._guard_id, self._guard_name = scanners, None, ""
+        path = self.workdir / f"litellm-{self.profile}-config.yaml"
+        path.unlink(missing_ok=True)
+        if policy.get("broken") != "missing_file":   # else the path is given and does not exist
+            path.write_text(json.dumps(self._policy_config(model, scanners, policy), indent=2))
+        self._cfg_path = path
+        self.port = _free_port()
+        env = dict(os.environ, LITELLM_LOCAL_MODEL_COST_MAP="True", NO_PROXY="127.0.0.1,localhost",
+                   no_proxy="127.0.0.1,localhost", LITELLM_MASTER_KEY=self.master_key)
+        env.pop("DATABASE_URL", None)
+        args = ["--config", str(path), "--host", "127.0.0.1", "--port", str(self.port)]
+        if policy.get("editable"):   # prisma is found through PATH; the schema is created at start
+            env.update(DATABASE_URL=db, PATH=f"{Path(self.python).parent}{os.pathsep}{env.get('PATH', '')}")
+            args.append("--use_prisma_db_push")
+        exe = str(Path(self.python).with_name("litellm"))
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen([exe, *args], stdout=logf, stderr=subprocess.STDOUT, env=env,
+                                         start_new_session=True)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 120:
+            if self.proc.poll() is not None:
+                raise StartRefused(_refusal_tail(self.log))
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health/liveliness", timeout=2):
+                    break
+            except urllib.error.HTTPError:
+                break
+            except (urllib.error.URLError, OSError):
+                time.sleep(0.5)
+        else:
+            raise RuntimeError(f"litellm is running but was not healthy after 120s; log tail:\n{_tail(self.log)}")
+        if policy.get("editable"):
+            self._seed_guardrail(policy["guards"][0], scanners)
+
+    def _seed_guardrail(self, guard: dict, scanners: dict) -> None:
+        """Every start begins from an empty guardrail table: delete what an earlier check left,
+        create this check's one guardrail through the API, and prove through the database listing
+        (/v2/guardrails/list; /guardrails/list shows only the in-memory ones) that it is the
+        only one. Anything else is CheckUnavailable: an unknown guardrail could be the thing under test."""
+        def listing() -> list[dict]:
+            st, text = self._api("GET", "/v2/guardrails/list")
+            if st != 200:
+                raise CheckUnavailable(f"GET /v2/guardrails/list answered {st}: {text[:200]}")
+            return json.loads(text).get("guardrails") or []
+
+        for g in listing():
+            st, text = self._api("DELETE", f"/guardrails/{g.get('guardrail_id')}")
+            if st != 200:
+                raise CheckUnavailable(f"could not clear a guardrail left in the database: {st} {text[:200]}")
+        st, text = self._api("POST", "/guardrails", {"guardrail": {
+            "guardrail_name": guard["name"],
+            "litellm_params": self._guard_params(scanners[guard["scanner"]].base_for("input"))}})
+        if st != 200:
+            raise CheckUnavailable(f"POST /guardrails answered {st}: {text[:200]}")
+        self._guard_id, self._guard_name = json.loads(text).get("guardrail_id"), guard["name"]
+        now = [g.get("guardrail_name") for g in listing()]
+        if now != [guard["name"]] or not self._guard_id:
+            raise CheckUnavailable(f"the guardrail table is not clean: expected only {guard['name']!r}, got {now}")
+
+    def edit_policy(self, policy: dict, mechanism: str) -> dict:
+        guard = policy["guards"][0]
+        params = self._guard_params(self._scanners[guard["scanner"]].base_for("input"))
+        path = f"/guardrails/{self._guard_id}"
+        body = ({"litellm_params": params} if mechanism == "PATCH"
+                else {"guardrail": {"guardrail_name": self._guard_name, "litellm_params": params}})
+        st, text = self._api(mechanism, path, body)
+        return {"mechanism": f"{mechanism} {path.rsplit('/', 1)[0]}/{{id}}", "acknowledged": 200 <= st < 300,
+                "detail": f"HTTP {st} {' '.join(text.split())[:160]}"}
+
+    def call_scope(self, scope: str, messages: list[dict], timeout_s: float) -> Observation:
+        return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions", {"model": scope, "messages": messages},
+                     {"Authorization": f"Bearer {self.master_key}"}, timeout_s)
+
+    def stop(self) -> None:
+        if self.proc is not None and getattr(self, "_guard_id", None):   # leave the database empty again
+            with contextlib.suppress(Exception):
+                self._api("DELETE", f"/guardrails/{self._guard_id}", timeout_s=5.0)
+            self._guard_id = None
+        super().stop()
+
 
 # --------------------------------------------------------------------------- NeMo
 NEMO_JAILBREAK = Protocol(
@@ -440,6 +677,16 @@ class ReferenceGateway(Adapter):
             "passage": "fail closed: any scanner error, timeout, unparseable or unrecognised verdict "
                        "stops the request"} for p in ("strict", "naive")}
 
+    # The policy-file contract in ref_gateway.py's docstring, for both profiles (naive breaks it).
+    config_documented: ClassVar[dict] = {p: {
+        "load_failure": ["refused to start", "stopped"], "live_tighten": "stopped", "live_loosen": "passed",
+        "scope_in": "stopped", "scope_out": "passed"} for p in ("strict", "naive")}
+    config_documented_sources: ClassVar[dict] = {p: [{
+        "source": "examples/enforce/ref_gateway.py (module docstring)", "read_for": "this release",
+        "passage": "a policy file that cannot be loaded makes the gateway refuse to start (or, once running, "
+                   "refuse every request); an edit takes effect on the next request, without a restart; a "
+                   "scoped guard applies to its scope and never to another"}] for p in ("strict", "naive")}
+
     def config_summary(self) -> dict:
         return {"gateway": "examples/enforce/ref_gateway.py", "policy": self.profile,
                 "documented_contract": "fail closed"}
@@ -463,6 +710,77 @@ class ReferenceGateway(Adapter):
         return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
                      {"model": "gcl-mock", "messages": messages, **({"stream": True} if stream else {})},
                      None, timeout_s)
+
+    # `--extra config`: the gateway's policy file (see ref_gateway.py for its contract).
+    config_checks: ClassVar[tuple[str, ...]] = ("load_failure", "live_edit", "scope")
+    config_scopes: ClassVar[tuple[str, str]] = ("gcl-x", "gcl-y")
+    load_failures: ClassVar[dict[str, str]] = {
+        "missing": "policy file missing", "malformed": "policy file not valid JSON",
+        "unknown_guard": "a guard of an unknown type"}
+    edit_mechanisms: ClassVar[tuple[str, ...]] = ("file",)
+    propagation_s: ClassVar[float] = 0.2   # re-read on the next request after the mtime changes
+
+    def _render_policy(self, policy: dict) -> str | None:
+        """The policy as the gateway's file text; None: no file at all (broken "missing")."""
+        broken = policy.get("broken")
+        if broken == "missing":
+            return None
+        if broken == "malformed":
+            return '{"guards": [ {"name": "gcl-a", "type": "http", '   # cut off: not JSON
+        urls = {k: f"{s.base_for('input')}{self.protocol.path}" for k, s in self._scanners.items()}
+        kind = "gcl-unknown" if broken == "unknown_guard" else "http"
+        return json.dumps({"guards": [{"name": g["name"], "type": kind, "scanner": urls[g["scanner"]],
+                                       "scope": g["scope"]} for g in policy["guards"]]}, indent=2)
+
+    def _write_policy(self, policy: dict) -> None:
+        """Write the policy file atomically (a temporary file, then os.replace) and make sure its
+        modification time moved: the gateway re-reads on a changed mtime, and a filesystem with
+        coarse timestamps could give the edit the old one."""
+        text = self._render_policy(policy)
+        before = self._policy_file.stat().st_mtime_ns if self._policy_file.exists() else None
+        if text is None:
+            self._policy_file.unlink(missing_ok=True)
+            return
+        tmp = self._policy_file.with_name(self._policy_file.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, self._policy_file)
+        if before is not None and self._policy_file.stat().st_mtime_ns <= before:
+            bumped = before + 1_000_000_000
+            os.utime(self._policy_file, ns=(bumped, bumped))
+
+    def start_policy(self, model: MockModel, scanners: dict[str, StandInScanner], policy: dict) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        self.port = _free_port()
+        self._scanners = scanners
+        self._policy_file = self.workdir / f"reference-{self.profile}-policy.json"
+        self._policy_file.unlink(missing_ok=True)
+        self._write_policy(policy)
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen(
+                [self.python, str(_ref_gateway_path()), "--policy-file", str(self._policy_file),
+                 "--model", f"{model.openai_base}/chat/completions", "--port", str(self.port),
+                 "--policy", self.profile], stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 15:
+            if self.proc.poll() is not None:
+                raise StartRefused(_tail(self.log))
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health", timeout=2):
+                    return
+            except urllib.error.HTTPError:
+                return
+            except (urllib.error.URLError, OSError):
+                time.sleep(0.1)
+        raise RuntimeError(f"the integration is running but was not healthy after 15s; log tail:\n{_tail(self.log)}")
+
+    def edit_policy(self, policy: dict, mechanism: str = "file") -> dict:
+        self._write_policy(policy)
+        return {"mechanism": "policy file rewrite", "acknowledged": True,
+                "detail": f"{self._policy_file.name} replaced atomically (temporary file, os.replace)"}
+
+    def call_scope(self, scope: str, messages: list[dict], timeout_s: float) -> Observation:
+        return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                     {"model": scope, "messages": messages}, None, timeout_s)
 
 
 def _ref_mcp_gateway_path() -> Path:

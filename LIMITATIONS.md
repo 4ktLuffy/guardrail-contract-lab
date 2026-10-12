@@ -211,6 +211,25 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   recognisable form (dropped or summarised) is unverified: gcl cannot tell a safe drop
   from a summary of the blocked text.
 
+## Config applied (`--extra config`)
+- Only the adapters that implement it (`reference` and `litellm`). Propagation of a live
+  edit is waited for (the adapter's documented time plus 0.5 s), not polled: an integration that
+  applies edits later than it documents reads as "old policy kept running". One guard per policy;
+  combinations of guards and scopes beyond one scope are not tested.
+- LiteLLM: the live-edit checks need a database (`GCL_LITELLM_DATABASE_URL`) and only test guardrails
+  created through the management API (config-file guardrails cannot be edited: 404). The edit is
+  waited for 1.5 s (the endpoint updates the live guardrail before it answers; the 30 s periodic
+  database sync is for other instances and runs only with `store_model_in_db: true`, which gcl does not
+  set), so an edit that applies only at the next sync reads as "old policy kept running". Scope is the model name; teams, keys and tags are not tested. LiteLLM's docs
+  say nothing on whether a guardrail change applies without a restart and nothing on a guardrail that
+  fails to load, so only the in-scope check has a documented verdict.
+- LiteLLM's MCP-scope case (issue #41680) is not reachable with gcl's stand-in guard on any released
+  LiteLLM: attachments have no MCP-server dimension (teams, keys, models, tags only), the
+  `generic_guardrail_api` guard that gcl points at its scanners cannot run on MCP traffic (its modes
+  are `pre_call`, `post_call`, `during_call`; the MCP modes are skipped at start-up), and the fix that
+  lets policy guardrails run on MCP output (PR #41334) is not merged. It needs a guard type that runs
+  on MCP traffic, plus that PR.
+
 ## MCP surfaces (`--extra mcp`)
 - Shapes of protocol versions 2025-03-26 to 2025-11-25 only. gcl negotiates 2025-03-26 unless
   `--mcp-protocol` asks for another. Some surfaces were introduced later (m02 `structuredContent`

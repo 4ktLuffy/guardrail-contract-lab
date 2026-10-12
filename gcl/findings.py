@@ -100,7 +100,8 @@ def _key(run: dict, r: dict) -> dict:
     return {"integration": i["integration"], "profile": i["profile"], "stage": s["stage"], "mode": s["mode"],
             "role": s.get("role") or "", "lang": s["lang"], "judge_latency_s": run.get("judge_latency_s"),
             "stream": bool(s.get("stream")), "history": bool(s.get("history")), "attack": s.get("attack") or "",
-            **({"surface": s["id"]} if s.get("surface") else {})}  # an MCP surface: one finding per surface
+            **({"surface": s["id"]} if s.get("surface") else {}),  # an MCP surface: one finding per surface
+            **({"config": s["config"]["check"]} if s.get("config") else {})}  # a config check: one per kind
 
 
 # Fields of a run's evidence that are derived from the report: `check` recomputes them all.

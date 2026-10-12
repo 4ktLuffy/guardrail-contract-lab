@@ -12,9 +12,41 @@ are treated as "allow". Use it to see `gcl enforce` catch the difference.
 
     python ref_gateway.py --scanner URL [--scanner-output URL] --model URL --port N \
         --policy strict|naive
+    python ref_gateway.py --policy-file PATH [--scanner-output URL] --model URL --port N \
+        --policy strict|naive
+
+With `--policy-file` the guards come from a policy file instead of one `--scanner` URL
+(`gcl enforce reference --extra config` tests this part):
+
+    {"guards": [{"name": "g1", "type": "http", "scanner": "http://127.0.0.1:9/x", "scope": "*"}]}
+
+Its documented contract, "the configured policy is the one that runs":
+  - the input (pre-model) guards are the policy's guards whose `scope` is "*" or equals the
+    request body's `model`; a request must pass every matching guard (a scoped guard never
+    applies to another model). The output stage still uses --scanner-output, if given;
+  - the file is re-read whenever its modification time changes, checked on every request, so
+    an edit takes effect on the next request, without a restart;
+  - a policy file that is missing, cannot be parsed, or has a structure it does not know (no
+    `guards` list, a guard without a string `scanner` or `scope`, a guard `type` other than
+    "http") makes the gateway refuse to start (exit code 2, the reason on stderr); if the file
+    becomes broken while running, every request is refused (fail closed, 503) until it is fixed.
+So, for a client: a policy that cannot load is refused at start or every request is stopped; a
+guard added or pointed at a blocking scanner by an edit stops the next request; one pointed at an
+allowing scanner lets the next request pass; a scoped guard stops requests to its scope and
+never touches the other scope.
+`--policy strict` keeps that contract. `--policy naive` breaks it the way real issues do: a
+missing or malformed file starts the gateway with no guards (everything allowed); the file is
+read once at startup, so edits are ignored (LiteLLM #40201); a scoped guard (scope other than
+"*") never matches anything (LiteLLM #41680: a scoped attachment matched nothing); a guard of an
+unknown type is skipped.
 """
+from __future__ import annotations
+
 import argparse
 import json
+import os
+import sys
+import threading
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,9 +59,77 @@ def post(url: str, body: dict, timeout: float) -> dict:
         return json.loads(r.read().decode())
 
 
-def check(args, texts: list[str], stage: str):
+class PolicyError(Exception):
+    """The policy file cannot be used: missing, unparseable or of a structure not known."""
+
+
+def parse_policy(text: str, skip_unknown: bool = False) -> list[dict]:
+    """The guards of a policy file's text. Raises PolicyError for anything not understood: an
+    unknown structure is never read as "no guards". With `skip_unknown` (naive) a guard of an
+    unknown type is left out instead."""
+    try:
+        doc = json.loads(text)
+    except ValueError as e:
+        raise PolicyError(f"not valid JSON: {e}") from None
+    guards = doc.get("guards") if isinstance(doc, dict) else None
+    if not isinstance(guards, list):
+        raise PolicyError('no "guards" list')
+    for g in guards:
+        if not (isinstance(g, dict) and isinstance(g.get("scanner"), str) and isinstance(g.get("scope"), str)):
+            raise PolicyError(f"a guard needs a string scanner and scope: {g!r}")
+        if g.get("type", "http") != "http" and not skip_unknown:
+            raise PolicyError(f"unknown guard type {g.get('type')!r} (only \"http\")")
+    return [g for g in guards if g.get("type", "http") == "http"]
+
+
+class Policy:
+    """The policy file as the gateway sees it. Strict: re-read when the modification time
+    changes, broken means refuse. Naive: read once, broken means no guards."""
+
+    def __init__(self, path: str, mode: str):
+        self.path, self.mode = path, mode
+        self.guards: list[dict] = []
+        self.error = ""
+        self._stamp = None
+        self._lock = threading.Lock()
+        self._load()   # a strict gateway with a broken file is stopped by the caller (self.error)
+
+    def _load(self) -> None:
+        try:
+            self._stamp = os.stat(self.path).st_mtime_ns
+            with open(self.path, encoding="utf-8") as f:
+                text = f.read()
+            self.guards, self.error = parse_policy(text, self.mode == "naive"), ""
+        except (OSError, PolicyError) as e:
+            self.guards, self.error = [], f"{type(e).__name__}: {e}"
+        if self.mode == "naive":  # carries on without the policy it could not read
+            self.error = ""
+
+    def current(self) -> list[dict] | None:
+        """The guards that apply now, or None if the policy is unusable (strict only)."""
+        if self.mode == "strict":
+            with self._lock:
+                try:
+                    stamp = os.stat(self.path).st_mtime_ns
+                except OSError:
+                    stamp = None
+                if stamp != self._stamp or stamp is None:
+                    self._load()
+                return None if self.error else self.guards
+        return self.guards
+
+    def matching(self, model: str) -> list[dict] | None:
+        guards = self.current()
+        if guards is None:
+            return None
+        if self.mode == "naive":
+            return [g for g in guards if g["scope"] == "*"]
+        return [g for g in guards if g["scope"] in ("*", model)]
+
+
+def check(args, texts: list[str], stage: str, url: str | None = None):
     """Return ("allow" | "block", texts). Strict: anything unexpected blocks."""
-    url = args.scanner_output if stage == "response" and args.scanner_output else args.scanner
+    url = url or (args.scanner_output if stage == "response" and args.scanner_output else args.scanner)
     try:
         verdict = post(url, {"texts": texts, "input_type": stage}, timeout=3)
     except Exception:
@@ -51,12 +151,37 @@ def check(args, texts: list[str], stage: str):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scanner", required=True)
+    ap.add_argument("--scanner", default="", help="scanner URL (not with --policy-file)")
+    ap.add_argument("--policy-file", default="", help="JSON policy file: the guards and their scopes")
     ap.add_argument("--scanner-output", default="", help="scanner URL for replies (default: --scanner)")
     ap.add_argument("--model", required=True)
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--policy", choices=["strict", "naive"], required=True)
     args = ap.parse_args()
+    if bool(args.scanner) == bool(args.policy_file):
+        ap.error("give exactly one of --scanner and --policy-file")
+    policy = Policy(args.policy_file, args.policy) if args.policy_file else None
+    if policy is not None and policy.error:  # strict: refuse to start with a policy it cannot load
+        print(f"ref_gateway: cannot load the policy file: {policy.error}", file=sys.stderr)
+        sys.exit(2)
+
+    def input_check(texts: list[str], model: str):
+        """The request-side verdict: the one --scanner, or every guard the policy has for `model`."""
+        if policy is None:
+            return check(args, texts, "request")
+        guards = policy.matching(model)
+        if guards is None:  # the policy became unusable while running: fail closed
+            return "refuse", texts
+        for g in guards:
+            decision, texts = check(args, texts, "request", g["scanner"])
+            if decision == "block":
+                return decision, texts
+        return "allow", texts
+
+    def output_check(texts: list[str]):
+        if policy is not None and not args.scanner_output:
+            return "allow", texts
+        return check(args, texts, "response")
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -77,7 +202,10 @@ def main() -> None:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
             messages = body.get("messages", [])
             texts = [m.get("content", "") for m in messages]
-            decision, texts = check(args, texts, "request")
+            decision, texts = input_check(texts, str(body.get("model", "")))
+            if decision == "refuse":
+                self._json(503, {"error": {"message": "policy unusable: refused"}})
+                return
             if decision == "block":
                 self._json(400, {"error": {"message": "blocked by guardrail"}})
                 return
@@ -89,7 +217,7 @@ def main() -> None:
                 self._json(502, {"error": {"message": "model unavailable"}})
                 return
             content = reply["choices"][0]["message"]["content"]
-            decision, out = check(args, [content], "response")
+            decision, out = output_check([content])
             if decision == "block":
                 self._json(400, {"error": {"message": "blocked by guardrail"}})
                 return

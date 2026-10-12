@@ -43,9 +43,11 @@ def test_invariant_exchange_hands_the_client_the_gateway_url_and_routing_headers
     ad.port, ad._mcp_base = 4321, "http://[::1]:99"
     seen = {}
     monkeypatch.setattr(adapters, "http_session",
-                        lambda url, headers, steps, timeout_s: seen.update(url=url, headers=headers, steps=steps,
-                                                                           timeout_s=timeout_s) or Exchange())
-    ad.mcp_exchange(STEPS, 7.5)
+                        lambda url, headers, steps, timeout_s, protocol: seen.update(
+                            url=url, headers=headers, steps=steps, timeout_s=timeout_s,
+                            protocol=protocol) or Exchange())
+    ad.mcp_exchange(STEPS, 7.5, protocol="2025-06-18")
+    assert seen["protocol"] == "2025-06-18"
     assert seen["url"] == "http://127.0.0.1:4321/api/v1/gateway/mcp/streamable"
     assert seen["headers"]["mcp-server-base-url"] == "http://[::1]:99"
     assert seen["headers"]["PUSH-INVARIANT-EXPLORER"] == "true"
@@ -58,9 +60,11 @@ def test_lasso_exchange_launches_its_own_gateway_with_the_start_environment(tmp_
     ad._cfg_path, ad._env = tmp_path / "mcp.json", {"GCL_LASSO_URL": "http://x", "LASSO_API_KEY": "k"}
     seen = {}
     monkeypatch.setattr(adapters, "stdio_session",
-                        lambda argv, env, steps, timeout_s, cwd=None: seen.update(
-                            argv=argv, env=env, steps=steps, timeout_s=timeout_s, cwd=cwd) or Exchange())
-    ad.mcp_exchange(STEPS, 9)
+                        lambda argv, env, steps, timeout_s, protocol, cwd=None: seen.update(
+                            argv=argv, env=env, steps=steps, timeout_s=timeout_s, cwd=cwd,
+                            protocol=protocol) or Exchange())
+    ad.mcp_exchange(STEPS, 9, protocol="2025-11-25")
+    assert seen["protocol"] == "2025-11-25"
     assert seen["argv"][0] == "/venv/python"
     assert seen["argv"][1].endswith("lasso_gateway_launch.py")
     assert seen["argv"][2:] == ["--mcp-json-path", str(tmp_path / "mcp.json"), "-p", "lasso"]

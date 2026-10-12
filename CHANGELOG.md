@@ -14,6 +14,28 @@
 - `contextforge`: IBM ContextForge MCP gateway (profiles `default`, `enforce`, `ignore_error`,
   `permissive`), with a gcl-supplied scanner plugin loaded through ContextForge's own plugin framework.
 - Surface results in the terminal, HTML, SARIF, `gcl compare`, `gcl table` and findings.
+- `toolhive`: Stacklok ToolHive as an MCP gateway (profiles `fail`, `ignore`). `--env` is the
+  `thv` binary or its folder; the mock MCP server runs as a remote workload (no container), with
+  ToolHive's mutating and validating webhooks pointed at the stand-in. Request side only; needs a
+  Docker-compatible runtime socket (`TOOLHIVE_DOCKER_SOCKET`, `DOCKER_HOST` or the docker context).
+- `--mcp-protocol` (2025-03-26, 2025-06-18, 2025-11-25): the version the MCP client asks for. A
+  surface the version does not have (m16 batches after 2025-03-26) is not run and reads n/a "not in
+  protocol"; the report names the version the gateway's initialize answered. m02 is run in every
+  session (a gateway that drops it gives n/a "not carried"). The terminal and HTML summaries count
+  "not in protocol" apart from "not carried"; `report.json` gains `not_in_protocol` and
+  `not_carried` next to `n/a`.
+- `gcl demo`: a seventh step, the same enforce drill on an MCP gateway, with an MCP hero line.
+- Stand-in flag `allow_unmarked`: a webhook that also sees traffic gcl never marked (a handshake)
+  is answered allow instead of the scenario's verdict.
+
+**Fixed**
+- `block_retry` on MCP gateways that refuse inside the JSON-RPC answer (an `isError` result or an
+  `error` object): only a response without any of the blocked text counts as a refusal, so a leak
+  is never read as a stop.
+- `modify` with a tool: a tool that ran with exactly the stand-in's rewrite and none of the
+  original text is "modified", no longer "tool executed".
+- Headline numbers: the README and NUMBERS.md said 16 of 22 gateway scenarios; the demo prints
+  18 of 38 (strict build 0 of 38). MCP surfaces: 13 of 16 naive, 0 of 16 strict (2 more not carried).
 
 **Standards**
 - OWASP MCP02:2025 and MCP03:2025 added to the mapping.

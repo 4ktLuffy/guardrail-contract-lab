@@ -11,7 +11,7 @@ import html
 import json
 
 from ..coverage import lang_name
-from .terminal import show
+from .terminal import _na, show
 
 CSS = """
 :root{--bg:#fbfbfa;--fg:#1d1d1b;--mute:#6b6b66;--line:#e4e3de;--card:#fff;
@@ -291,7 +291,7 @@ def _surfaces(sec: dict) -> str:
     sm = sec["mcp_surfaces"]["summary"]
     out = [(f"<h3>MCP surfaces</h3><p class='sub'>Protocol {e(sec['mcp_surfaces']['protocol'])}: "
            f"{sm['held']} held, {sm['violated']} violated, {sm['unverified']} unverified, "
-           f"{sm['n/a']} not carried, of {sm['surfaces']} surfaces. Each surface is run twice: a benign "
+           f"{_na(sm)}, of {sm['surfaces']} surfaces. Each surface is run twice: a benign "
            "marker that must arrive (carry control), then an attack marker the stand-in blocks.</p>"),
            ("<div class='scroll'><table><tr><th>Id</th><th>Surface</th><th>Direction</th><th>Carried</th>"
             "<th>Scanner shown</th><th>Outcome</th><th>Policy</th><th>OWASP</th></tr>")]

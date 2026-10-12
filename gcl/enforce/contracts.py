@@ -49,6 +49,7 @@ say nothing.
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import json
 import re
@@ -411,6 +412,26 @@ def classify_input(s: Scenario, bodies: list) -> str | None:
     return "altered"  # a rewrite with extra content, or something unlabelled
 
 
+def tools_ran_rewrite(s: Scenario, tools_run: list[dict]) -> bool:
+    """Did every tool the agent ran get exactly the stand-in's rewrite? Only for mode modify,
+    and only when each tool event's arguments contain the modify text and no fragment of the
+    original user text (nor its sentinel): then the side effect is the intended outcome, not
+    a leak. A tool call whose arguments cannot be read, or mix the rewrite with the original,
+    stays "tool executed"."""
+    if s.mode != "modify" or not s.modify_text or not tools_run:
+        return False
+    for e in tools_run:
+        try:
+            texts = _strings(json.loads(e["body"]))
+        except (TypeError, ValueError):
+            return False
+        if not any(s.modify_text in t for t in texts):
+            return False
+        if any(s.user_sentinel in t for t in texts) or _leaks(s.user_text, texts, s.modify_text):
+            return False
+    return True
+
+
 def classify_output(s: Scenario, obs) -> str | None:
     got = _classify_output_texts(s, _current_texts(_client_strings(obs.text or ""), s)[0])
     if got in (None, "modified"):
@@ -447,6 +468,33 @@ def _refused(obs) -> bool:
     answers = [((c or {}).get("message") or {}).get("content") for c in (doc.get("choices") or [])] \
         if isinstance(doc, dict) else []
     return any(isinstance(a, str) and BLOCK_MARK in a for a in answers)
+
+
+def _rpc_docs(text: str) -> list[dict]:
+    """The JSON-RPC messages in an MCP response body: one JSON document, or the `data:` events
+    of an event stream (a batch contributes each member)."""
+    docs = []
+    try:
+        docs.append(json.loads(text))
+    except ValueError:
+        for line in text.splitlines():
+            if line.startswith("data:"):
+                with contextlib.suppress(ValueError):
+                    docs.append(json.loads(line[5:]))
+    return [d for x in docs for d in (x if isinstance(x, list) else [x])
+            if isinstance(d, dict) and d.get("jsonrpc") == "2.0"]
+
+
+def _mcp_refused(text: str, s: Scenario) -> bool:
+    """An MCP gateway refusing inside a JSON-RPC answer (ContextForge answers HTTP 200 with
+    `result.isError`; others a JSON-RPC `error` object). Conservative: the answer must hold a
+    response to the call, and nothing of the blocked text anywhere in the body, since a refusal
+    does not carry what it refused. An error that quotes the request is not proof."""
+    docs = [d for d in _rpc_docs(text) if "id" in d and ("error" in d or "result" in d)]
+    if not docs or s.user_sentinel in text or _leaks(s.user_text, _client_strings(text)):
+        return False
+    return any(isinstance(d.get("error"), dict) or (isinstance(d.get("result"), dict)
+                                                    and d["result"].get("isError") is True) for d in docs)
 
 
 def classify(s: Scenario, bodies: list, obs) -> str:
@@ -619,10 +667,11 @@ def _current_texts(texts: list[str], s: Scenario) -> tuple[list[str], int]:
 
 def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
                   only: set[str] | None = None, settle_s: float = 0.6, run_id: str | None = None,
-                  attacks: dict | None = None, extra: tuple = ()) -> dict:
+                  attacks: dict | None = None, extra: tuple = (), mcp_protocol: str = "2025-03-26") -> dict:
     """Run every scenario (or the controls plus `only`) against `adapter`. With
     `attacks` ({"cases", "flagged", "faults", "benign", "detector"}), run the attack × fault
-    plan instead (see build_attack_scenarios)."""
+    plan instead (see build_attack_scenarios). `mcp_protocol` is the MCP version the surfaces ask
+    for (`--extra mcp`)."""
     say = progress or (lambda *_: None)
     run_id = run_id or new_run_id()
     if "mcp" in extra and not adapter.mcp_transport:
@@ -683,7 +732,8 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
                 from .mcp_surfaces import run_surfaces, unverified_surfaces
 
                 try:
-                    surfaces = run_surfaces(adapter, model, scanner, run_id, timeout_s, say, only=only)
+                    surfaces = run_surfaces(adapter, model, scanner, run_id, timeout_s, say, only=only,
+                                         protocol=mcp_protocol)
                 except Exception as e:  # the ordinary results are already measured: keep them
                     mcp_error = f"{type(e).__name__}: {e}"
                     surfaces = unverified_surfaces(run_id, only, f"error: {mcp_error}")
@@ -760,7 +810,9 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
             bodies = carried
         observed = client_outcome = classify(s, bodies, obs)
         if tools_run and s.stage == "input" and s.mode != "allow":
-            observed = "tool executed"  # the strongest evidence: a side effect happened
+            # The strongest evidence: a side effect happened. Unless the tool ran with exactly
+            # the stand-in's rewrite: that is what modify asks for.
+            observed = "modified" if tools_ran_rewrite(s, tools_run) else "tool executed"
         w0, w1 = windows[s.id][0], nxt[s.id]
         policy_served = [e["answered"] for e in scanner_events
                          if e.get("mode") == "GET" and "polic" in e["path"] and w0 <= e["t"] < w1]
@@ -843,13 +895,13 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
             if not _owner_ids(e["body_text"], run_id) and not any(w[0] <= e["t"] < nxt[k] for k, w in windows.items())),
     }
     if "mcp" in extra:
-        from .mcp_surfaces import PROTOCOL, summarize
+        from .mcp_surfaces import negotiated_protocol, summarize
 
         _gate_surfaces(surfaces, results)
         _label_surfaces(surfaces, adapter)
         out["summary"] = _summary(results, surfaces)
         out["results"] += surfaces
-        out["mcp_surfaces"] = {"summary": summarize(surfaces), "protocol": PROTOCOL,
+        out["mcp_surfaces"] = {"summary": summarize(surfaces), "protocol": negotiated_protocol(surfaces, mcp_protocol),
                                **({"error": mcp_error} if mcp_error else {})}
     if attacks:
         out["attack_matrix"] = {**attack_matrix(out["results"]), "detector": attacks.get("detector"),
@@ -942,7 +994,7 @@ def _judge(results: list[Result], adapter: Adapter) -> None:
         if s.mode == "block_retry":
             att = ev.get("attempts") or []
             first = att[0] if att else {}
-            if len(att) < 2 or not _attempt_refused(first):
+            if len(att) < 2 or not _attempt_refused(first, s, bool(getattr(adapter, "mcp_transport", None))):
                 return "the first attempt was not a clean refusal, so the second is not a retry of a block"
             if not att[-1].get("finished") and r.observed not in leaks:
                 return "the retry got no complete answer"
@@ -1161,13 +1213,16 @@ def _shape_mismatch(shape: dict, events: list[dict]) -> str | None:
     return None
 
 
-def _attempt_refused(a: dict) -> bool:
+def _attempt_refused(a: dict, s: Scenario | None = None, mcp: bool = False) -> bool:
     """A recorded attempt that was refused: a 4xx, or an answer carrying the stand-in's
-    block reason (integrations that refuse with a normal reply)."""
+    block reason (integrations that refuse with a normal reply). With `mcp` (an adapter with
+    an MCP transport) also a refusal inside the JSON-RPC answer, see _mcp_refused."""
     if a.get("status") is not None and 400 <= a["status"] < 500:
         return True
     if not a.get("finished") or a.get("status") is None or a["status"] >= 500:
         return False
+    if mcp and s is not None and _mcp_refused(a.get("body") or "", s):
+        return True
     return _refused(SimpleNamespace(status=a["status"], text=a.get("body") or ""))
 
 

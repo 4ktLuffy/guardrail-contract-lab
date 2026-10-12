@@ -47,16 +47,18 @@ def test_naive_gateway_guards_only_the_note_and_the_first_text(naive):
     res = _surfaces(naive)
     assert set(res) == set(IDS) | {f"{i}c" for i in IDS}
     for sid in IDS:
-        assert res[f"{sid}c"]["observed"] == "carried" and res[f"{sid}c"]["policy"] == "held", sid
         r = res[sid]
+        assert res[f"{sid}c"]["observed"] == "carried" and res[f"{sid}c"]["policy"] == "held", sid
         if sid in NAIVE_HELD:
             assert (r["observed"], r["policy"]) == ("stopped", "held"), sid
         else:
             assert (r["observed"], r["policy"]) == ("passed unscanned", "violated"), sid
             assert r["evidence"]["owasp"], sid
             assert r["evidence"]["scanner_shown"] is False and r["evidence"]["marker_at_far_end"]
-    assert naive["mcp_surfaces"]["summary"] == {"surfaces": 17, "held": 4, "violated": 13, "unverified": 0, "n/a": 0}
+    assert naive["mcp_surfaces"]["summary"] == {"surfaces": 17, "held": 4, "violated": 13, "unverified": 0, "n/a": 0,
+                                                "not_in_protocol": 0, "not_carried": 0}
     assert naive["summary"]["policy_violated"] == 13
+    assert naive["mcp_surfaces"]["protocol"] == "2025-03-26"
 
 
 def test_strict_gateway_holds_every_surface_it_carries(strict):
@@ -70,7 +72,8 @@ def test_strict_gateway_holds_every_surface_it_carries(strict):
             assert (c["observed"], c["policy"]) == ("carried", "held"), sid
             assert (r["observed"], r["policy"]) == ("stopped", "held"), sid
             assert r["evidence"]["scanner_shown"] is True and r["evidence"]["marker_at_far_end"] is False
-    assert strict["mcp_surfaces"]["summary"] == {"surfaces": 17, "held": 15, "violated": 0, "unverified": 0, "n/a": 2}
+    assert strict["mcp_surfaces"]["summary"] == {"surfaces": 17, "held": 15, "violated": 0, "unverified": 0, "n/a": 2,
+                                                 "not_in_protocol": 0, "not_carried": 2}
     assert strict["summary"]["policy_violated"] == 0 and strict["summary"]["unverified"] == 0
 
 
@@ -349,7 +352,8 @@ class _Adapter:
     def mcp_name(self, kind, base):
         return base
 
-    def mcp_exchange(self, steps, timeout_s):
+    def mcp_exchange(self, steps, timeout_s, protocol="2025-03-26"):
+        self.protocols = [*getattr(self, "protocols", []), protocol]
         self.seen.append(steps)
         return self.script(len(self.seen), steps)
 
@@ -832,7 +836,8 @@ def test_adapters_pass_steps_through_untouched(tmp_path, monkeypatch):
 
     steps = [{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, lambda ex: None]
     got = []
-    monkeypatch.setattr(adapters, "http_session", lambda url, headers, st, t: got.append(st) or Exchange())
+    monkeypatch.setattr(adapters, "http_session",
+                        lambda url, headers, st, t, protocol=None: got.append(st) or Exchange())
     for ad in (ReferenceMCPGateway(sys.executable, tmp_path / "r", "strict"), InvariantMCP("python", tmp_path / "i"),
                ContextForgeMCP(sys.executable, tmp_path / "c")):
         ad.port = 1
@@ -891,3 +896,47 @@ def test_a_bare_http_4xx_refusal_ends_an_attack_but_never_proves_a_control():
     ex5.add("recv", {"_raw": "Internal Server Error"}, "json", 500)
     ex5.conclude([mc.HANDSHAKE_ID, 3])
     assert not ex5.http_refusal and ms.classify(S1, MARK, PAY, True, ex5, [], _shown())[0] == "transport failure"
+
+
+def test_a_surface_outside_the_negotiated_protocol_is_not_run_and_is_n_a():
+    stub = _Stub()
+    ad = _Adapter(lambda n, s: Exchange(finished=True))
+    out = {r["scenario"]["id"]: r for r in ms.run_surfaces(
+        ad, stub, stub, "r1", 1, only={"m16"}, protocol="2025-06-18")}
+    assert out["m16"]["policy"] == "n/a" and out["m16"]["observed"] == "not in protocol"
+    assert out["m16c"]["policy"] == "n/a" and "2025-06-18" in out["m16"]["notes"][0]
+    assert set(ad.protocols) == {"2025-06-18"}  # only the m00 baseline ran, at the asked version
+    assert ms.BY_ID["m02"].in_protocol("2025-03-26") and ms.BY_ID["m02"].in_protocol("2025-06-18")
+    assert "2025-06-18" in ms.BY_ID["m02"].protocol  # a note, not a gate: real gateways leak it in old sessions
+    assert ms.BY_ID["m16"].in_protocol("2025-03-26") and not ms.BY_ID["m16"].in_protocol("2025-11-25")
+    assert all(ms.BY_ID[i].in_protocol("2025-11-25") for i in ms.BY_ID if i not in ("m16",))
+
+
+def test_the_negotiated_version_is_the_one_initialize_answered():
+    ex = Exchange()
+    ex.log.append({"dir": "recv", "via": "json", "status": 200, "t": 0.0, "msg": {
+        "jsonrpc": "2.0", "id": "gcl-init", "result": {"protocolVersion": "2025-03-26"}}})
+    assert ms._negotiated(ex) == "2025-03-26"
+    assert ms._negotiated(Exchange()) == ""
+    rows = [{"evidence": {}}, {"evidence": {"negotiated_protocol": "2025-03-26"}}]
+    assert ms.negotiated_protocol(rows, "2025-06-18") == "2025-03-26"
+    assert ms.negotiated_protocol([{"evidence": {}}], "2025-06-18") == "2025-06-18"
+
+
+def test_protocol_flag_runs_m02_and_skips_m16_on_the_reference_gateway(tmp_path):
+    run = run_contracts(ReferenceMCPGateway(sys.executable, tmp_path, "strict"), 10, extra=("mcp",),
+                        only={"none", "m02", "m16"}, mcp_protocol="2025-06-18")
+    res = _surfaces(run)
+    assert (res["m02"]["observed"], res["m02"]["policy"]) == ("stopped", "held")
+    assert (res["m16"]["observed"], res["m16"]["policy"]) == ("not in protocol", "n/a")
+    assert run["mcp_surfaces"]["protocol"] == "2025-06-18"  # what the gateway's initialize answered
+    assert res["m02"]["evidence"]["negotiated_protocol"] == "2025-06-18"
+    sm = run["mcp_surfaces"]["summary"]  # "not in protocol" is counted apart from "not carried"; n/a is their sum
+    assert (sm["n/a"], sm["not_in_protocol"], sm["not_carried"]) == (1, 1, 0)
+    from gcl.report.terminal import render_enforce as _terminal
+
+    assert "0 not carried, 1 not in protocol of" in _terminal(run)
+    old = {**run, "mcp_surfaces": {**run["mcp_surfaces"], "summary": {k: v for k, v in sm.items()
+                                                                       if k not in ("not_in_protocol", "not_carried")}}}
+    # a report written before the split still renders
+    assert "1 not carried of" in _terminal(old) and "not in protocol of" not in _terminal(old)

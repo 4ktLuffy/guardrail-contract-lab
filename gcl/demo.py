@@ -37,14 +37,14 @@ def run_demo(out: Path, say=print) -> dict:
     texts = [c["text"] for c in cases]
     flags = {"python": "IM", "node": "im"}
 
-    say("1/6  check: a rule file loaded by Python and by JavaScript")
+    say("1/7  check: a rule file loaded by Python and by JavaScript")
     vuln = EX / "portability" / "rules.vulnerable.yaml"
     rs_before = load_rules(vuln)
     rs_before.path = "examples/portability/rules.vulnerable.yaml"  # no local paths in a shared report
     before = R.check_section(run_check(rs_before, ["python", "node"], None, benign,
                                        flags, deadline_s=2.0))
 
-    say("2/6  fix: rewrite, verify against Python, re-check")
+    say("2/7  fix: rewrite, verify against Python, re-check")
     fixed_path = out / "rules.portable.yaml"
     fix_summary = run_fix(vuln, fixed_path, ["python", "node"], flags, texts)
     fix_summary["written"] = fixed_path.name
@@ -53,7 +53,7 @@ def run_demo(out: Path, say=print) -> dict:
     after = R.check_section(run_check(rs_after, ["python", "node"], None, benign,
                                       flags, deadline_s=2.0))
 
-    say("3/6  coverage: an English-only rule set across 12 languages")
+    say("3/7  coverage: an English-only rule set across 12 languages")
     eng = EX / "coverage" / "rules.english-only.yaml"
     secs = [summarize(cases, detect_with_rules(str(eng), e, texts, loader_drops_broken=True))
             for e in ("python", "node")]
@@ -65,18 +65,18 @@ def run_demo(out: Path, say=print) -> dict:
                        "by_lang": {lg: r["recall_pct"] for lg, r in s["by_lang"].items()}}
                       for s in secs]
 
-    say("4/6  probe: a tool runner whose scanner fails open")
+    say("4/7  probe: a tool runner whose scanner fails open")
     contract = EX / "failopen" / "contract.yaml"
     probes = {}
     for pol in ("open", "closed"):
         if pol == "closed":
-            say("5/6  probe: the same runner, fail-closed")
+            say("5/7  probe: the same runner, fail-closed")
         m = load_manifest(EX / "failopen" / f"runner.fail-{pol}.yaml")
         sc = run_probe(m, load_contract(contract))
         probes[pol] = probe_section(f"examples/failopen/runner.fail-{pol}.yaml",
                                     "examples/failopen/contract.yaml", sc)
 
-    say("6/6  enforce: a gateway whose guardrail must stop what its scanner rejects")
+    say("6/7  enforce: a gateway whose guardrail must stop what its scanner rejects")
     import sys
     import tempfile
 
@@ -85,6 +85,15 @@ def run_demo(out: Path, say=print) -> dict:
 
     wd = Path(tempfile.mkdtemp(prefix="gcl-demo-enforce-"))
     enforce_runs = {p: run_contracts(ReferenceGateway(sys.executable, wd, p), 15) for p in ("strict", "naive")}
+
+    say("7/7  enforce: the same drill on an MCP gateway, every place a message can carry text")
+    from .enforce.adapters import ReferenceMCPGateway
+    from .enforce.mcp_surfaces import CATALOGUE
+
+    # Only the opening controls of the ordinary plan plus the surfaces: ~25 s per build.
+    only = {"none", *(s.id for s in CATALOGUE)}
+    mcp_runs = {p: run_contracts(ReferenceMCPGateway(sys.executable, wd / f"mcp-{p}", p), 15,
+                                 only=only, extra=("mcp",)) for p in ("naive", "strict")}
 
     s0, s1 = before["summary"], after["summary"]
     split_before = s0["compile_split"] + s0["match_split"]
@@ -106,6 +115,10 @@ def run_demo(out: Path, say=print) -> dict:
                   f"{enforce_runs['naive']['summary']['scenarios']}",
          "label": "gateway scenarios that break the gateway's own fail-closed promise "
                   "(0 for the strict build)"},
+        {"value": f"{mcp_runs['naive']['mcp_surfaces']['summary']['violated']} of {len(CATALOGUE) - 1}",
+         "label": "MCP surfaces that reach the client or server unscanned through a naive MCP gateway "
+                  f"({mcp_runs['strict']['mcp_surfaces']['summary']['violated']} for the strict build; "
+                  f"{mcp_runs['strict']['mcp_surfaces']['summary']['n/a']} more not carried)"},
     ]
 
     doc = R.envelope("demo", {"examples": "examples",
@@ -145,6 +158,17 @@ def run_demo(out: Path, say=print) -> dict:
         {"title": "7 · The same gateway, built strict",
          "lead": "Same scenarios, the build that keeps its fail-closed promise.",
          "enforce": enforce_runs["strict"]},
+        {"title": "8 · An MCP gateway: the note is guarded, the rest is not",
+         "lead": "The same drill on a gateway for the Model Context Protocol. Each of 16 other places "
+                 "a message can carry text (a second content item, a tool description, a resource, a "
+                 "log notification, a nested argument, a batch ...) is tried with a harmless marker "
+                 "and then with an attack; the naive build scans only the note and the first text "
+                 "and lets the rest through. Protocol 2025-03-26: m02 needs 2025-06-18.",
+         "enforce": mcp_runs["naive"]},
+        {"title": "9 · The same MCP gateway, built strict",
+         "lead": "Every string in both directions is scanned; what the build refuses to carry "
+                 "(batches, a tool it never listed) reads n/a, never held.",
+         "enforce": mcp_runs["strict"]},
     ]
     doc["fix"] = fix_summary
     R.write_json(doc, out / "report.json")

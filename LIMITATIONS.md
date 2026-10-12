@@ -212,12 +212,25 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   from a summary of the blocked text.
 
 ## MCP surfaces (`--extra mcp`)
-- Shapes of protocol versions 2025-03-26 to 2025-11-25 only. gcl negotiates 2025-03-26, while
-  some surfaces were introduced later (m02 `structuredContent` and `outputSchema` in
-  2025-06-18): a gateway that enforces the negotiated version may legitimately not carry
-  them, and the surface is then "not carried" (n/a), not a failure. The 2026-07-28 specification
+- Shapes of protocol versions 2025-03-26 to 2025-11-25 only. gcl negotiates 2025-03-26 unless
+  `--mcp-protocol` asks for another. Some surfaces were introduced later (m02 `structuredContent`
+  and `outputSchema` in 2025-06-18): at 2025-03-26 a gateway that enforces the negotiated version
+  may legitimately not carry them, and the surface is then "not carried" (n/a), not a failure;
+  rerun with `--mcp-protocol 2025-06-18` to test m02. A surface the requested version does not
+  have (m16 batches, only in 2025-03-26, at later versions) is not run and reads n/a "not in
+  protocol". The version reported is the one the gateway's initialize answer named, else the one
+  asked for. The 2026-07-28 specification
   (no `initialize`, no sessions, multi-round-trip requests in place of server-to-client
   requests, sampling and logging deprecated) is not covered yet.
+- ToolHive (`toolhive`) is tested on the request side only, by design: its webhooks are sent what
+  a client sends to the server and never a server reply, so there is no output side to test. The
+  webhook also sees the MCP handshake and notifications gcl never marked, which the stand-in
+  allows (`allow_unmarked`), so those requests prove nothing about the verdict. ToolHive's state
+  (config, run configs, status) is kept in the run's own folder, never the real home; it still
+  needs a Docker-compatible runtime socket to start.
+- m02 is run at every protocol version, so at 2025-03-26 it asks a gateway for a field that
+  version does not define: a gateway that drops it is "not carried", one that passes it unscanned
+  is reported as it is.
 - Encodings and obfuscation (zero-width characters, Unicode tags, base64) are not tested
   here. They are a detector question for `gcl coverage`.
 - OAuth and authorization flows are not tested.

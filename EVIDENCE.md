@@ -273,6 +273,12 @@ else is labelled.
 - Real gateways, opt-in (`GCL_INTEG_INVARIANT_PYTHON`: Invariant Gateway 0.0.9;
   `GCL_INTEG_LASSO_PYTHON`: Lasso mcp-gateway 1.2.1): run 2026-10-11. The results are not
   stated here; findings go to the maintainers first, as the README says.
+- ToolHive v0.51.4 real runs, opt-in (`--env` the `thv` binary): profiles `fail` and `ignore`, with
+  and without `--extra mcp`, run 2026-10-11 — checked; results withheld, as above. Extra real
+  profiles run 2026-10-11: Invariant `push`, Lasso `no_key`, ContextForge `enforce` and
+  `ignore_error` — checked; results withheld.
+- structuredContent (m02) is run at the default protocol 2025-03-26: reference gateway, naive 13
+  of 16 violated, strict 0 of 16 violated with 2 not carried (m15, m16) — checked.
 
 ## Not yet verified
 - CI matrix (Python 3.11–3.13 × Node 20/22): the workflow is written, not run.

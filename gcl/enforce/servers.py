@@ -477,6 +477,11 @@ class Protocol:
     # whose request does not positively match it gets a guessed answer.
     recorded_modes: tuple = ()
     recorded_shape: dict = field(default_factory=dict)
+    # The guard is shown every message the client sends, handshake included (MCP gateways that
+    # hook the proxy, not the tool call). A request that carries no gcl marker is not about any
+    # scenario: it is answered "allow" whatever the stage is set to, so the scenario's own request
+    # is the one that meets the verdict or fault, and the handshake before it does not end the session.
+    allow_unmarked: bool = False
 
 
 # Modes a stage can be put in. Verdict modes answer correctly; fault modes misbehave.
@@ -680,6 +685,8 @@ class StandInScanner:
         modes, modify_text = (self.by_sid[next(iter(ids))] if len(ids) == 1 and next(iter(ids)) in self.by_sid
                               else (self.modes, self.modify_text))
         mode = modes.get(stage, "allow") if valid else "rejected"
+        if valid and proto.allow_unmarked and "GCL-" not in text:
+            mode = "allow"
         scanned = proto.scanned(body) if (proto.scanned and isinstance(body, dict)) else None
         ev = {"t": time.monotonic(), "stage": stage, "claimed_stage": claimed,
               "path": h.path, "valid": valid, "mode": mode, "body": body, "scanned": scanned,

@@ -172,6 +172,13 @@ def render_fix(summary: dict) -> str:
     return "\n".join(lines)
 
 
+def _na(sm: dict) -> str:
+    """The n/a count by cause; a report written before the split has only `n/a`."""
+    if "not_in_protocol" not in sm:
+        return f"{sm['n/a']} not carried"
+    return f"{sm['not_carried']} not carried, {sm['not_in_protocol']} not in protocol"
+
+
 def _surface_table(run: dict) -> list[str]:
     """MCP surfaces (`--extra mcp`): one row per surface, from its carry control and its attack."""
     rows = {}
@@ -181,7 +188,7 @@ def _surface_table(run: dict) -> list[str]:
             rows.setdefault(sc["surface"]["id"], {})["control" if sc["role"] else "attack"] = r
     sm = run["mcp_surfaces"]["summary"]
     lines = ["", (f"MCP surfaces (protocol {run['mcp_surfaces']['protocol']}): {sm['held']} held, "
-                  f"{sm['violated']} violated, {sm['unverified']} unverified, {sm['n/a']} not carried of "
+                  f"{sm['violated']} violated, {sm['unverified']} unverified, {_na(sm)} of "
                   f"{sm['surfaces']}"),
              *([c(f"  the surface phase failed: {run['mcp_surfaces']['error']}", "error")]
                if run["mcp_surfaces"].get("error") else []),

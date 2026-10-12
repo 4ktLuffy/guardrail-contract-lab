@@ -51,7 +51,7 @@ TITLES = {
     "MCP08:2025": "Lack of Audit and Telemetry",
     "MCP10:2025": "Context Injection & Over-Sharing",
 }
-MCP_INTEGRATIONS = ("invariant-mcp", "lasso-mcp-gateway", "contextforge")
+MCP_INTEGRATIONS = ("invariant-mcp", "lasso-mcp-gateway", "contextforge", "toolhive")
 AGENT_INTEGRATIONS = ("openai-agents", "openai-agents-js", "pydantic-ai", "google-adk", "semantic-kernel",
                       "crewai", "agno", "mastra")
 VERDICTS = ("allow", "block", "modify", "block_retry")

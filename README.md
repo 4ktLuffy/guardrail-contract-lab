@@ -45,7 +45,7 @@ On the bundled fixtures (written for the demo; see [NUMBERS.md](NUMBERS.md)):
 | **0** after `gcl fix` | 8 rules rewritten; each agrees with the original under Python on every tested input before it is written |
 | **91.7% → 0.0%** | recall in English vs Arabic for the same, reasonable, English rule set |
 | **6 of 6** scanner faults | still let the tool call run, in a fail-open tool runner (0 of 6 after the fix) |
-| **16 of 22** gateway scenarios | break a gateway's own fail-closed promise, end to end (0 of 22 for the strict build) |
+| **18 of 38** gateway scenarios | break a gateway's own fail-closed promise, end to end (0 of 38 for the strict build) |
 | **13 of 16** MCP surfaces | reach the client or server unscanned through a naive MCP gateway (0 of 16 for the strict build; 2 more not carried) |
 
 ## Commands
@@ -159,7 +159,7 @@ LlamaFirewall's LLM-judged PII check (`llamafirewall`), Invariant Gateway's MCP 
 mcp-gateway (gcl plays the MCP client and a mock MCP server, over HTTP or stdio), Agno's built-in guardrails, the bundled
 reference gateway (`reference`), IBM ContextForge's MCP gateway (`contextforge`: ContextForge ships no
 plugin that calls an HTTP scanner, so gcl's driver supplies one and the run tests ContextForge's plugin
-framework — hook dispatch, modes, `on_error`, timeout), or the reference gateway's MCP variant (`reference-mcp`, profiles `naive` and `strict`). A report notes when one request ran a tool more than once (retries that
+framework — hook dispatch, modes, `on_error`, timeout), Stacklok ToolHive's MCP proxy (`toolhive`: `--env DIR` is the `thv` binary or its folder; gcl's mock MCP server runs as a remote workload, so no container or image, but ToolHive needs a Docker-compatible runtime socket to start even then: `TOOLHIVE_DOCKER_SOCKET`, else `DOCKER_HOST`, else the current docker context; its webhooks see the request side only), or the reference gateway's MCP variant (`reference-mcp`, profiles `naive` and `strict`). A report notes when one request ran a tool more than once (retries that
 re-execute side effects). The Invariant MCP adapter also runs a retry scenario (the same
 blocked request sent twice in one session), and integrations that fetch their rules get
 policy-source faults (the policy is missing, or its source errors). Agent integrations run with a
@@ -298,12 +298,16 @@ gateway answered every request properly. The far end is what gcl's own
 observers recorded: a raw MCP client (standard library only, so every byte is visible) and a
 mock MCP server. Gateway logs are not used.
 
-It runs on the MCP adapters only: `reference-mcp`, `invariant-mcp`, `lasso-mcp-gateway` and `contextforge`.
-Any other adapter refuses `--extra mcp`. The protocol is 2025-03-26, the only version with
-JSON-RPC batches (m16).
+It runs on the MCP adapters only: `reference-mcp`, `invariant-mcp`, `lasso-mcp-gateway`, `contextforge` and `toolhive`.
+Any other adapter refuses `--extra mcp`. The protocol is 2025-03-26 unless `--mcp-protocol`
+(2025-06-18, 2025-11-25) asks otherwise. m02 is run in every session, although structuredContent
+came with 2025-06-18: real gateways carry it in older sessions and may leak it there, and a gateway
+that drops it gives n/a "not carried". m16 (batches) exists only in 2025-03-26, so at a later version it
+is not run and reads n/a "not in protocol".
 
 ```bash
 gcl enforce reference-mcp --python python3 --profile naive --extra mcp
+gcl enforce reference-mcp --python python3 --profile strict --extra mcp --mcp-protocol 2025-06-18
 ```
 
 #### Which OWASP risk a failure is evidence about

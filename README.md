@@ -1,6 +1,5 @@
 # Guardrail Contract Lab
 
-**Check whether a guardrail does what its config says.**
 
 AI-agent guardrails are usually a file of detection rules plus some glue: a scanner
 that reads tool output or tool calls, and code that decides what happens next. The

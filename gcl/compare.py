@@ -28,7 +28,7 @@ def _key(run: dict, r: dict) -> tuple:
     s = r["scenario"]
     # A surface is told apart by its id (m01, m01c): stage, mode and role are shared by many. A config
     # check by its kind, since its id depends on what the adapter declares.
-    which = s["config"]["check"] if s.get("config") else (s["id"] if s.get("surface") else "")
+    which = s["config"]["check"] if s.get("config") else (s["id"] if s.get("surface") or s.get("route") else "")
     return (run.get("judge_latency_s"), s["stage"], s["mode"], which,
             s.get("role") or "", s["lang"], s.get("attack") or "")
 

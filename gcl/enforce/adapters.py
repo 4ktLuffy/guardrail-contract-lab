@@ -28,6 +28,7 @@ from typing import ClassVar
 
 from .mcp_client import Exchange, http_session, stdio_session
 from .receipt import probe_versions
+from .routes import CHAT, CHAT_STREAM, COMPLETIONS, MESSAGES, RESPONSES
 from .servers import MockModel, Protocol, StandInScanner
 
 
@@ -205,6 +206,23 @@ class Adapter:
     # profile -> [{"source", "read_for", "passage", "kinds"?}]: the passages those expectations
     # rest on, shown beside the config results like documented_sources beside the ordinary ones.
     config_documented_sources: ClassVar[dict] = {}
+
+    # `--extra routes` (same guard on every route, see routes.py): the HTTP routes this gateway has, as
+    # routes.Route values. An MCP gateway needs to declare none: its routes are the MCP ones. An
+    # adapter that has routes implements `route_endpoint`.
+    routes: ClassVar[tuple] = ()
+
+    def route_endpoint(self) -> tuple[str, str, dict]:
+        """(base URL, model name, request headers) for the HTTP routes."""
+        raise NotImplementedError(f"{self.name} declares no routes")
+
+    def call_route(self, route, text: str, timeout_s: float) -> Observation:
+        """One request carrying `text` on `route` (an llm route of `routes`)."""
+        from .routes import build_request
+
+        base, model, headers = self.route_endpoint()
+        path, body = build_request(route, text, model)
+        return _post(base + path, body, headers, timeout_s)
 
     def __init__(self, python: str, workdir: Path, profile: str = "default"):
         self.python, self.workdir, self.profile = python, Path(workdir), profile
@@ -387,6 +405,13 @@ class LiteLLMProxy(Adapter):
         return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
                      {"model": "gcl-model", "messages": messages, **({"stream": True} if stream else {})},
                      {"Authorization": f"Bearer {self.master_key}"}, timeout_s)
+
+    # `--extra routes`: LiteLLM's own routes to the same model, behind the same generic_guardrail_api
+    # guard (default_on, pre_call and post_call). #40583: /v1/messages skipped the guardrails.
+    routes: ClassVar[tuple] = (CHAT, CHAT_STREAM, MESSAGES, RESPONSES, COMPLETIONS)
+
+    def route_endpoint(self) -> tuple[str, str, dict]:
+        return f"http://127.0.0.1:{self.port}", "gcl-model", {"Authorization": f"Bearer {self.master_key}"}
 
     # ---- `--extra config`. Scope = the model name: two model_list entries ("gcl-x", "gcl-y") that
     # both point at the mock model. A "*" guard is a plain guardrail with default_on true; a scoped
@@ -710,6 +735,12 @@ class ReferenceGateway(Adapter):
         return _post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
                      {"model": "gcl-mock", "messages": messages, **({"stream": True} if stream else {})},
                      None, timeout_s)
+
+    # `--extra routes`: ref_gateway.py guards all of these in strict, only chat completions in naive.
+    routes: ClassVar[tuple] = (CHAT, CHAT_STREAM, MESSAGES, RESPONSES, COMPLETIONS)
+
+    def route_endpoint(self) -> tuple[str, str, dict]:
+        return f"http://127.0.0.1:{self.port}", "gcl-mock", {}
 
     # `--extra config`: the gateway's policy file (see ref_gateway.py for its contract).
     config_checks: ClassVar[tuple[str, ...]] = ("load_failure", "live_edit", "scope")

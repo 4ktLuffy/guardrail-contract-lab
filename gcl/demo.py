@@ -159,7 +159,7 @@ def run_demo(out: Path, say=print) -> dict:
          "lead": "Same scenarios, the build that keeps its fail-closed promise.",
          "enforce": enforce_runs["strict"]},
         {"title": "8 · An MCP gateway: the note is guarded, the rest is not",
-         "lead": "The same drill on a gateway for the Model Context Protocol. Each of 16 other places "
+         "lead": "The same drill on a gateway for the Model Context Protocol. Each of 18 other places "
                  "a message can carry text (a second content item, a tool description, a resource, a "
                  "log notification, a nested argument, a batch ...) is tried with a harmless marker "
                  "and then with an attack; the naive build scans only the note and the first text "

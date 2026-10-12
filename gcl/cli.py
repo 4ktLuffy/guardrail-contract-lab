@@ -311,7 +311,7 @@ def enforce(
                                       "results that change with timing as unstable."),
     extra: str = typer.Option("", help="Opt-in blind spots, comma-separated: stream (output checks on "
                               "streamed answers), history (the attack in an earlier turn), retry (a "
-                              "blocked request sent twice), mcp (MCP gateways: the baseline plus 16 more "
+                              "blocked request sent twice), mcp (MCP gateways: the baseline plus 18 more "
                               "places a message can carry text, each run with a benign control and an attack)."),
     mcp_protocol: str = typer.Option("2025-03-26", "--mcp-protocol", help="With --extra mcp: the MCP "
                                      "protocol version the client asks for (2025-03-26, 2025-06-18, 2025-11-25). "

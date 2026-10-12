@@ -46,7 +46,7 @@ On the bundled fixtures (written for the demo; see [NUMBERS.md](NUMBERS.md)):
 | **91.7% → 0.0%** | recall in English vs Arabic for the same, reasonable, English rule set |
 | **6 of 6** scanner faults | still let the tool call run, in a fail-open tool runner (0 of 6 after the fix) |
 | **18 of 38** gateway scenarios | break a gateway's own fail-closed promise, end to end (0 of 38 for the strict build) |
-| **13 of 16** MCP surfaces | reach the client or server unscanned through a naive MCP gateway (0 of 16 for the strict build; 2 more not carried) |
+| **15 of 18** MCP surfaces | reach the client or server unscanned through a naive MCP gateway (0 of 18 for the strict build; 2 more not carried) |
 
 ## Commands
 
@@ -262,7 +262,7 @@ can send them (LiteLLM, Portkey, the reference gateway).
 #### MCP: every place a message can carry text (`--extra mcp`)
 
 The MCP checks above test one path: `tools/call` arguments `note` going in, and
-`result.content[0].text` coming back. `--extra mcp` adds 16 more surfaces, each a place an
+`result.content[0].text` coming back. `--extra mcp` adds 18 more surfaces, each a place an
 MCP message can carry text to the model or out of the agent:
 
 | id | surface |
@@ -283,6 +283,8 @@ MCP message can carry text to the model or out of the agent:
 | m14 | nested argument |
 | m15 | call to an unlisted tool |
 | m16 | call inside a JSON-RPC batch |
+| m17 | server `instructions` in the initialize result |
+| m18 | tool `title` |
 
 Each surface runs twice. A **carry control** puts a benign marker in the surface, with a
 stand-in that allows everything. The marker must arrive whole at the far end; if it does

@@ -1,4 +1,4 @@
-"""The mock MCP server places a payload in each surface m01..m16; gcl's raw MCP client
+"""The mock MCP server places a payload in each surface m01..m18; gcl's raw MCP client
 sees it over HTTP directly and over the stdio bridge. mcp_surface=None is the old server."""
 import json
 import sys
@@ -181,3 +181,16 @@ def test_received_records_session_and_transport(mock, transport):
     rec = mock.mcp_received[n:]
     assert {r["transport"] for r in rec} == {transport}
     assert all(r["session"] for r in rec[1:])
+
+
+def test_m17_instructions_in_the_initialize_result(mock, transport):
+    ex = surf(mock, transport, "m17", [LIST])
+    assert ex.finished, ex.error
+    assert ex.response_to(HANDSHAKE)["result"]["instructions"] == PAY
+    assert "instructions" not in run(mock, transport, [LIST]).response_to(HANDSHAKE)["result"]
+
+
+def test_m18_tool_title(mock, transport):
+    t = surf(mock, transport, "m18", [LIST]).response_to(5)["result"]["tools"][0]
+    assert t["title"] == PAY and t["description"] == "Record a note."
+    assert "title" not in run(mock, transport, [LIST]).response_to(5)["result"]["tools"][0]

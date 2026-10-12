@@ -243,8 +243,8 @@ else is labelled.
   from an installed wheel outside the checkout.
 
 ## MCP surfaces (tests/test_mcp_surfaces.py, test_mcp_mock_surfaces.py, test_mcp_real_adapters.py)
-- Reference gateway, naive profile, every surface m00–m16 with its carry control: each
-  control is carried; 4 of 17 attacks are held (m00, m04, m13, m15), and the other 13
+- Reference gateway, naive profile, every surface m00–m18 with its carry control: each
+  control is carried; 4 of 19 attacks are held (m00, m04, m13, m15), and the other 15
   are "passed unscanned" and violated, with the OWASP IDs and the scanner never shown the
   text — checked.
 - Reference gateway, strict profile: every carried surface is stopped and held, with the
@@ -277,8 +277,8 @@ else is labelled.
   and without `--extra mcp`, run 2026-10-11 — checked; results withheld, as above. Extra real
   profiles run 2026-10-11: Invariant `push`, Lasso `no_key`, ContextForge `enforce` and
   `ignore_error` — checked; results withheld.
-- structuredContent (m02) is run at the default protocol 2025-03-26: reference gateway, naive 13
-  of 16 violated, strict 0 of 16 violated with 2 not carried (m15, m16) — checked.
+- structuredContent (m02) is run at the default protocol 2025-03-26: reference gateway, naive 15
+  of 18 violated, strict 0 of 18 violated with 2 not carried (m15, m16) — checked.
 
 ## Not yet verified
 - CI matrix (Python 3.11–3.13 × Node 20/22): the workflow is written, not run.

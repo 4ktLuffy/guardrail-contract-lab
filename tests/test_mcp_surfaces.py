@@ -55,9 +55,9 @@ def test_naive_gateway_guards_only_the_note_and_the_first_text(naive):
             assert (r["observed"], r["policy"]) == ("passed unscanned", "violated"), sid
             assert r["evidence"]["owasp"], sid
             assert r["evidence"]["scanner_shown"] is False and r["evidence"]["marker_at_far_end"]
-    assert naive["mcp_surfaces"]["summary"] == {"surfaces": 17, "held": 4, "violated": 13, "unverified": 0, "n/a": 0,
+    assert naive["mcp_surfaces"]["summary"] == {"surfaces": 19, "held": 4, "violated": 15, "unverified": 0, "n/a": 0,
                                                 "not_in_protocol": 0, "not_carried": 0}
-    assert naive["summary"]["policy_violated"] == 13
+    assert naive["summary"]["policy_violated"] == 15
     assert naive["mcp_surfaces"]["protocol"] == "2025-03-26"
 
 
@@ -72,7 +72,7 @@ def test_strict_gateway_holds_every_surface_it_carries(strict):
             assert (c["observed"], c["policy"]) == ("carried", "held"), sid
             assert (r["observed"], r["policy"]) == ("stopped", "held"), sid
             assert r["evidence"]["scanner_shown"] is True and r["evidence"]["marker_at_far_end"] is False
-    assert strict["mcp_surfaces"]["summary"] == {"surfaces": 17, "held": 15, "violated": 0, "unverified": 0, "n/a": 2,
+    assert strict["mcp_surfaces"]["summary"] == {"surfaces": 19, "held": 17, "violated": 0, "unverified": 0, "n/a": 2,
                                                  "not_in_protocol": 0, "not_carried": 2}
     assert strict["summary"]["policy_violated"] == 0 and strict["summary"]["unverified"] == 0
 
@@ -183,11 +183,13 @@ def test_classify_to_server_surface_reads_what_the_mock_received():
 
 
 def test_catalogue_is_complete():
-    assert [f"m{i:02d}" for i in range(17)] == IDS
+    assert [f"m{i:02d}" for i in range(19)] == IDS
     assert ms.BY_ID["m16"].protocol == "batches exist only in protocol 2025-03-26"
     assert {s.id for s in ms.CATALOGUE if s.needs_sse} == {"m08", "m11", "m12", "m13"}
     assert {s.id for s in ms.CATALOGUE if s.direction == "to_server"} == {"m14", "m15", "m16"}
     assert all(s.owasp for s in ms.CATALOGUE)
+    assert {s.id for s in ms.CATALOGUE if s.direction == "to_client"} >= {"m17", "m18"}
+    assert ms.BY_ID["m17"].owasp == ms.BY_ID["m18"].owasp == ["MCP03:2025", "LLM01:2025"]
 
 
 # --- downstream consumers -------------------------------------------------------------------
@@ -246,8 +248,8 @@ def test_table_has_one_compact_surface_column(tmp_path, naive, strict):
     t = build(tmp_path)
     assert t["columns"].count("mcp surfaces") == 1
     cells = {k.split(" (")[1][:5]: v["mcp surfaces"] for k, v in t["rows"].items()}
-    assert cells["naive"].startswith("4/17 hold") and "m01:FAILS OPEN" in cells["naive"]
-    assert cells["stric"].startswith("15/17 hold") and "m15:not carried" in cells["stric"]
+    assert cells["naive"].startswith("4/19 hold") and "m01:FAILS OPEN" in cells["naive"]
+    assert cells["stric"].startswith("17/19 hold") and "m15:not carried" in cells["stric"]
     assert "mcp surfaces" in render(t)
 
 

@@ -20,7 +20,8 @@ the thing the risk describes:
   disables the guard MCP08:2025 Lack of Audit and Telemetry
   an MCP surface (`--extra mcp`, SURFACE_RISKS below) whose attack text reached the far end
   unstopped: tool results, errors, notifications and SSE events MCP03:2025 Tool Poisoning
-  + MCP10:2025 + LLM01:2025; tool metadata and a rug pull MCP03:2025 + LLM01:2025;
+  + MCP10:2025 + LLM01:2025; tool metadata (description, title), server instructions and a
+  rug pull MCP03:2025 + LLM01:2025;
   resources and prompts MCP10:2025 + LLM01:2025; a sampling request MCP06:2025 + LLM01:2025;
   a nested argument or a batch MCP06:2025; a call to an unlisted tool MCP02:2025 Privilege
   Escalation via Scope Creep + ASI02:2026 + LLM06:2025
@@ -91,7 +92,7 @@ _RESULT = ["MCP03:2025", "MCP10:2025", "LLM01:2025"]
 # MCP surface -> OWASP IDs, applied to a violated attack result (see mcp_surfaces.py).
 SURFACE_RISKS = {
     **{sid: _RESULT for sid in ("m00", "m01", "m02", "m03", "m04", "m05", "m11", "m13")},
-    **{sid: ["MCP03:2025", "LLM01:2025"] for sid in ("m06", "m07", "m08")},
+    **{sid: ["MCP03:2025", "LLM01:2025"] for sid in ("m06", "m07", "m08", "m17", "m18")},
     **{sid: ["MCP10:2025", "LLM01:2025"] for sid in ("m09", "m10")},
     "m12": ["MCP06:2025", "LLM01:2025"],
     "m14": ["MCP06:2025"], "m16": ["MCP06:2025"],

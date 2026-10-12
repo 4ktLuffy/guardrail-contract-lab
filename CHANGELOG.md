@@ -1,9 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-10-12
 
 **New**
-- `--extra mcp`: 16 MCP surfaces (tool results, errors, metadata, resources, prompts,
+- `--extra mcp`: 18 MCP surfaces (tool results, errors, metadata, server instructions, tool
+  titles, resources, prompts,
   notifications, sampling, SSE, nested arguments, unlisted tools, batches), each with a
   benign carry control that must arrive intact before the attack is judged.
 - `reference-mcp`: the bundled MCP reference gateway, profiles `naive` and `strict`.
@@ -35,7 +36,7 @@
 - `modify` with a tool: a tool that ran with exactly the stand-in's rewrite and none of the
   original text is "modified", no longer "tool executed".
 - Headline numbers: the README and NUMBERS.md said 16 of 22 gateway scenarios; the demo prints
-  18 of 38 (strict build 0 of 38). MCP surfaces: 13 of 16 naive, 0 of 16 strict (2 more not carried).
+  18 of 38 (strict build 0 of 38). MCP surfaces: 15 of 18 naive, 0 of 18 strict (2 more not carried).
 
 **Standards**
 - OWASP MCP02:2025 and MCP03:2025 added to the mapping.

@@ -68,7 +68,7 @@ class MockModel(_Server):
         self.mcp_sessions = 0
         self.mcp_valid_sessions: set[str] = set()
         self.mcp_rejected: list[dict] = []
-        # MCP surfaces (m01..m16, see gcl/enforce/mcp_surfaces.py): where the mock MCP server
+        # MCP surfaces (m01..m18, see gcl/enforce/mcp_surfaces.py): where the mock MCP server
         # places mcp_payload. None keeps the plain gcl_probe server. mcp_received is
         # append-only like events: every JSON-RPC message the server got, so a client->server
         # surface is judged on what arrived here, not on what a gateway logged.
@@ -144,6 +144,8 @@ class MockModel(_Server):
                     note = {"type": "string", "description": pay}
                 tool = {"name": "gcl_probe", "description": desc,
                         "inputSchema": {"type": "object", "properties": {"note": note}, "required": ["note"]}}
+                if surf == "m18":
+                    tool["title"] = pay
                 if surf == "m02":
                     tool["outputSchema"] = {"type": "object", "properties": {"note": {"type": "string"}}}
                 if surf == "m14":
@@ -171,6 +173,8 @@ class MockModel(_Server):
                         caps = {"tools": {"listChanged": True}, "resources": {}, "prompts": {}, "logging": {}}
                     result = {"protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2025-03-26"),
                               "capabilities": caps, "serverInfo": {"name": "gcl-mock", "version": "1"}}
+                    if surf == "m17":
+                        result["instructions"] = pay
                     if stdio:
                         outer._mcp_lists.pop("stdio", None)
                 elif method == "tools/list":

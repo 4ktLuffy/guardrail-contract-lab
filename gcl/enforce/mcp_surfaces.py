@@ -110,6 +110,11 @@ CATALOGUE = [
     Surface("m15", "unlisted tool", "to_server", "tools/call to a tool that tools/list never showed"),
     Surface("m16", "batched call", "to_server", "the tools/call sent as a one-element JSON-RPC batch",
             protocol="batches exist only in protocol 2025-03-26", until="2025-03-26"),
+    Surface("m17", "server instructions", "to_client",
+            "initialize result: instructions, which a client puts in the model's context"),
+    Surface("m18", "tool title", "to_client", "tools/list: tool.title",
+            protocol="title was introduced in protocol 2025-06-18; a gateway that drops it in an older session "
+                     "gives n/a"),
 ]
 BY_ID = {s.id: s for s in CATALOGUE}
 
@@ -282,6 +287,8 @@ def steps_for(adapter, s: Surface, payload: str) -> tuple[list, dict]:
             return [call] if batch else call
         return step
 
+    if s.id in ("m17", "m18"):  # m17's payload is in the handshake itself; m18's in the list
+        return [lst], picks
     if s.id == "m09":
         def read(ex):
             uri = _named(adapter, picks, "resource", ex, 3, "resources", "uri", "resource", "gcl://note",

@@ -20,7 +20,7 @@ from `demo-out/report.json` (python 3.13.15, node v25.8.0, macOS). Regenerate wi
 | Fail-open runner: scanner faults that let the call run | 6 of 6 | `sections[3].probe.summary` |
 | Fail-closed runner | 0 of 6; both controls held | `sections[4].probe.summary` |
 | Reference gateway, naive build: scenarios breaking its documented fail-closed contract | 18 of 38 (strict build: 0 of 38) | `sections[5].enforce.summary`, `sections[6]` |
-| MCP gateway (`reference-mcp`), naive build: surfaces that reach the client or server unscanned | 13 of 16 at the default protocol 2025-03-26 (m02 structuredContent is run in every session, since real gateways carry it in older sessions too). Strict build: 0 of 16 violated, 15 held, 2 n/a (m15 unlisted tool and m16 batch refused, so not carried). At `--mcp-protocol 2025-06-18` m16 batches are not in the protocol (n/a, not run) | `sections[7].enforce.mcp_surfaces.summary`, `sections[8]` |
+| MCP gateway (`reference-mcp`), naive build: surfaces that reach the client or server unscanned | 15 of 18 at the default protocol 2025-03-26 (m02 structuredContent is run in every session, since real gateways carry it in older sessions too). Strict build: 0 of 18 violated, 17 held, 2 n/a (m15 unlisted tool and m16 batch refused, so not carried). At `--mcp-protocol 2025-06-18` m16 batches are not in the protocol (n/a, not run) | `sections[7].enforce.mcp_surfaces.summary`, `sections[8]` |
 | Wall time | ~175 s in total (173 s measured; most of it the deliberate hang, timing and timeout drills, and ~25 s per MCP build) | terminal |
 
 The MCP row is produced by two commands (no model, no network; the stand-in scanner answers

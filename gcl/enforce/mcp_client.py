@@ -300,6 +300,7 @@ def http_session(url: str, headers: dict | None, steps: list, timeout_s: float =
         cli.post(_initialize(protocol))
         init = ex.response_to(HANDSHAKE_ID)
         if not init or "result" not in init:
+            ex.conclude([HANDSHAKE_ID])  # a refused handshake is an ending, not a hang
             ex.error = ex.error or "initialize got no result"
             return ex
         cli.protocol = (init["result"] or {}).get("protocolVersion") or protocol
@@ -406,7 +407,8 @@ def stdio_session(argv: list[str], env: dict | None, steps: list, timeout_s: flo
         collect([HANDSHAKE_ID])
         init = ex.response_to(HANDSHAKE_ID)
         if not init or "result" not in init:
-            ex.error = "initialize got no result"
+            ex.conclude([HANDSHAKE_ID])
+            ex.error = ex.error or "initialize got no result"
             return ex
         send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         expected: list = [HANDSHAKE_ID]

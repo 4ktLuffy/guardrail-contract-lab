@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+**Fixed** (`--extra mcp`: results are now reported only with full proof)
+- A reply counts as an answer only if it is a valid JSON-RPC 2.0 response: `jsonrpc` "2.0", exactly
+  one of `result` / `error`, an error with an integer `code` and a string `message`. `error: null`,
+  both members or a missing `jsonrpc` no longer end as "not carried" or "dropped unscanned".
+- The surface's own request must have been sent and answered. An initialize error ends as the new
+  unverified outcome "handshake failed", a skipped step as "probe not sent", never n/a or held.
+  m17's handshake and m18's list must be answered too.
+- A session that did not settle is "unsettled" (unverified), not held or n/a; a proven leak stays
+  violated. `evidence.settled` records it.
+- "stopped" and "passed despite block" need a block answer whose delivery is confirmed; a missing
+  delivery receipt is "unconfirmed".
+- m00 judges the note in and the reply out each on the stand-in events that carry its own marker.
+
 ## 0.4.0 — 2026-10-12
 
 **New**

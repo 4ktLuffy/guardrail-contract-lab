@@ -296,7 +296,20 @@ Outcomes: `stopped` and `dropped unscanned` are held; `passed unscanned` (the st
 shown the text) and `passed despite block` (the stand-in said block and the text arrived anyway)
 are violated; no answer, a transport failure, a response cut at the byte cap, or a baseline (m00)
 that did not carry its own benign marker is unverified. "Not carried" is claimed only when the
-gateway answered every request properly. The far end is what gcl's own
+gateway answered every request properly (a valid JSON-RPC 2.0 result or error: `error: null`, both
+members, or no `jsonrpc` is no answer) and the surface's own request was really sent. A stop rests
+on a block answer whose delivery to the gateway is confirmed. More unverified outcomes, each one
+line:
+
+| outcome | meaning |
+|---|---|
+| `handshake failed` | initialize got an error or no result, so no probe was sent |
+| `probe not sent` | the session ended before the surface's own request was sent and answered |
+| `unsettled` | a late call may still arrive: a clean result is not proven (a leak already seen stands) |
+| `unconfirmed` | the stand-in said block but the delivery of that answer is missing or failed |
+
+m00 judges its two far ends (note in, reply out) each on the stand-in events that carry its own
+marker. The far end is what gcl's own
 observers recorded: a raw MCP client (standard library only, so every byte is visible) and a
 mock MCP server. Gateway logs are not used.
 

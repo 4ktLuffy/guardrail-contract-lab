@@ -32,6 +32,22 @@ _ANSWER_TEXT = "GCL client: sampling answered with a fixed benign result."
 HANDSHAKE_ID = "gcl-init"
 
 
+def valid_response(m) -> bool:
+    """`m` is a JSON-RPC 2.0 response object: "jsonrpc" "2.0", an id member, no method, and
+    exactly one of "result" / "error", the error an object with an integer code and a string
+    message. `{"id": 3, "error": null}`, a reply with both members or with no "jsonrpc", and a
+    non-JSON body are not answers: the one definition every "was it answered" decision uses."""
+    if not isinstance(m, dict) or "_raw" in m or m.get("method") is not None:
+        return False
+    if m.get("jsonrpc") != "2.0" or "id" not in m or ("result" in m) == ("error" in m):
+        return False
+    if "error" in m:
+        err = m["error"]
+        return (isinstance(err, dict) and isinstance(err.get("code"), int) and not isinstance(err.get("code"), bool)
+                and isinstance(err.get("message"), str))
+    return True
+
+
 @dataclass
 class Exchange:
     """Every message of one session, in order: {"dir": "sent"|"recv", "msg", "via":
@@ -62,23 +78,29 @@ class Exchange:
         return [e["msg"] for e in self.log if e["dir"] == "sent"]
 
     def response_to(self, rid) -> dict | None:
-        """The received response (result or error) for request id `rid`, if any."""
+        """The received JSON-RPC response (valid_response: result or error) for request id
+        `rid`, if any. HTTP status is not looked at here; `proper` does that."""
         for m in self.received():
-            if isinstance(m, dict) and m.get("id") == rid and m.get("method") is None and "_raw" not in m:
+            if valid_response(m) and m.get("id") == rid:
                 return m
         return None
 
+    def sent_ids(self) -> set:
+        """Ids of the requests gcl sent, inside batches too (not notifications, not gcl's own
+        answers to server requests): what a session can claim to have asked."""
+        return {i for m in self.sent() for i in _request_ids(m)}
+
     def proper(self, rid) -> bool:
-        """Request `rid` got a proper answer: a JSON-RPC result or error object for it, with
-        HTTP status below 400 or an error object (a 5xx page, or a result under 4xx/5xx, is not).
+        """Request `rid` got a proper answer: a valid JSON-RPC response (valid_response) for it,
+        with HTTP status below 400 or an error object (a 5xx page, or a result under 4xx/5xx,
+        is not).
         A batch refused as a whole, with one error object whose id is null, answers every
         request in it."""
         if rid in self.refused:
             return True
         for e in self.log:
             m = e["msg"]
-            if (e["dir"] == "recv" and isinstance(m, dict) and "_raw" not in m and m.get("id") == rid
-                    and m.get("method") is None and ("result" in m or "error" in m)
+            if (e["dir"] == "recv" and valid_response(m) and m.get("id") == rid
                     and (e["status"] is None or e["status"] < 400 or "error" in m)):
                 return True
         return False
@@ -188,15 +210,15 @@ class _Http:
                 self._record_body(body, resp.status)
                 if 400 <= resp.status < 500:
                     answered = {e["msg"].get("id") for e in self.ex.log[mark:]
-                                if e["dir"] == "recv" and isinstance(e["msg"], dict) and "_raw" not in e["msg"]}
+                                if e["dir"] == "recv" and valid_response(e["msg"])}
                     for rid in _request_ids(msg):
                         if rid not in answered:
                             self.ex.http_refused[rid] = resp.status
         finally:
             conn.close()
         if isinstance(msg, list) and any(
-                e["dir"] == "recv" and isinstance(e["msg"], dict) and "error" in e["msg"] and e["msg"].get("id") is None
-                and e["msg"].get("method") is None for e in self.ex.log[mark:]):
+                e["dir"] == "recv" and valid_response(e["msg"]) and "error" in e["msg"] and e["msg"].get("id") is None
+                for e in self.ex.log[mark:]):
             self.ex.refused.update(_request_ids(msg))
 
     def _room(self) -> int:
@@ -299,7 +321,7 @@ def http_session(url: str, headers: dict | None, steps: list, timeout_s: float =
     try:
         cli.post(_initialize(protocol))
         init = ex.response_to(HANDSHAKE_ID)
-        if not init or "result" not in init:
+        if not init or "result" not in init or not ex.proper(HANDSHAKE_ID):
             ex.conclude([HANDSHAKE_ID])  # a refused handshake is an ending, not a hang
             ex.error = ex.error or "initialize got no result"
             return ex
@@ -406,7 +428,7 @@ def stdio_session(argv: list[str], env: dict | None, steps: list, timeout_s: flo
         send(_initialize(protocol))
         collect([HANDSHAKE_ID])
         init = ex.response_to(HANDSHAKE_ID)
-        if not init or "result" not in init:
+        if not init or "result" not in init or not ex.proper(HANDSHAKE_ID):
             ex.conclude([HANDSHAKE_ID])
             ex.error = ex.error or "initialize got no result"
             return ex

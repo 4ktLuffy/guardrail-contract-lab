@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+**New**
+- `--extra config`: is the configured policy the one that runs. A policy that fails to load must
+  not allow everything; a live edit (tighten, loosen, once per edit mechanism) must take effect; a
+  scoped policy must apply to its scope and only to it. Two stand-in scanners of gcl's own (A allows,
+  B blocks) prove which policy was running; a check is never held without that receipt. Runs on
+  `reference` and `litellm`; other adapters refuse it. New adapter interface: `config_checks`, `config_scopes`,
+  `load_failures`, `edit_mechanisms`, `propagation_s`, `start_policy`, `edit_policy`, `call_scope`,
+  `StartRefused`, `CheckUnavailable`.
+- The reference gateway takes `--policy-file` (guards with scopes, re-read on change, fail closed);
+  profile `naive` reproduces the LiteLLM failures (ignored edits, scoped guards that match nothing,
+  a broken file that allows everything).
+- `--extra config` on LiteLLM: four load failures, live edit through `PATCH` and `PUT /guardrails/{id}`
+  (needs `GCL_LITELLM_DATABASE_URL`, a Postgres database used only for this), and a model-scoped policy.
+- Config results carry a documented verdict (`Adapter.config_documented`, `config_documented_sources`),
+  shown with its quoted passage in the terminal and HTML tables.
+- OWASP mapping for config results: LLM01:2025 where a request that should have been stopped passed;
+  ASI08:2026 (Cascading Failures) only on a policy that failed to load.
+- Severity: a config result is trigger "configuration not applied" (0), not an operator mistake (-1).
+- A stop outside the policy's scope without scanner B consulted is unverified, not violated.
+
 **Fixed** (`--extra mcp`: results are now reported only with full proof)
 - A reply counts as an answer only if it is a valid JSON-RPC 2.0 response: `jsonrpc` "2.0", exactly
   one of `result` / `error`, an error with an integer `code` and a string `message`. `error: null`,

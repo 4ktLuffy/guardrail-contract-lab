@@ -13,6 +13,8 @@ reason, and the ledger keeps both.
                 the guard service is down or slow (error, timeout, ...)      0
                 the guard sends a malformed or unexpected answer             -1
                 the operator misconfigured the policy source                 -1
+    the configuration was not applied (--extra config: a policy that
+      failed to load, an edit that did not take, a scope that did not match)   0
   config        not the integration's default configuration              -2
   documented    the integration's docs describe this behaviour            -1
   clamp to 1..10; a result on a guessed stand-in answer is capped at 3 ("needs
@@ -31,8 +33,11 @@ TRIGGER = {
     "guard down": ("error", "timeout", "refused", "empty", "malformed", "policy_error"),
     "guard answers oddly": ("unknown_verdict", "verdict_type", "wrong_schema", "null_verdict", "judge_refusal"),
     "operator misconfiguration": ("policy_missing",),
+    # Not the operator's mistake: they wrote a valid policy and the integration did not apply it.
+    "configuration not applied": ("config",),
 }
-TRIGGER_POINTS = {"attacker": 1, "guard down": 0, "guard answers oddly": -1, "operator misconfiguration": -1}
+TRIGGER_POINTS = {"attacker": 1, "guard down": 0, "guard answers oddly": -1, "operator misconfiguration": -1,
+                  "configuration not applied": 0}
 HUMAN_FIELDS = ("default_config", "trigger")
 
 

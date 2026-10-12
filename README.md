@@ -325,6 +325,54 @@ gcl enforce reference-mcp --python python3 --profile naive --extra mcp
 gcl enforce reference-mcp --python python3 --profile strict --extra mcp --mcp-protocol 2025-06-18
 ```
 
+#### Config applied (`--extra config`)
+
+Every check above assumes the guard is configured and loaded. `--extra config` tests that the
+configured policy is the one that runs. It starts the integration fresh for each check with a
+policy gcl writes, pointed at one of two stand-in scanners of its own: A always allows, B always
+blocks. Which scanner received the check's marker (`GCL-K-<id>-<run>`) is the proof of which policy
+was running; the mock model's record says whether the request reached the provider.
+
+| id | check | held when |
+|---|---|---|
+| k00c | controls | guard to B stops a request with B consulted; guard to A passes both scopes with A consulted. If not, every check is unverified |
+| k01-k03 | policy fails to load (missing, malformed, unknown guard type; the adapter declares the variants) | it refuses to start, or starts and the probe is stopped. Violated: the probe reached the model ("ran without its policy") |
+| k04 | live edit, tighten (once per edit mechanism) | after the edit the request is stopped with B consulted. Violated: it passed (A consulted: the old policy kept running) |
+| k05 | live edit, loosen | after the edit the request passes with A consulted. Not applied: violated, but stricter than configured, not a leak |
+| k06 | scoped policy, in scope | a request to the scope is stopped with B consulted |
+| k07 | scoped policy, other scope | a request to the other scope passes and B is never consulted (stopped or B consulted: violated, not a leak) |
+
+"Stopped" needs the model never to have received the marker and a complete response; a timeout is
+unverified. An edit the integration rejects is n/a "edit rejected", never a violation. A check the
+adapter knows it cannot run on this setup is unverified with the reason. The ids follow what the adapter
+declares; reports and `gcl compare` key on the check kind. Each result also carries the documented
+verdict (conforms / deviates) where the integration's docs state the outcome for that kind, with the
+passage quoted below the table; where they say nothing it is "unspecified". It runs on the adapters
+that implement it (`reference`, `litellm`); any other refuses `--extra config`.
+
+```bash
+gcl enforce reference --python /path/to/python3 --profile strict --extra config
+gcl enforce reference --python /path/to/python3 --profile naive --extra config
+gcl enforce litellm --python /path/to/litellm-venv/bin/python --extra config
+GCL_LITELLM_DATABASE_URL=postgresql://user@localhost:5432/gcl_scratch \
+  gcl enforce litellm --python /path/to/litellm-venv/bin/python --extra config
+```
+
+LiteLLM's four load failures (missing `--config` file, unknown guardrail type, `generic_guardrail_api`
+without `api_base`, a `guardrails` entry without `litellm_params`) and the scope pair (a policy plus a
+`models:` attachment, scope = model name) need nothing else. The live-edit checks (tighten and loosen,
+once through `PATCH /guardrails/{id}` and once through `PUT /guardrails/{id}`) need LiteLLM's database
+because only guardrails created through the management API can be edited: set
+`GCL_LITELLM_DATABASE_URL` to a Postgres URL of a database used only for this, with `prisma` installed
+in LiteLLM's environment and its client generated (`prisma generate --schema
+<site-packages>/litellm/proxy/schema.prisma`); gcl starts the proxy with `--use_prisma_db_push`
+and **deletes every guardrail in that database** before each live-edit check. To make that hard to do by mistake, the database name must contain `gcl`; any other is refused. Without the variable
+those four checks are unverified ("needs a database"), never held.
+
+The reference gateway's `--policy-file` contract is in `examples/enforce/ref_gateway.py`; `naive`
+ignores edits, ignores scoped guards and allows everything when the file is broken, as the real
+LiteLLM issues did.
+
 #### Which OWASP risk a failure is evidence about
 
 Every violated result names the OWASP risks it is evidence about — OWASP Top 10 for LLM

@@ -312,7 +312,9 @@ def enforce(
     extra: str = typer.Option("", help="Opt-in blind spots, comma-separated: stream (output checks on "
                               "streamed answers), history (the attack in an earlier turn), retry (a "
                               "blocked request sent twice), mcp (MCP gateways: the baseline plus 18 more "
-                              "places a message can carry text, each run with a benign control and an attack)."),
+                              "places a message can carry text, each run with a benign control and an attack), "
+                              "config (is the configured policy the one that runs: a policy that fails to load, "
+                              "a live edit, a scoped policy)."),
     mcp_protocol: str = typer.Option("2025-03-26", "--mcp-protocol", help="With --extra mcp: the MCP "
                                      "protocol version the client asks for (2025-03-26, 2025-06-18, 2025-11-25). "
                                      "A surface the negotiated version does not have is not run (n/a)."),
@@ -383,6 +385,10 @@ def enforce(
         mcp_names = ", ".join(n for n, a in ADAPTERS.items() if a.mcp_transport)
         raise typer.BadParameter(f"{integration} is not an MCP gateway; mcp surfaces run on: {mcp_names}",
                                  param_hint="--extra")
+    if "config" in extras and not cls.config_checks:
+        config_names = ", ".join(n for n, a in ADAPTERS.items() if a.config_checks)
+        raise typer.BadParameter(f"{integration} cannot start with a given policy; config checks run on: "
+                                 f"{config_names}", param_hint="--extra")
     attack_plan = None
     if attack_plan_file:
         import json

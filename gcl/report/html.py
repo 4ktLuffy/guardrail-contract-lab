@@ -262,7 +262,7 @@ def _enforce(sec: dict) -> str:
            "deviates": "error", "unspecified": ""}
     for r in sec["results"]:
         s, ev = r["scenario"], r["evidence"]
-        if s["mode"] == "surface":
+        if s["mode"] in ("surface", "config"):
             continue  # their own table below
         notes = "".join(f"<br><small>{e(n)}</small>" for n in r["notes"])
         evidence = (f"client {e(ev['client_status'])} · model requests {e(ev['model_requests'])} · "
@@ -276,7 +276,38 @@ def _enforce(sec: dict) -> str:
                    f"<td><small>{evidence}</small>{notes}</td></tr>")
     out.append("</table></div>")
     out.append(_surfaces(sec))
+    out.append(_config(sec))
     return "\n".join(out)
+
+
+def _config(sec: dict) -> str:
+    """Config checks (`--extra config`): is the configured policy the one that runs."""
+    rows = [r for r in sec["results"] if r["scenario"]["mode"] == "config"]
+    if not sec.get("config_checks") or not rows:
+        return ""
+    sm = sec["config_checks"]["summary"]
+    out = [(f"<h3>Config applied</h3><p class='sub'>{sm['held']} held, {sm['violated']} violated, "
+            f"{sm['unverified']} unverified, {sm['n/a']} n/a, of {sm['checks']} checks; controls: "
+            f"{e(sm['controls'] or 'not run')}. Which stand-in scanner received a check's marker proves which "
+            "policy was running: A always allows, B always blocks.</p>"),
+           ("<div class='scroll'><table><tr><th>Id</th><th>Check</th><th>A asked</th><th>B asked</th>"
+            "<th>Model got it</th><th>Outcome</th><th>Policy</th><th>Docs</th><th>OWASP</th></tr>")]
+    cls = {"held": "okc", "violated": "error", "unverified": "warning", "n/a": ""}
+    dcls = {"conforms": "okc", "deviates": "error", "unverified": "warning"}
+    for r in rows:
+        sc, ev = r["scenario"], r["evidence"]
+        notes = "".join(f"<br><small>{e(n)}</small>" for n in r["notes"])
+        out.append(f"<tr><td><code>{e(sc['id'])}</code></td><td>{e(sc['config']['name'])}<br>"
+                   f"<small>{e(sc['config']['description'])}</small></td><td>{ev['scanner_a_consulted']}</td>"
+                   f"<td>{ev['scanner_b_consulted']}</td><td>{'yes' if ev['model_received'] else 'no'}</td>"
+                   f"<td><b>{e(r['observed'])}</b></td>"
+                   f'<td class="lv {cls[r["policy"]]}">{e(r["policy"])}{notes}</td>'
+                   f'<td class="lv {dcls.get(r["documented"], "")}">{e(r["documented"])}</td>'
+                   f"<td><small>{e(', '.join(ev.get('owasp') or []))}</small></td></tr>")
+    out.append("</table></div>")
+    for src in sec["integration"].get("config_documented_source") or []:
+        out.append(_doc_source(src))
+    return "".join(out)
 
 
 def _surfaces(sec: dict) -> str:

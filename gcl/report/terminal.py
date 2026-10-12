@@ -211,6 +211,35 @@ def _surface_table(run: dict) -> list[str]:
     return lines
 
 
+def _config_table(run: dict) -> list[str]:
+    """Config checks (`--extra config`): one row per check, the controls first."""
+    sm = run["config_checks"]["summary"]
+    lines = ["", (f"Config applied: {sm['held']} held, {sm['violated']} violated, {sm['unverified']} unverified, "
+                  f"{sm['n/a']} n/a of {sm['checks']} checks (controls: {sm['controls'] or 'not run'})"),
+             *([c(f"  the config phase failed: {run['config_checks']['error']}", "error")]
+               if run["config_checks"].get("error") else []),
+             f"  {'id':<5} {'check':<54} {'A':>2} {'B':>2} {'model':<6} {'outcome':<18} {'policy':<11} docs"]
+    for r in run["results"]:
+        sc = r["scenario"]
+        if sc["mode"] != "config":
+            continue
+        ev = r["evidence"]
+        pk = {"held": "ok", "violated": "error", "unverified": "warning", "n/a": "dim"}[r["policy"]]
+        dk = {"conforms": "ok", "deviates": "error"}.get(r["documented"], "dim")
+        pol = f"{r['policy']:<11}"
+        lines.append(f"  {sc['id']:<5} {sc['config']['name']:<54} {ev['scanner_a_consulted']:>2} "
+                     f"{ev['scanner_b_consulted']:>2} {'yes' if ev['model_received'] else 'no':<6} "
+                     f"{r['observed']:<18} {c(pol, pk)} "
+                     f"{c(r['documented'], dk)}")
+        for n in r["notes"]:
+            lines.append(c(f"       {n}", "dim"))
+        if ev.get("owasp"):
+            lines.append(c(f"       OWASP: {', '.join(ev['owasp'])}", "dim"))
+    for src in run["integration"].get("config_documented_source") or []:
+        lines.append(c(f"  Docs: {src.get('source')} (read for {src.get('read_for')}): {src.get('passage')}", "dim"))
+    return lines
+
+
 def render_enforce(run: dict) -> str:
     i = run["integration"]
     v = ", ".join(f"{k} {val}" for k, val in i["versions"].items() if val)
@@ -229,7 +258,7 @@ def render_enforce(run: dict) -> str:
     lines.append("")
     for r in run["results"]:
         s = r["scenario"]
-        if s["mode"] == "surface":
+        if s["mode"] in ("surface", "config"):
             continue  # shown in their own table below
         pk = {"held": "ok", "violated": "error", "unverified": "warning"}[r["policy"]]
         dk = {"conforms": "ok", "deviates": "error", "unspecified": "dim", "unverified": "warning"}[r["documented"]]
@@ -247,6 +276,8 @@ def render_enforce(run: dict) -> str:
             lines.append(c(f"             OWASP: {', '.join(r['evidence']['owasp'])}", "dim"))
     if run.get("mcp_surfaces"):
         lines += _surface_table(run)
+    if run.get("config_checks") and any(r["scenario"]["mode"] == "config" for r in run["results"]):
+        lines += _config_table(run)
     sm = run["summary"]
     lines.append("")
     lines.append(f"Policy: {sm['policy_held']} held, {sm['policy_violated']} violated, {sm['unverified']} unverified "

@@ -68,6 +68,7 @@ def build(runs_dir: Path, ledger: dict | None = None, public: bool = False) -> d
         name = f"{i['integration']} ({i['profile']}) {vers}" + (f" @{lat:g}s" if lat is not None else "")
         row = rows.setdefault(name, {})
         surfaces: list[str] = []
+        configs: list[str] = []
         for r in run["results"]:
             s = r["scenario"]
             if s.get("control") or s.get("attack"):
@@ -83,6 +84,17 @@ def build(runs_dir: Path, ledger: dict | None = None, public: bool = False) -> d
                 else:
                     surfaces.append(s["surface"]["id"] + ("" if r["policy"] == "held" else
                                                           ":" + _cell(r).replace(" (documented)", "")))
+                continue
+            if s["mode"] == "config":
+                if s["role"]:
+                    continue  # the config controls gate the checks; their result is theirs
+                covered = json.dumps(i.get("versions"), sort_keys=True) in disclosed.get(_ident(run, r), set())
+                if public and r["policy"] == "violated" and not covered:
+                    withheld += 1
+                    configs.append("withheld")
+                else:
+                    configs.append(s["config"]["check"] + ("" if r["policy"] == "held" else
+                                              ":" + ("n/a" if r["policy"] == "n/a" else _cell(r))))
                 continue
             col = f"{s['stage']} {s['mode']}" + (" (stream)" if s.get("stream") else "") + \
                 (" (history)" if s.get("history") else "")
@@ -102,6 +114,13 @@ def build(runs_dir: Path, ledger: dict | None = None, public: bool = False) -> d
             if "mcp surfaces" not in cols:
                 cols.append("mcp surfaces")
             row["mcp surfaces"] = f"{row['mcp surfaces']} / {cell}" if row.get("mcp surfaces") not in (None, cell) \
+                else cell
+        if configs:
+            n_held = sum(1 for x in configs if ":" not in x and x != "withheld")
+            cell = f"{n_held}/{len(configs)} hold" + "".join(f"; {x}" for x in configs if ":" in x or x == "withheld")
+            if "config checks" not in cols:
+                cols.append("config checks")
+            row["config checks"] = f"{row['config checks']} / {cell}" if row.get("config checks") not in (None, cell) \
                 else cell
     return {"columns": cols, "rows": rows, "public": public, "withheld": withheld}
 

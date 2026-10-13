@@ -311,10 +311,12 @@ def enforce(
                                       "results that change with timing as unstable."),
     extra: str = typer.Option("", help="Opt-in blind spots, comma-separated: stream (output checks on "
                               "streamed answers), history (the attack in an earlier turn), retry (a "
-                              "blocked request sent twice), mcp (MCP gateways: the baseline plus 18 more "
+                              "blocked request sent twice), mcp (MCP gateways: the baseline plus 34 more "
                               "places a message can carry text, each run with a benign control and an attack), "
                               "config (is the configured policy the one that runs: a policy that fails to load, "
-                              "a live edit, a scoped policy)."),
+                              "a live edit, a scoped policy), routes (the same guard on every route to the same "
+                              "action: chat, /v1/messages, /v1/responses, /v1/completions, streaming; for MCP a "
+                              "batch, resources, prompts, a hidden tool)."),
     mcp_protocol: str = typer.Option("2025-03-26", "--mcp-protocol", help="With --extra mcp: the MCP "
                                      "protocol version the client asks for (2025-03-26, 2025-06-18, 2025-11-25). "
                                      "A surface the negotiated version does not have is not run (n/a)."),
@@ -379,8 +381,13 @@ def enforce(
 
     if mcp_protocol not in PROTOCOLS:
         raise typer.BadParameter(f"choose from {', '.join(PROTOCOLS)}", param_hint="--mcp-protocol")
-    if mcp_protocol != PROTOCOL and "mcp" not in extras:
-        raise typer.BadParameter("it only applies with --extra mcp", param_hint="--mcp-protocol")
+    if mcp_protocol != PROTOCOL and not {"mcp", "routes"} & set(extras):
+        raise typer.BadParameter("it only applies with --extra mcp (or routes, on an MCP gateway)",
+                                 param_hint="--mcp-protocol")
+    if "routes" in extras and not (cls.routes or cls.mcp_transport):
+        route_names = ", ".join(n for n, a in ADAPTERS.items() if a.routes or a.mcp_transport)
+        raise typer.BadParameter(f"{integration} declares no routes; route parity runs on: {route_names}",
+                                 param_hint="--extra")
     if "mcp" in extras and not cls.mcp_transport:
         mcp_names = ", ".join(n for n, a in ADAPTERS.items() if a.mcp_transport)
         raise typer.BadParameter(f"{integration} is not an MCP gateway; mcp surfaces run on: {mcp_names}",
@@ -704,6 +711,56 @@ def table(runs: Path = typer.Argument(..., exists=True, file_okay=False, help="F
     if out:
         out.write_text(text + "\n", encoding="utf-8")
     typer.echo(text)
+
+
+@app.command("evidence-pack")
+def evidence_pack(
+    reports: list[Path] = typer.Argument(..., exists=True, dir_okay=False,
+                                         help="gcl report.json files (enforce, coverage, probe)."),
+    out: Path = typer.Option(..., help="Directory for pack.json, pack.html, manifest.json and copies of the inputs."),
+    sign_key: Path | None = typer.Option(None, "--sign-key", exists=True, dir_okay=False,
+                                         help="File holding an HMAC key. Adds manifest.hmac: proves integrity "
+                                              "to whoever holds the key, not who made the pack."),
+):
+    """Map stored run reports to framework provisions, with hashes and an honest coverage matrix.
+
+    Technical test evidence only: not a conformity assessment, not legal advice."""
+    from . import evidence as E
+
+    try:
+        res = E.build(reports, out, sign_key)
+    except E.PackError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2) from None
+    p = res["pack"]
+    c = p["cell_summary"]
+    typer.echo(E.FW.DISCLAIMER)
+    typer.echo(f"\n{len(reports)} report(s); {p['totals']['total']} results mapped: {p['totals']['held']} held, "
+               f"{p['totals']['violated']} violated, {p['totals']['unverified']} unverified, {p['totals']['n/a']} n/a")
+    typer.echo(f"matrix cells: {c['held']} held, {c['violated']} violated, {c['unverified']} unverified, "
+               f"{c['not tested']} not tested, {c['n/a']} not applicable")
+    for w in p["warnings"]:
+        typer.echo(f"warning: {w}")
+    typer.echo("signing: " + res["manifest"]["signing"]["statement"])
+    typer.echo(f"\nPack: {out}/  ({', '.join(res['files'][:3])} ...)")
+
+
+@app.command("evidence-verify")
+def evidence_verify(
+    pack_dir: Path = typer.Argument(..., exists=True, file_okay=False,
+                                    help="A directory written by `gcl evidence-pack`."),
+    sign_key: Path | None = typer.Option(None, "--sign-key", exists=True, dir_okay=False,
+                                         help="HMAC key file to check manifest.hmac with."),
+):
+    """Re-hash every file in the manifest and check the HMAC. Exit 1 on any difference."""
+    from . import evidence as E
+
+    r = E.verify(pack_dir, sign_key)
+    typer.echo(f"{r['checked']} file(s) checked; signature: {r['signature']}")
+    for pr in r["problems"]:
+        typer.echo(f"PROBLEM: {pr}")
+    typer.echo("OK: every listed file matches the manifest" if r["ok"] else "NOT OK")
+    raise typer.Exit(0 if r["ok"] else 1)
 
 
 # Last, so every command above is registered when run as `python -m gcl.cli`.

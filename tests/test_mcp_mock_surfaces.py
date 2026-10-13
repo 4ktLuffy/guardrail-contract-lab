@@ -194,3 +194,106 @@ def test_m18_tool_title(mock, transport):
     t = surf(mock, transport, "m18", [LIST]).response_to(5)["result"]["tools"][0]
     assert t["title"] == PAY and t["description"] == "Record a note."
     assert "title" not in run(mock, transport, [LIST]).response_to(5)["result"]["tools"][0]
+
+
+# --- m19..m34: the places the first eighteen surfaces left out -----------------------------------------
+def _call(rid=7, **params):
+    return {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+            "params": {"name": "gcl_probe", "arguments": {"note": "hello"}, **params}}
+
+
+def _sent_to_server(mock, n):
+    return dumps([e["msg"] for e in mock.mcp_received[n:]])
+
+
+def test_m19_m20_completion(mock, transport):
+    req = {"jsonrpc": "2.0", "id": 5, "method": "completion/complete", "params": {
+        "ref": {"type": "ref/prompt", "name": "gcl_prompt"}, "argument": {"name": "note", "value": PAY}}}
+    n = len(mock.mcp_received)
+    ex = surf(mock, transport, "m19", [req])
+    assert ex.finished, ex.error
+    assert PAY in _sent_to_server(mock, n)
+    assert ex.response_to(HANDSHAKE)["result"]["capabilities"]["completions"] == {}
+    assert PAY not in dumps(ex.response_to(5))
+    assert ex.response_to(5)["result"]["completion"]["values"] == ["note-1"]
+    ex = surf(mock, transport, "m20", [req])
+    assert ex.response_to(5)["result"]["completion"]["values"] == [PAY]
+
+
+def test_m21_m22_resource_templates(mock, transport):
+    req = {"jsonrpc": "2.0", "id": 5, "method": "resources/templates/list"}
+    t = surf(mock, transport, "m21", [req]).response_to(5)["result"]["resourceTemplates"][0]
+    assert t["description"] == PAY and "{id}" in t["uriTemplate"]
+    t = surf(mock, transport, "m22", [req]).response_to(5)["result"]["resourceTemplates"][0]
+    assert PAY in t["uriTemplate"] and t["description"] == "A resource template."
+
+
+def test_m23_m31_m33_tool_result_places(mock, transport):
+    r = surf(mock, transport, "m23", [_call()]).response_to(7)["result"]
+    link = r["content"][1]
+    assert link["type"] == "resource_link" and link["description"] == PAY and link["uri"]
+    assert surf(mock, transport, "m31", [_call()]).response_to(7)["result"]["_meta"] == {"gcl/note": PAY}
+    err = surf(mock, transport, "m33", [_call()]).response_to(7)["error"]
+    assert err["data"] == PAY and err["message"] != PAY and isinstance(err["code"], int)
+
+
+def test_m24_m25_tool_fields(mock, transport):
+    t = surf(mock, transport, "m24", [LIST]).response_to(5)["result"]["tools"][0]
+    assert t["outputSchema"]["properties"]["note"]["description"] == PAY and t["description"] == "Record a note."
+    t = surf(mock, transport, "m25", [LIST]).response_to(5)["result"]["tools"][0]
+    assert t["annotations"]["title"] == PAY and t["annotations"]["readOnlyHint"] is False
+
+
+def test_m26_m27_m34_elicitation_requests_are_answered_in_the_stream(mock, transport):
+    schema = lambda p: p["requestedSchema"]["properties"]["note"]["description"]  # noqa: E731
+    for sid, where in (("m26", lambda p: p["message"]), ("m27", schema), ("m34", lambda p: p["url"])):
+        n = len(mock.mcp_received)
+        ex = surf(mock, transport, sid, [_call()])
+        assert ex.finished, (sid, ex.error)
+        req = next(m for m in ex.received() if m.get("method") == "elicitation/create")
+        assert PAY in where(req["params"]), sid
+        assert (req["params"].get("mode") == "url") == (sid == "m34")
+        ans = next(e["msg"] for e in mock.mcp_received[n:]
+                   if e["msg"].get("id") == req["id"] and "method" not in e["msg"])
+        assert ans["result"] == {"action": "decline"}
+
+
+def test_m28_m30_the_clients_answers_carry_the_payload_to_the_server(mock, transport):
+    n = len(mock.mcp_received)
+    accept = mc.Answers({"elicitation/create": {"action": "accept", "content": {"note": PAY}}})
+    ex = surf(mock, transport, "m28", [accept, _call()])
+    assert ex.finished, ex.error
+    ans = [e["msg"] for e in mock.mcp_received[n:] if "method" not in e["msg"] and e["msg"].get("id")]
+    assert ans[0]["result"]["content"] == {"note": PAY}
+    assert all(not isinstance(e["msg"], mc.Answers) for e in ex.log if e["dir"] == "sent")   # Answers sends nothing
+    n = len(mock.mcp_received)
+    roots = mc.Answers({"roots/list": {"roots": [{"uri": "file:///x", "name": PAY}]}})
+    ex = surf(mock, transport, "m30", [roots, _call()])
+    assert any(m.get("method") == "roots/list" for m in ex.received())
+    ans = [e["msg"] for e in mock.mcp_received[n:] if "method" not in e["msg"] and e["msg"].get("id")]
+    assert ans[0]["result"]["roots"][0]["name"] == PAY
+
+
+def test_m29_progress_message_only_for_a_request_with_a_token(mock, transport):
+    ex = surf(mock, transport, "m29", [_call(_meta={"progressToken": "tok"})])
+    note = next(m for m in ex.received() if m.get("method") == "notifications/progress")
+    assert note["params"] == {"progressToken": "tok", "progress": 1, "total": 1, "message": PAY}
+    ex = surf(mock, transport, "m29", [_call()])
+    assert not any(m.get("method") == "notifications/progress" for m in ex.received())
+
+
+def test_m32_request_meta_reaches_the_server(mock, transport):
+    n = len(mock.mcp_received)
+    surf(mock, transport, "m32", [_call(_meta={"gcl/note": PAY})])
+    assert PAY in _sent_to_server(mock, n)
+
+
+def test_resource_template_lists_are_paged_too(mock):
+    mock.set_mcp_paging(1, 2)
+    try:
+        req = {"jsonrpc": "2.0", "id": 5, "method": "resources/templates/list"}
+        ex = mc.http_session(mock.base + "/mcp", None, [req], 10)
+    finally:
+        mock.set_mcp_paging()
+    got = [t["name"] for rid in (5, "5.1", "5.2") for t in ex.response_to(rid)["result"]["resourceTemplates"]]
+    assert got == ["decoy-0", "decoy-1", "note-template"]

@@ -101,6 +101,7 @@ def _key(run: dict, r: dict) -> dict:
             "role": s.get("role") or "", "lang": s["lang"], "judge_latency_s": run.get("judge_latency_s"),
             "stream": bool(s.get("stream")), "history": bool(s.get("history")), "attack": s.get("attack") or "",
             **({"surface": s["id"]} if s.get("surface") else {}),  # an MCP surface: one finding per surface
+            **({"route": s["id"]} if s.get("route") else {}),  # a route (--extra routes): one per route
             **({"config": s["config"]["check"]} if s.get("config") else {})}  # a config check: one per kind
 
 
@@ -384,6 +385,7 @@ def render(doc: dict) -> str:
         vers = ", ".join(f"{a} {b}" for a, b in (last["versions"] or {}).items() if b)
         lines.append(f"| {f['id']} | {f['status']} | {f['title']} | {k['integration']} ({k['profile']}) | "
                      f"{k['stage']} / {k['mode']}{' ' + k['surface'] if k.get('surface') else ''}"
+                     f"{' ' + k['route'] if k.get('route') else ''}"
                      f"{' (' + k['role'] + ')' if k['role'] else ''} | "
                      f"{last['observed']} / {last['policy']} | "
                      f"{'GUESSED ' if f['guessed'] else ''}{last['stand_in']} | {len(f['runs'])} | {vers} | "

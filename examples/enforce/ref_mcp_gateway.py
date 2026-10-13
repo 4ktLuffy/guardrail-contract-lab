@@ -12,13 +12,18 @@ called for a blocked request.
 Its documented contract: fail closed, as ref_gateway.py. `--policy strict` keeps it and
 guards every message: every string in requests, responses, notifications, server requests
 inside SSE streams, the client's answers to them, tools/list, resources/read, prompts/get
-and error messages, in both directions. It rejects JSON-RPC batches, refuses a tools/call
+and error messages, in both directions. That includes every place gcl's MCP surfaces m19-m34
+put text: completion/complete arguments and values, resources/templates/list, resource_link
+items, outputSchema descriptions, tool annotations, elicitation messages, schemas, URLs and
+the client's answers, notifications/progress messages, the client's roots/list answer, `_meta`
+on requests and results, and JSON-RPC error `data`. It rejects JSON-RPC batches, refuses a tools/call
 for a tool missing from the last tools/list it forwarded in that session (a session
 with no tools/list has nothing to compare against), re-scans every
 tools/list, and treats any scanner failure as a block. A blocked SSE event ends the stream
 with an error for the original request.
 `--policy naive` guards what most gateways guard: tools/call arguments.note going in and
-result.content[0].text coming back; everything else is forwarded untouched, and scanner
+result.content[0].text coming back; everything else (all of the places above included) is
+forwarded untouched, and scanner
 errors and unknown verdicts mean "allow".
 
     python ref_mcp_gateway.py --scanner URL [--scanner-output URL] --upstream URL --port N --policy strict|naive

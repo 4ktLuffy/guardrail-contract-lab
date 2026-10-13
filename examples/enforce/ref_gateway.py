@@ -39,6 +39,14 @@ missing or malformed file starts the gateway with no guards (everything allowed)
 read once at startup, so edits are ignored (LiteLLM #40201); a scoped guard (scope other than
 "*") never matches anything (LiteLLM #41680: a scoped attachment matched nothing); a guard of an
 unknown type is skipped.
+
+Routes (`gcl enforce reference --extra routes` tests that the same guard stands on every way in):
+POST /v1/chat/completions (OpenAI chat; `"stream": true` answers as an event stream),
+/v1/messages (the Anthropic message shape), /v1/completions (legacy `prompt`) and /v1/responses
+(`input`). Any other path is 404. `--policy strict` guards all of them the same way: every message
+text (system, content blocks, prompt, input) before the model call, the reply after. `--policy
+naive` guards /v1/chat/completions only and forwards the others unscanned, in both directions:
+the shape of LiteLLM #40583 (/v1/messages skipped the guardrails).
 """
 from __future__ import annotations
 
@@ -58,6 +66,10 @@ def post(url: str, body: dict, timeout: float) -> dict:
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
+
+
+ROUTES = {"/v1/chat/completions": "chat", "/v1/messages": "messages", "/v1/completions": "completions",
+          "/v1/responses": "responses"}
 
 
 class PolicyError(Exception):
@@ -213,17 +225,74 @@ def main() -> None:
         def do_GET(self):
             self._json(200, {"status": "ok"})
 
+        @staticmethod
+        def _chat_messages(route: str, body: dict) -> list[dict]:
+            """The request as chat messages (what the model is called with); texts keep their order."""
+            def blocks(c):
+                if isinstance(c, str):
+                    return c
+                return " ".join(b.get("text", "") for b in c if isinstance(b, dict)) if isinstance(c, list) else ""
+            if route == "chat":
+                return body.get("messages", [])
+            if route == "messages":
+                sys_ = body.get("system")
+                head = [{"role": "system", "content": blocks(sys_)}] if sys_ else []
+                return head + [{"role": m.get("role", "user"), "content": blocks(m.get("content", ""))}
+                               for m in body.get("messages", []) if isinstance(m, dict)]
+            if route == "completions":
+                p = body.get("prompt", "")
+                return [{"role": "user", "content": " ".join(p) if isinstance(p, list) else str(p)}]
+            inp = body.get("input", "")
+            if isinstance(inp, str):
+                return [{"role": "user", "content": inp}]
+            return [{"role": m.get("role", "user"), "content": blocks(m.get("content", ""))}
+                    for m in inp if isinstance(m, dict)]
+
+        @staticmethod
+        def _shape(route: str, reply: dict, text: str, model: str) -> dict:
+            if route == "chat":
+                reply["choices"][0]["message"]["content"] = text
+                return reply
+            if route == "messages":
+                return {"id": "gcl-1", "type": "message", "role": "assistant", "model": model,
+                        "content": [{"type": "text", "text": text}], "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}}
+            if route == "completions":
+                return {"id": "gcl-1", "object": "text_completion", "model": model,
+                        "choices": [{"index": 0, "text": text, "finish_reason": "stop"}]}
+            return {"id": "gcl-1", "object": "response", "model": model, "status": "completed",
+                    "output": [{"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text", "text": text}]}]}
+
+        def _sse(self, text: str) -> None:
+            chunk = {"id": "gcl-1", "object": "chat.completion.chunk",
+                     "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]}
+            end = {"id": "gcl-1", "object": "chat.completion.chunk",
+                   "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\ndata: {json.dumps(end)}\n\n"
+                             "data: [DONE]\n\n".encode())
+
         def do_POST(self):
+            route = ROUTES.get(self.path.split("?")[0].rstrip("/"))
+            if route is None:
+                self._json(404, {"error": {"message": "no such route"}})
+                return
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
-            messages = body.get("messages", [])
+            messages = self._chat_messages(route, body)
+            # Strict guards every route; naive only guards chat completions (LiteLLM #40583).
+            guarded = args.policy == "strict" or route == "chat"
             texts = [m.get("content", "") for m in messages]
-            decision, texts = input_check(texts, str(body.get("model", "")))
-            if decision == "refuse":
-                self._json(503, {"error": {"message": "policy unusable: refused"}})
-                return
-            if decision == "block":
-                self._json(400, {"error": {"message": "blocked by guardrail"}})
-                return
+            if guarded:
+                decision, texts = input_check(texts, str(body.get("model", "")))
+                if decision == "refuse":
+                    self._json(503, {"error": {"message": "policy unusable: refused"}})
+                    return
+                if decision == "block":
+                    self._json(400, {"error": {"message": "blocked by guardrail"}})
+                    return
             for m, t in zip(messages, texts, strict=True):
                 m["content"] = t
             try:
@@ -232,12 +301,16 @@ def main() -> None:
                 self._json(502, {"error": {"message": "model unavailable"}})
                 return
             content = reply["choices"][0]["message"]["content"]
-            decision, out = output_check([content])
-            if decision == "block":
-                self._json(400, {"error": {"message": "blocked by guardrail"}})
+            if guarded:
+                decision, out = output_check([content])
+                if decision == "block":
+                    self._json(400, {"error": {"message": "blocked by guardrail"}})
+                    return
+                content = out[0]
+            if route == "chat" and body.get("stream"):
+                self._sse(content)
                 return
-            reply["choices"][0]["message"]["content"] = out[0]
-            self._json(200, reply)
+            self._json(200, self._shape(route, reply, content, str(body.get("model", "m"))))
 
     exit_with_parent()
     ThreadingHTTPServer(("127.0.0.1", args.port), H).serve_forever()

@@ -211,6 +211,25 @@ def _surface_table(run: dict) -> list[str]:
     return lines
 
 
+def _route_table(run: dict) -> list[str]:
+    """Route parity (`--extra routes`): one row per route, then the parity line."""
+    rt = run["routes"]
+    sm, par = rt["summary"], rt["parity"]
+    lines = ["", (f"Routes: {sm['held']} held, {sm['violated']} violated, {sm['unverified']} unverified, "
+                  f"{sm['n/a']} not carried of {sm['routes']}"),
+             *([c(f"  the route phase failed: {rt['error']}", "error")] if rt.get("error") else []),
+             f"  {'id':<4} {'route':<36} {'kind':<5} {'carried':<8} {'outcome':<22} policy"]
+    for r in rt["routes"]:
+        carried = {True: "yes", False: "no", None: "?"}[r["carried"]]
+        pk = {"held": "ok", "violated": "error", "unverified": "warning", "n/a": "dim"}[r["policy"]]
+        via = f" ({r['surface']})" if r["surface"] else ""
+        lines.append(f"  {r['id']:<4} {r['name'] + via:<36} {r['kind']:<5} {carried:<8} {r['observed']:<22} "
+                     f"{c(r['policy'], pk)}")
+    kind = {"equal": "ok", "broken": "error", "unverified": "warning", "not applicable": "dim"}[par["state"]]
+    lines.append(c(f"  parity: {par['state']}: {par['message']}", kind))
+    return lines
+
+
 def _config_table(run: dict) -> list[str]:
     """Config checks (`--extra config`): one row per check, the controls first."""
     sm = run["config_checks"]["summary"]
@@ -258,7 +277,7 @@ def render_enforce(run: dict) -> str:
     lines.append("")
     for r in run["results"]:
         s = r["scenario"]
-        if s["mode"] in ("surface", "config"):
+        if s["mode"] in ("surface", "config", "route"):
             continue  # shown in their own table below
         pk = {"held": "ok", "violated": "error", "unverified": "warning"}[r["policy"]]
         dk = {"conforms": "ok", "deviates": "error", "unspecified": "dim", "unverified": "warning"}[r["documented"]]
@@ -276,6 +295,8 @@ def render_enforce(run: dict) -> str:
             lines.append(c(f"             OWASP: {', '.join(r['evidence']['owasp'])}", "dim"))
     if run.get("mcp_surfaces"):
         lines += _surface_table(run)
+    if run.get("routes"):
+        lines += _route_table(run)
     if run.get("config_checks") and any(r["scenario"]["mode"] == "config" for r in run["results"]):
         lines += _config_table(run)
     sm = run["summary"]

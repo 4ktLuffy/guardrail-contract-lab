@@ -311,10 +311,12 @@ def enforce(
                                       "results that change with timing as unstable."),
     extra: str = typer.Option("", help="Opt-in blind spots, comma-separated: stream (output checks on "
                               "streamed answers), history (the attack in an earlier turn), retry (a "
-                              "blocked request sent twice), mcp (MCP gateways: the baseline plus 18 more "
+                              "blocked request sent twice), mcp (MCP gateways: the baseline plus 34 more "
                               "places a message can carry text, each run with a benign control and an attack), "
                               "config (is the configured policy the one that runs: a policy that fails to load, "
-                              "a live edit, a scoped policy)."),
+                              "a live edit, a scoped policy), routes (the same guard on every route to the same "
+                              "action: chat, /v1/messages, /v1/responses, /v1/completions, streaming; for MCP a "
+                              "batch, resources, prompts, a hidden tool)."),
     mcp_protocol: str = typer.Option("2025-03-26", "--mcp-protocol", help="With --extra mcp: the MCP "
                                      "protocol version the client asks for (2025-03-26, 2025-06-18, 2025-11-25). "
                                      "A surface the negotiated version does not have is not run (n/a)."),
@@ -379,8 +381,13 @@ def enforce(
 
     if mcp_protocol not in PROTOCOLS:
         raise typer.BadParameter(f"choose from {', '.join(PROTOCOLS)}", param_hint="--mcp-protocol")
-    if mcp_protocol != PROTOCOL and "mcp" not in extras:
-        raise typer.BadParameter("it only applies with --extra mcp", param_hint="--mcp-protocol")
+    if mcp_protocol != PROTOCOL and not {"mcp", "routes"} & set(extras):
+        raise typer.BadParameter("it only applies with --extra mcp (or routes, on an MCP gateway)",
+                                 param_hint="--mcp-protocol")
+    if "routes" in extras and not (cls.routes or cls.mcp_transport):
+        route_names = ", ".join(n for n, a in ADAPTERS.items() if a.routes or a.mcp_transport)
+        raise typer.BadParameter(f"{integration} declares no routes; route parity runs on: {route_names}",
+                                 param_hint="--extra")
     if "mcp" in extras and not cls.mcp_transport:
         mcp_names = ", ".join(n for n, a in ADAPTERS.items() if a.mcp_transport)
         raise typer.BadParameter(f"{integration} is not an MCP gateway; mcp surfaces run on: {mcp_names}",

@@ -102,6 +102,13 @@ SURFACE_RISKS = {
     "m12": ["MCP06:2025", "LLM01:2025"],
     "m14": ["MCP06:2025"], "m16": ["MCP06:2025"],
     "m15": ["MCP02:2025", "ASI02:2026", "LLM06:2025"],
+    # tool-shaped text the model reads (descriptions, annotations, links, templates, results, errors)
+    **{sid: ["MCP03:2025", "LLM01:2025"] for sid in ("m21", "m22", "m24", "m25", "m23")},
+    **{sid: _RESULT for sid in ("m20", "m29", "m31", "m33")},
+    # server requests the client forwards to a person or a model
+    **{sid: ["MCP06:2025", "LLM01:2025"] for sid in ("m26", "m27", "m34")},
+    # what the client sends out
+    **{sid: ["MCP06:2025"] for sid in ("m19", "m28", "m30", "m32")},
 }
 
 

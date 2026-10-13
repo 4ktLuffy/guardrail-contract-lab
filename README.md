@@ -261,7 +261,7 @@ can send them (LiteLLM, Portkey, the reference gateway).
 #### MCP: every place a message can carry text (`--extra mcp`)
 
 The MCP checks above test one path: `tools/call` arguments `note` going in, and
-`result.content[0].text` coming back. `--extra mcp` adds 18 more surfaces, each a place an
+`result.content[0].text` coming back. `--extra mcp` adds 34 more surfaces, each a place an
 MCP message can carry text to the model or out of the agent:
 
 | id | surface |
@@ -284,6 +284,29 @@ MCP message can carry text to the model or out of the agent:
 | m16 | call inside a JSON-RPC batch |
 | m17 | server `instructions` in the initialize result |
 | m18 | tool `title` |
+| m19 | `completion/complete` argument going out (2025-03-26+) |
+| m20 | `completion/complete` values coming back |
+| m21 | resource template `description` |
+| m22 | resource template `uriTemplate` |
+| m23 | `resource_link` item in a tool result (2025-06-18+) |
+| m24 | tool `outputSchema` description (2025-06-18+) |
+| m25 | tool `annotations.title` |
+| m26 | elicitation `message` (2025-06-18+) |
+| m27 | elicitation `requestedSchema` description (2025-06-18+) |
+| m28 | the client's elicitation answer going out (2025-06-18+) |
+| m29 | `notifications/progress` `message` |
+| m30 | the client's `roots/list` answer going out (root names) |
+| m31 | `_meta` on a tool result |
+| m32 | `_meta` on a request going out |
+| m33 | JSON-RPC error `data` |
+| m34 | URL-mode elicitation `url` (2025-11-25) |
+
+m19-m34 are version-gated (`since`): a surface newer than the negotiated protocol is not run and
+reads n/a "not in protocol". Each field and the version that introduced it were checked against `schema/<version>/schema.ts` of github.com/modelcontextprotocol/modelcontextprotocol (versions 2025-03-26, 2025-06-18, 2025-11-25)
+(2025-03-26: completion, resource templates, tool annotations, progress `message`, `Root.name`,
+`_meta`, error `data`; 2025-06-18: `resource_link`, `outputSchema`, elicitation; 2025-11-25: URL mode). m28 and m30 put the payload in
+what gcl's client answers to a server request (the mock server makes the server ask); m29 needs a
+request that carries a progress token, which gcl sends.
 
 Each surface runs twice. A **carry control** puts a benign marker in the surface, with a
 stand-in that allows everything. The marker must arrive whole at the far end; if it does
@@ -292,8 +315,9 @@ not, the gateway does not carry that surface: "not carried", policy n/a, never "
 text it is shown with an attack marker. The attack is not sent when its control was not carried.
 
 Outcomes: `stopped` and `dropped unscanned` are held; `passed unscanned` (the stand-in was never
-shown the text) and `passed despite block` (the stand-in said block and the text arrived anyway)
-are violated; no answer, a transport failure, a response cut at the byte cap, or a baseline (m00)
+shown the text), `passed despite block` (the stand-in said block and the text arrived anyway) and
+`passed without marker` (the marker was removed but the injection sentence reached the far end;
+the marker is how gcl finds a message, not what is protected) are violated; no answer, a transport failure, a response cut at the byte cap, or a baseline (m00)
 that did not carry its own benign marker is unverified. "Not carried" is claimed only when the
 gateway answered every request properly (a valid JSON-RPC 2.0 result or error: `error: null`, both
 members, or no `jsonrpc` is no answer) and the surface's own request was really sent. A stop rests
@@ -306,6 +330,18 @@ line:
 | `probe not sent` | the session ended before the surface's own request was sent and answered |
 | `unsettled` | a late call may still arrive: a clean result is not proven (a leak already seen stands) |
 | `unconfirmed` | the stand-in said block but the delivery of that answer is missing or failed |
+| `carried, marker stripped` | (control, held) the marker is gone but the benign sentence arrived whole: the surface is carried, so the attack runs and is judged on its sentence |
+| `text altered` | (control) part of the benign sentence arrived without its marker: neither whole nor absent |
+| `list incomplete` | a `tools/list`, `resources/list` or `prompts/list` was not read to its last page (`nextCursor` is followed, 20 pages at most; a repeated cursor or an error on a later page also stops it): "not listed" and "absent" are not proven |
+| `name ambiguous` | the gateway's documented name for the item is not listed and more than one entry ends like it: no guess |
+| `stream not observed` | the standalone GET stream could not be opened (other than a 4xx refusal, e.g. 405) or died, or a stdio server was still sending when the session ended: nothing is claimed absent |
+
+Everything the far end receives counts: every reply and event stream, what the server sends on
+the standalone GET stream of streamable HTTP (opened after the handshake; a 405 is recorded as
+"none offered"), and, over stdio, lines that arrive after the last answer (the session is read
+until it has been quiet for 0.3 s, at most 2 s). Names are read from the session's own lists
+and matched exactly against the gateway's documented name (`mcp_name`) first; a match by
+suffix is recorded as such.
 
 m00 judges its two far ends (note in, reply out) each on the stand-in events that carry its own
 marker. The far end is what gcl's own
@@ -322,6 +358,39 @@ is not run and reads n/a "not in protocol".
 ```bash
 gcl enforce reference-mcp --python python3 --profile naive --extra mcp
 gcl enforce reference-mcp --python python3 --profile strict --extra mcp --mcp-protocol 2025-06-18
+```
+
+#### Same guard on every route (`--extra routes`)
+
+A guard is usually written against one door, and the same action has others. LiteLLM #40583:
+`/v1/messages` skipped the guardrails. LiteLLM #32329: MCP resources and prompts skipped them.
+mcp-server-kubernetes CVE-2026-46519: a tool hidden at `tools/list` was still callable. `--extra
+routes` runs the same check on each way in and then compares them. An adapter declares its routes:
+
+| gateway | routes |
+|---|---|
+| `reference`, `litellm` | `/v1/chat/completions`, the same streamed, `/v1/messages` (Anthropic shape), `/v1/responses`, `/v1/completions` |
+| MCP gateways | `tools/call`, a batch, a call to a tool `tools/list` never showed, `resources/read`, `prompts/get` |
+
+Each HTTP route gets a **carry control** (a benign marker in the request must reach the model, one in
+the reply must reach the client, the stand-in allowing) and an **attack** (an injection sentence in
+the request and one in the reply, the stand-in blocking any text with a `GCL-A-` marker). The proof
+rules are the MCP surfaces': a route is "not carried" (policy n/a, never held) only when the gateway
+answers properly that it has none (HTTP 404, 405 or 501) or the text does not arrive on a 200; any
+other refusal or a missing answer is unverified; the attack is judged only on a carried route; a
+marker or its sentence at the far end is a leak, "passed unscanned" when the stand-in was never shown
+it. The MCP routes are surfaces that already are the same thing (m00, m16, m15, m09, m10): they run
+as `--extra mcp` does and the route table refers to their results (with `--extra mcp` as well they
+are not counted twice).
+
+Then the **parity** line: every route that carried must hold. One held and another violated is
+`parity broken`, naming both; fewer than two carried routes, or an unverified one, is not a
+conclusion.
+
+```bash
+gcl enforce reference --python python3 --profile naive --extra routes     # chat held, the other routes violated
+gcl enforce litellm --python /path/to/litellm-venv/bin/python --extra routes
+gcl enforce reference-mcp --python python3 --profile naive --extra routes
 ```
 
 #### Config applied (`--extra config`)

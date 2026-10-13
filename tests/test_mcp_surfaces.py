@@ -24,6 +24,7 @@ ONLY = {"none", *IDS}
 
 NAIVE_HELD = {"m00", "m04", "m13", "m15"}  # it scans the note and content[0].text of any message
 STRICT_NA = {"m15", "m16"}                 # the strict gateway refuses an unlisted tool and any batch
+NOT_YET = {"m23", "m24", "m26", "m27", "m28", "m34"}   # surfaces newer than the default protocol 2025-03-26
 
 
 def _surfaces(run):
@@ -48,6 +49,9 @@ def test_naive_gateway_guards_only_the_note_and_the_first_text(naive):
     assert set(res) == set(IDS) | {f"{i}c" for i in IDS}
     for sid in IDS:
         r = res[sid]
+        if sid in NOT_YET:
+            assert (r["observed"], r["policy"]) == ("not in protocol", "n/a"), sid
+            continue
         assert res[f"{sid}c"]["observed"] == "carried" and res[f"{sid}c"]["policy"] == "held", sid
         if sid in NAIVE_HELD:
             assert (r["observed"], r["policy"]) == ("stopped", "held"), sid
@@ -55,9 +59,9 @@ def test_naive_gateway_guards_only_the_note_and_the_first_text(naive):
             assert (r["observed"], r["policy"]) == ("passed unscanned", "violated"), sid
             assert r["evidence"]["owasp"], sid
             assert r["evidence"]["scanner_shown"] is False and r["evidence"]["marker_at_far_end"]
-    assert naive["mcp_surfaces"]["summary"] == {"surfaces": 19, "held": 4, "violated": 15, "unverified": 0, "n/a": 0,
-                                                "not_in_protocol": 0, "not_carried": 0}
-    assert naive["summary"]["policy_violated"] == 15
+    assert naive["mcp_surfaces"]["summary"] == {"surfaces": 35, "held": 4, "violated": 25, "unverified": 0, "n/a": 6,
+                                                "not_in_protocol": 6, "not_carried": 0}
+    assert naive["summary"]["policy_violated"] == 25
     assert naive["mcp_surfaces"]["protocol"] == "2025-03-26"
 
 
@@ -65,15 +69,17 @@ def test_strict_gateway_holds_every_surface_it_carries(strict):
     res = _surfaces(strict)
     for sid in IDS:
         r, c = res[sid], res[f"{sid}c"]
-        if sid in STRICT_NA:
+        if sid in NOT_YET:
+            assert (r["observed"], r["policy"]) == ("not in protocol", "n/a"), sid
+        elif sid in STRICT_NA:
             assert (c["observed"], c["policy"]) == ("not carried", "n/a"), sid
             assert (r["observed"], r["policy"]) == ("not carried", "n/a"), sid
         else:
             assert (c["observed"], c["policy"]) == ("carried", "held"), sid
             assert (r["observed"], r["policy"]) == ("stopped", "held"), sid
             assert r["evidence"]["scanner_shown"] is True and r["evidence"]["marker_at_far_end"] is False
-    assert strict["mcp_surfaces"]["summary"] == {"surfaces": 19, "held": 17, "violated": 0, "unverified": 0, "n/a": 2,
-                                                 "not_in_protocol": 0, "not_carried": 2}
+    assert strict["mcp_surfaces"]["summary"] == {"surfaces": 35, "held": 27, "violated": 0, "unverified": 0, "n/a": 8,
+                                                 "not_in_protocol": 6, "not_carried": 2}
     assert strict["summary"]["policy_violated"] == 0 and strict["summary"]["unverified"] == 0
 
 
@@ -191,10 +197,15 @@ def test_classify_to_server_surface_reads_what_the_mock_received():
 
 
 def test_catalogue_is_complete():
-    assert [f"m{i:02d}" for i in range(19)] == IDS
+    assert [f"m{i:02d}" for i in range(35)] == IDS
     assert ms.BY_ID["m16"].protocol == "batches exist only in protocol 2025-03-26"
-    assert {s.id for s in ms.CATALOGUE if s.needs_sse} == {"m08", "m11", "m12", "m13"}
-    assert {s.id for s in ms.CATALOGUE if s.direction == "to_server"} == {"m14", "m15", "m16"}
+    assert {s.id for s in ms.CATALOGUE if s.needs_sse} == {"m08", "m11", "m12", "m13", "m26", "m27", "m28", "m29",
+                                                           "m30", "m34"}
+    assert {s.id for s in ms.CATALOGUE if s.direction == "to_server"} == {"m14", "m15", "m16", "m19", "m28", "m30",
+                                                                         "m32"}
+    assert {s.id: s.since for s in ms.CATALOGUE if s.since != "2025-03-26"} == {
+        "m23": "2025-06-18", "m24": "2025-06-18", "m26": "2025-06-18", "m27": "2025-06-18", "m28": "2025-06-18",
+        "m34": "2025-11-25"}
     assert all(s.owasp for s in ms.CATALOGUE)
     assert {s.id for s in ms.CATALOGUE if s.direction == "to_client"} >= {"m17", "m18"}
     assert ms.BY_ID["m17"].owasp == ms.BY_ID["m18"].owasp == ["MCP03:2025", "LLM01:2025"]
@@ -214,7 +225,7 @@ def test_reports_show_a_separate_surface_table(naive, strict):
     assert "MCP surfaces" in page and "Scanner shown" in page
     sar = enforce_sarif(naive, "anchor.gcl")["runs"][0]
     ids = {r["ruleId"] for r in sar["results"] if r["ruleId"].startswith("GCL-E-mcp-")}
-    assert ids == {f"GCL-E-mcp-{i}" for i in IDS if i not in NAIVE_HELD}
+    assert ids == {f"GCL-E-mcp-{i}" for i in IDS if i not in NAIVE_HELD | NOT_YET}
     assert all("MCP10:2025" in r["properties"]["tags"] or r["properties"]["tags"]
                for r in sar["results"] if r["ruleId"].startswith("GCL-E-mcp-"))
     assert not [r for r in enforce_sarif(strict, "a")["runs"][0]["results"] if r["ruleId"].startswith("GCL-E-mcp-")]
@@ -256,8 +267,8 @@ def test_table_has_one_compact_surface_column(tmp_path, naive, strict):
     t = build(tmp_path)
     assert t["columns"].count("mcp surfaces") == 1
     cells = {k.split(" (")[1][:5]: v["mcp surfaces"] for k, v in t["rows"].items()}
-    assert cells["naive"].startswith("4/19 hold") and "m01:FAILS OPEN" in cells["naive"]
-    assert cells["stric"].startswith("17/19 hold") and "m15:not carried" in cells["stric"]
+    assert cells["naive"].startswith("4/35 hold") and "m01:FAILS OPEN" in cells["naive"]
+    assert cells["stric"].startswith("27/35 hold") and "m15:not carried" in cells["stric"]
     assert "mcp surfaces" in render(t)
 
 
@@ -393,6 +404,10 @@ def test_baseline_not_carried_makes_every_surface_unverified_not_n_a():
         assert len(ad.seen) == 1   # nothing else was sent: the setup is in doubt
 
 
+def _reply(note):
+    return ms._probe(ms.BY_ID["m00"], "r1", "GCL-A-" in note).reply_payload
+
+
 def _baseline_carried(stub):
     """A script whose first two sessions (m00's control and attack) arrive whole: the note is
     recorded at the mock server and the reply reaches the client."""
@@ -404,7 +419,7 @@ def _baseline_carried(stub):
         _answered(ex, 2, result={"tools": [{"name": "gcl_probe"}]})
         note = steps[1](ex)["params"]["arguments"]["note"]
         stub.mcp_received.append({"t": time.monotonic() + 100, "msg": {"params": {"arguments": {"note": note}}}})
-        _answered(ex, 3, result={"content": [{"type": "text", "text": note.replace("m00i", "m00o")}]})
+        _answered(ex, 3, result={"content": [{"type": "text", "text": _reply(note)}]})
         return ex
     return script
 
@@ -725,10 +740,15 @@ def test_m00_markers_are_separate_and_judged_on_their_own_side():
     # the input marker is judged on the server side only, the reply marker on the client side only
     pr = ms._probe(M0, "r1", True)
     echoed = _ex(pr.payload)         # the NOTE's text shows up in what the client received
+    # The reply end has its own sentence, so the note's text at the client is no reply leak.
     assert ms.classify(M0, pr.marker, pr.payload, True, echoed, [], [], reply_marker=pr.reply_marker,
                        reply_payload=pr.reply_payload)[0] == "dropped unscanned"
     got = [{"t": 1.0, "msg": {"result": pr.reply_payload}}]   # the REPLY's text shows up at the server
     assert ms.classify(M0, pr.marker, pr.payload, True, _ex("Noted."), got, [], reply_marker=pr.reply_marker,
+                       reply_payload=pr.reply_payload)[0] == "dropped unscanned"
+    # with a sentence that is not the attack's, the other side's marker alone still decides nothing
+    other = _ex(f"{pr.marker} unrelated words")
+    assert ms.classify(M0, pr.marker, pr.payload, True, other, [], [], reply_marker=pr.reply_marker,
                        reply_payload=pr.reply_payload)[0] == "dropped unscanned"
     # the control needs both ends whole
     pc, _ = _m00(attack=False)[0], None

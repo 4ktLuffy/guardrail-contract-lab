@@ -284,6 +284,20 @@ def demo(
         webbrowser.open((out / "report.html").resolve().as_uri())
 
 
+def _make_adapter(cls, integration: str, where, profile: str, spec: Path | None):
+    """One adapter instance in a fresh work directory; the vendor adapters need their --spec."""
+    import tempfile
+
+    workdir = Path(tempfile.mkdtemp(prefix="gcl-enforce-"))
+    if integration in ("litellm-vendor", "nemo-vendor"):
+        if spec is None:
+            raise typer.BadParameter(f"{integration} needs --spec FILE", param_hint="--spec")
+        import json
+
+        return cls(str(where), workdir, profile, spec=json.loads(spec.read_text()))
+    return cls(str(where), workdir, profile)
+
+
 @app.command()
 def enforce(
     integration: str = typer.Argument(..., help="litellm | nemo"),
@@ -336,8 +350,6 @@ def enforce(
                                "reports and repro bundles of different runs never mix)."),
 ):
     """Does a real guardrail integration enforce what its scanner decides?"""
-    import tempfile
-
     from .enforce.adapters import ADAPTERS
     from .enforce.contracts import run_contracts, write_bundles
     from .report.html import render_html
@@ -357,15 +369,7 @@ def enforce(
     if where is None:
         flag = "--env" if cls.runtime == "node" else "--python"
         raise typer.BadParameter(f"{integration} needs {flag}", param_hint=flag)
-    workdir = Path(tempfile.mkdtemp(prefix="gcl-enforce-"))
-    if integration in ("litellm-vendor", "nemo-vendor"):
-        if spec is None:
-            raise typer.BadParameter(f"{integration} needs --spec FILE", param_hint="--spec")
-        import json
-
-        adapter = cls(str(where), workdir, profile, spec=json.loads(spec.read_text()))
-    else:
-        adapter = cls(str(where), workdir, profile)
+    adapter = _make_adapter(cls, integration, where, profile, spec)
     try:
         lats = [float(x) for x in judge_latency.split(",") if x.strip()]
     except ValueError:
@@ -682,6 +686,90 @@ def compare(old: Path = typer.Argument(..., exists=True, dir_okay=False, help="E
     if json_out:
         json_out.write_text(json.dumps(d, ensure_ascii=False, indent=2))
     raise typer.Exit(1 if d["regressions"] else 0)
+
+
+@app.command("upgrade-check")
+def upgrade_check(
+    integration: str = typer.Argument(..., help="Any `gcl enforce` integration."),
+    before: Path = typer.Option(..., exists=True, help="The install you run today: its Python (Node "
+                                "integrations: the directory holding its node_modules)."),
+    after: Path = typer.Option(..., exists=True, help="The install you are about to move to."),
+    profile: str = typer.Option("default", help="Integration profile, used on both sides."),
+    before_profile: str | None = typer.Option(None, help="Profile for the before side only (default: --profile)."),
+    after_profile: str | None = typer.Option(None, help="Profile for the after side only (default: --profile). "
+                                             "Differing profiles simulate an upgrade that changed behaviour."),
+    timeout: float | None = typer.Option(None, help="Client deadline per scenario, seconds."),
+    out: Path | None = typer.Option(None, help="Directory for before/, after/ (full enforce reports) and "
+                                    "upgrade-check.json."),
+    scenario: list[str] = typer.Option([], help="Run only this scenario id (repeatable); controls always run."),
+    spec: Path | None = typer.Option(None, exists=True, dir_okay=False, help="For the vendor adapters."),
+    extra: str = typer.Option("", help="Opt-in blind spots, as for `gcl enforce` (stream, history, retry, "
+                              "mcp, config)."),
+    mcp_protocol: str = typer.Option("2025-03-26", "--mcp-protocol", help="With --extra mcp."),
+    force: bool = typer.Option(False, help="Write into a non-empty --out folder."),
+):
+    """Run the same enforce plan against two installs and report what the upgrade changed.
+    Exit 1 on a regression (held -> violated or unverified, or a guard no longer consulted), 2 if the
+    comparison could not be made, 0 otherwise."""
+    import json
+
+    from .enforce.adapters import ADAPTERS
+    from .enforce.contracts import EXTRAS, run_contracts
+    from .enforce.mcp_surfaces import PROTOCOL, PROTOCOLS
+    from .report.html import render_html
+    from .upgrade import render
+    from .upgrade import upgrade_check as judge
+
+    if integration not in ADAPTERS:
+        raise typer.BadParameter(f"choose from {', '.join(ADAPTERS)}", param_hint="integration")
+    cls = ADAPTERS[integration]
+    profiles = {"before": before_profile or profile, "after": after_profile or profile}
+    for side, p in profiles.items():
+        if p not in cls.documented:
+            raise typer.BadParameter(f"{integration} profiles: {', '.join(cls.documented)}",
+                                     param_hint=f"--{side}-profile")
+    if out and out.exists() and any(out.iterdir()) and not force:
+        raise typer.BadParameter(f"{out} is not empty; use a new folder or --force", param_hint="--out")
+    extras = tuple(x.strip() for x in extra.split(",") if x.strip())
+    if any(x not in EXTRAS for x in extras):
+        raise typer.BadParameter(f"choose from {', '.join(EXTRAS)}", param_hint="--extra")
+    if mcp_protocol not in PROTOCOLS:
+        raise typer.BadParameter(f"choose from {', '.join(PROTOCOLS)}", param_hint="--mcp-protocol")
+    if "mcp" in extras and not cls.mcp_transport:
+        raise typer.BadParameter(f"{integration} is not an MCP gateway", param_hint="--extra")
+    if "config" in extras and not cls.config_checks:
+        raise typer.BadParameter(f"{integration} cannot start with a given policy", param_hint="--extra")
+    docs: dict[str, dict] = {}
+    # One side after the other, never together: the stand-ins and the integrations use free ports and the
+    # timing of a scenario must not depend on what the other install is doing. Each side gets its OWN
+    # run id: a cache that outlives one install must not be able to answer the other install's
+    # requests (sentinels carry the run id). The plan, and so every scenario id, is the same.
+    for side, where in (("before", before), ("after", after)):
+        adapter = _make_adapter(cls, integration, where, profiles[side], spec)
+        _say(f"upgrade-check: {side} ({where}, profile {profiles[side]})")
+        try:
+            run = run_contracts(adapter, timeout or adapter.default_timeout_s, progress=_say,
+                                only=set(scenario) or None, extra=extras, mcp_protocol=mcp_protocol)
+        except (RuntimeError, OSError, ValueError) as e:
+            typer.echo(f"error: {side}: {e}", err=True)
+            raise typer.Exit(2) from None
+        doc = R.envelope("enforce", {"integration": integration, "profile": profiles[side]})
+        doc["enforce"] = run
+        docs[side] = doc
+        if out:
+            _write_outputs(doc, out / side, ["json", "html"], render_html)
+    try:
+        d = judge(docs["before"]["enforce"], docs["after"]["enforce"])
+    except ValueError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2) from None
+    d["options"] = {"integration": integration, "extra": list(extras), "scenario": list(scenario),
+                    "mcp_protocol": mcp_protocol if mcp_protocol != PROTOCOL or "mcp" in extras else None}
+    typer.echo(render(d))
+    if out:
+        (out / "upgrade-check.json").write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+        typer.echo(f"\nReports: {out}/")
+    raise typer.Exit(d["exit_code"])
 
 
 @findings_app.command("disclose")

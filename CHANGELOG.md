@@ -3,6 +3,13 @@
 ## Unreleased
 
 **New**
+- `gcl upgrade-check ADAPTER --before PY --after PY`: the same enforce plan against the installed and the
+  next version, one report (per scenario before -> after, regressions, improvements, unchanged); exit 1 on
+  held -> violated, held -> unverified or a guard no longer consulted at a stage, exit 2 if the comparison
+  could not be made (unusable controls on a side, guard never consulted, scenarios on one side only).
+  `--before-profile` / `--after-profile` per side. Reports which documented expectations were read for an
+  older version than the one installed (re-read due). `gcl compare` now shares its classification
+  (`compare.classify`) with it.
 - `gcl evidence-pack REPORT.json ... --out DIR` and `gcl evidence-verify DIR`: a compliance evidence pack
   from stored reports. Maps check families to EU AI Act (2024/1689 as amended by 2026/1744), NIST AI RMF
   1.0, NIST AI 600-1 and OWASP ids (reused from `gcl/standards.py`), each row with a reason and a

@@ -3,6 +3,14 @@
 ## Unreleased
 
 **New**
+- `gcl evidence-pack REPORT.json ... --out DIR` and `gcl evidence-verify DIR`: a compliance evidence pack
+  from stored reports. Maps check families to EU AI Act (2024/1689 as amended by 2026/1744), NIST AI RMF
+  1.0, NIST AI 600-1 and OWASP ids (reused from `gcl/standards.py`), each row with a reason and a
+  strength (direct / supporting). Coverage matrix with held, violated, unverified, not tested and not
+  applicable cells and counts; unverified is never promoted. Manifest with SHA-256 of every input and
+  output plus each run's receipt; optional `--sign-key` HMAC-SHA256 (integrity, not identity). Dates block,
+  a "considered, not mapped" list, ISO/IEC 42001 listed as not mapped. New modules `gcl/frameworks.py`,
+  `gcl/evidence.py`.
 - `--extra config`: is the configured policy the one that runs. A policy that fails to load must
   not allow everything; a live edit (tighten, loosen, once per edit mechanism) must take effect; a
   scoped policy must apply to its scope and only to it. Two stand-in scanners of gcl's own (A allows,

@@ -333,6 +333,34 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   stand-in answers are not reused verbatim.
 - `check` compares newer runs only when they are in the folder it is given.
 
+## Evidence pack (`gcl evidence-pack`)
+- It is technical test evidence, not a conformity assessment and not legal advice. The mapping from
+  results to provisions is gcl's reading of the text, kept as data in `gcl/frameworks.py` so it can be
+  disputed line by line. gcl tests a guardrail integration against stand-ins, not a deployed AI system;
+  most rows are therefore "supporting", and a "held" cell says the tests gcl ran held, not that a
+  provision is met.
+- ISO/IEC 42001 is not mapped: iso.org blocked every fetch and Annex A is a paid standard, so no
+  control text was read and none is cited.
+- The OWASP MCP Top 10 is in Beta; its ids (and titles) are provisional. `gcl/standards.py` keeps the
+  repository's title for MCP06:2025 ("Intent Flow Subversion"), the project page prints "Prompt
+  Injection via Contextual Payloads"; the id is the same.
+- EU AI Act text was read from the Publications Office copies of the Official Journal (EUR-Lex was not
+  reachable). The corrigendum to Regulation (EU) 2026/1744 dated 2026-09-29, the corrigenda to 2024/1689
+  and the 2026-07-27 consolidation were not read. A text search of the Omnibus found no amendment to
+  Arts 9, 12, 13, 15, 26 or 55; that is a search, not a legal review. No harmonised standard was found
+  cited in the Official Journal, so no presumption of conformity can be claimed.
+- Art 55(1)(a) (adversarial testing) applies to providers of general-purpose AI models with systemic
+  risk and to the model; the attack-corpus and MCP rows are context for such a provider at most.
+  Art 12 (the system's own logs) is not mapped: gcl's run records are records of a test.
+  MS-2.7-007 asks for red-teaming; a scripted corpus is not a human red team.
+- The pack cell is the worst state of all results in that check family across all inputs. Mixing a
+  `strict` and a `naive` run shows "violated"; the per-report table and the lists of violated and
+  unverified scenario ids keep them apart. Mix only runs you mean to compare.
+- `gcl coverage` stores recall but no pass/fail threshold, so its languages count as unverified in the
+  pack, with the numbers beside them. A `gcl check` report has no mapping and is only hashed.
+- The HMAC covers `manifest.json` (which holds the hashes); it is not a signature by a responsible
+  person as Annex IV 2(g) describes. The key is read from a file, never from the command line.
+
 ## What it cannot see
 - Keyword rules cannot tell "disable the firewall" from "don't disable the firewall".
   `gcl` measures that as hard-negative false positives; it does not fix it.

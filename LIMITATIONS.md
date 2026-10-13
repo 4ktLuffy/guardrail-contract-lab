@@ -262,13 +262,20 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   makes the surface "not carried"; a list not read to its end is "list incomplete". The
   adapter's documented name is matched exactly; only if it is not listed does the entry ending
   like it count, recorded as "matched by suffix" (several such entries: "name ambiguous").
-- The attack is judged on its marker and on its sentence. The sentence is looked for with the
-  ordinary contracts' fragment rule (any distinctive word pair of ATTACK_TEXT), so a gateway
-  that strips the marker and forwards the sentence reads "passed without marker" (violated),
-  also if only part of the sentence survived. A sentence a gateway paraphrases or encodes (no
-  fragment left) is not seen: that reads as stopped or dropped. The benign control is "carried"
+- The attack is judged on its marker and on its sentence. The sentence is looked for with one
+  rule for every surface (`_text_leaked`): a run of four consecutive words of the sentence that
+  includes its distinctive word (`attacker`, `quillfern`, ...), or one run of half of it (at least
+  five words) in order. Two common words are not enough (the ordinary contracts' pair rule read
+  invariant-gateway's own "explain to the user ..." refusal as the attack). A gateway that strips
+  the marker and forwards the sentence reads "passed without marker" (violated), also if part of
+  it survived; a gateway that cuts out the distinctive word and keeps less than half is not seen.
+  A sentence a gateway paraphrases or encodes is not seen: that reads as stopped or dropped. The benign control is "carried"
   without its marker only if the whole sentence arrived (case, punctuation and spacing aside);
-  part of it is "text altered" (unverified). For m14 only `arguments.meta` is searched, since
+  part of it (by the same rule) is "text altered" (unverified). A marker or sentence seen is
+  proof by itself; a lost result or a cut stream (e.g. m11/m12 when the gateway cuts the SSE
+  response after its first event) does not undo it. Only claims of absence need a complete,
+  settled, fully observed session. The distinctive word alone at a far end (an error that echoes a truncated copy)
+  is a piece of the sentence: "text altered" (unverified) for control and attack, never an absence. For m14 only `arguments.meta` is searched, since
   the benign note travels beside the payload there.
 - m19-m34: one field per surface (m21 description but not name, m23 description but not name or
   uri, m25 `annotations.title` only since the other hints are booleans, m27 one property
@@ -280,7 +287,7 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   and m28 judge the client's answer where the mock server received it; a gateway that rewrites
   the answer before the server is seen as "stripped"/"altered" like any other surface.
 - A sentence found at a far end must be that far end's own: m00's reply out has sentences of its
-  own, and gcl's requests carry a note no payload shares a fragment with. A gateway that quotes the
+  own, and gcl's requests carry a note that shares no match (by `_text_leaked`) with any payload. A gateway that quotes the
   text it blocks back to the client (the same surface's payload) is still counted as that
   payload arriving, as it did before the payload search: the sentence did reach the model.
 - Server-to-client traffic outside the replies is watched, not provoked: over HTTP the

@@ -34,6 +34,11 @@
 - "stopped" and "passed despite block" need a block answer whose delivery is confirmed; a missing
   delivery receipt is "unconfirmed".
 - m00 judges the note in and the reply out each on the stand-in events that carry its own marker.
+- An integration started by an adapter no longer outlives the process that started it. Adapters
+  start integrations in their own session, so a killed or interrupted run (SIGTERM, SIGHUP, an exit
+  without `stop()`) left `ref_gateway.py ... --policy naive` running. Started processes are now
+  registered and stopped on exit and on SIGTERM/SIGHUP, and the bundled reference gateways exit when
+  their parent is gone (covers SIGKILL).
 
 ## 0.4.0 — 2026-10-12
 

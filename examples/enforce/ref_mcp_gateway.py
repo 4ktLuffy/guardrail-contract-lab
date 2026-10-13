@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from ref_gateway import check  # same directory: the fail-closed verdict handling is shared
+from ref_gateway import check, exit_with_parent  # same directory: the fail-closed verdict handling is shared
 
 TOOLS: dict = {}  # session id -> tool names in the last tools/list forwarded
 
@@ -220,6 +220,7 @@ def main() -> None:
                     self.wfile.flush()
                 lines = []
 
+    exit_with_parent()
     ThreadingHTTPServer(("127.0.0.1", args.port), H).serve_forever()
 
 

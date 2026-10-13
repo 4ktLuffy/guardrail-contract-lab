@@ -47,6 +47,7 @@ import json
 import os
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -149,6 +150,20 @@ def check(args, texts: list[str], stage: str, url: str | None = None):
     return "block", texts
 
 
+def exit_with_parent() -> None:
+    """Exit when the process that started this gateway is gone (it was killed, so it never stopped
+    us). Harmless in a terminal: a gateway run by hand has a shell as parent that outlives it."""
+    parent = os.getppid()
+
+    def watch() -> None:
+        while True:
+            time.sleep(1)
+            if os.getppid() != parent:
+                os._exit(0)
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--scanner", default="", help="scanner URL (not with --policy-file)")
@@ -224,6 +239,7 @@ def main() -> None:
             reply["choices"][0]["message"]["content"] = out[0]
             self._json(200, reply)
 
+    exit_with_parent()
     ThreadingHTTPServer(("127.0.0.1", args.port), H).serve_forever()
 
 

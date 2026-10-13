@@ -321,17 +321,20 @@ the marker is how gcl finds a message, not what is protected) are violated; no a
 that did not carry its own benign marker is unverified. "Not carried" is claimed only when the
 gateway answered every request properly (a valid JSON-RPC 2.0 result or error: `error: null`, both
 members, or no `jsonrpc` is no answer) and the surface's own request was really sent. A stop rests
-on a block answer whose delivery to the gateway is confirmed. More unverified outcomes, each one
+on a block answer whose delivery to the gateway is confirmed. What was seen needs no such proof: a
+marker at the far end makes a control `carried` and an attack a leak even if the result was lost or
+the session did not settle. The sentence counts as arrived only by a run of four words round its
+distinctive word (or half of it, in order), never by common words a gateway's own refusal also says. More unverified outcomes, each one
 line:
 
 | outcome | meaning |
 |---|---|
 | `handshake failed` | initialize got an error or no result, so no probe was sent |
 | `probe not sent` | the session ended before the surface's own request was sent and answered |
-| `unsettled` | a late call may still arrive: a clean result is not proven (a leak already seen stands) |
+| `unsettled` | a late call may still arrive: a clean result is not proven (a leak or a carried control already seen stands) |
 | `unconfirmed` | the stand-in said block but the delivery of that answer is missing or failed |
 | `carried, marker stripped` | (control, held) the marker is gone but the benign sentence arrived whole: the surface is carried, so the attack runs and is judged on its sentence |
-| `text altered` | (control) part of the benign sentence arrived without its marker: neither whole nor absent |
+| `text altered` | part of a sentence arrived without its marker, or only its distinctive word (an echoed error): neither whole nor absent, so no absence is claimed (control or attack) |
 | `list incomplete` | a `tools/list`, `resources/list` or `prompts/list` was not read to its last page (`nextCursor` is followed, 20 pages at most; a repeated cursor or an error on a later page also stops it): "not listed" and "absent" are not proven |
 | `name ambiguous` | the gateway's documented name for the item is not listed and more than one entry ends like it: no guess |
 | `stream not observed` | the standalone GET stream could not be opened (other than a 4xx refusal, e.g. 405) or died, or a stdio server was still sending when the session ended: nothing is claimed absent |

@@ -80,7 +80,8 @@ def test_control_is_carried_only_when_both_ends_got_their_text():
     stripped = _ends(in_text=[ms.BENIGN_NOTE], out_text=["x " + ms.BENIGN_REPLY_TEXT.lower()])
     out = rt.judge_control(_obs(), stripped)[0]
     assert (out, ms.policy_of(out, False)) == ("carried, marker stripped", "held")
-    assert rt.judge_control(_obs(), _ends(), settled=False)[0] == "unsettled"
+    assert rt.judge_control(_obs(), _ends(), settled=False)[0] == "carried"   # a sighting stands
+    assert rt.judge_control(_obs(), _ends(in_text=[], out_text=["{}"]), settled=False)[0] == "unsettled"
 
 
 def test_not_carried_needs_a_proper_answer_and_never_reads_as_held():
@@ -94,7 +95,7 @@ def test_not_carried_needs_a_proper_answer_and_never_reads_as_held():
     for status in (400, 401, 403, 429, 500, 502):   # a refusal is not "the route is absent"
         out = rt.judge_control(_obs(status), nothing)[0]
         assert (out, ms.policy_of(out, False)) == ("unexpected status", "unverified"), status
-    part = _ends(in_text=["please record"], out_text=["{}"])
+    part = _ends(in_text=["please record this note under"], out_text=["{}"])
     assert rt.judge_control(_obs(), part)[0] == "text altered"
 
 

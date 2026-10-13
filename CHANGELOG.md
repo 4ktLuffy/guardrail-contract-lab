@@ -73,6 +73,17 @@
 - `--extra mcp`: m00's reply out has its own sentences (no shared fragment with the note in), and
   the argument of every other session is a third benign sentence, so a refusal that quotes what it
   refuses cannot read as the other end's text arriving ("passed without marker" without proof).
+- `--extra mcp`: a refusal is not the payload. The sentence is now matched by a run of four words
+  around its distinctive word (`attacker`, `quillfern`, ...) or by half of it in order, not by any two
+  common words, so a gateway's own block text ("explain to the user ...", "blocked for the user") no
+  longer reads as "passed without marker" (was a false violation on invariant-gateway). The same rule
+  serves every surface and `--extra routes`; the benign and request sentences gained a distinctive word.
+- `--extra mcp` and `routes`: the distinctive word of a sentence at a far end, without a full match (e.g. an
+  error echoing a truncated copy), is `text altered` (unverified) for control and attack, not an absence.
+- `--extra mcp` and `routes`: a sighting is proof. A marker (or payload) seen at the far end is
+  "carried" or a leak even if the result was lost, the stream cut or the session unsettled (a control
+  was "no answer" and its attack never judged; a violation on an undelivered stream became unverified).
+  Only claims of absence (not carried, stopped, dropped unscanned, held) keep the full proof rules.
 - `--extra mcp`: lists are read to their end (`nextCursor`, 20 pages at most) and names match the
   adapter's documented name exactly before a recorded suffix match. A list not read to its end is
   `list incomplete` and several equally good suffix matches are `name ambiguous`, both unverified,

@@ -9,6 +9,7 @@ itself depends on none of them.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import json
 import os
@@ -129,6 +130,66 @@ def _wait_http(url: str, proc: subprocess.Popen, deadline_s: float, log: Path) -
     raise RuntimeError(f"integration did not come up within {deadline_s:.0f}s; log tail:\n{_tail(log)}")
 
 
+# Every integration is started in its own session (start_new_session=True), so a terminal's SIGINT
+# and a plain SIGTERM/SIGHUP of gcl or the test runner do not reach it, and a run that ends without
+# Adapter.stop() (an exception in the wrong place, a kill) left it behind. Each started process is
+# registered here; leaving the interpreter, or SIGTERM/SIGHUP, stops whatever is still registered.
+# (SIGKILL cannot be caught: the bundled reference gateways watch their parent instead.)
+_LIVE: set[subprocess.Popen] = set()
+_LIVE_LOCK = threading.Lock()
+_HANDLED: dict[int, object] = {}
+
+
+def _kill_group(proc: subprocess.Popen, sig: int) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, sig)
+
+
+def _stop_all_live() -> None:
+    with _LIVE_LOCK:
+        procs = list(_LIVE)
+        _LIVE.clear()
+    for proc in procs:
+        _kill_group(proc, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=5)
+
+
+def _stop_all_live_of(proc: subprocess.Popen) -> None:
+    with _LIVE_LOCK:
+        _LIVE.discard(proc)
+    _kill_group(proc, signal.SIGKILL)
+    with contextlib.suppress(Exception):
+        proc.wait(timeout=5)
+
+
+def _on_fatal_signal(signum, frame) -> None:
+    _stop_all_live()
+    prev = _HANDLED.get(signum)
+    if callable(prev):
+        prev(signum, frame)
+        return
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+def _track(proc: subprocess.Popen) -> None:
+    with _LIVE_LOCK:
+        _LIVE.add(proc)
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            if sig not in _HANDLED:
+                with contextlib.suppress(ValueError, OSError):
+                    prev = signal.getsignal(sig)
+                    if prev is signal.SIG_IGN:
+                        continue
+                    _HANDLED[sig] = prev
+                    signal.signal(sig, _on_fatal_signal)
+
+
+atexit.register(_stop_all_live)
+
+
 class StartRefused(Exception):
     """The integration exited, or never became healthy, while starting with a policy gcl gave it
     (`--extra config`). Not an error of gcl's: with a policy it could not load, refusing to start
@@ -226,8 +287,22 @@ class Adapter:
 
     def __init__(self, python: str, workdir: Path, profile: str = "default"):
         self.python, self.workdir, self.profile = python, Path(workdir), profile
-        self.proc: subprocess.Popen | None = None
+        self.proc = None
         self.log = self.workdir / f"{self.name}-{profile}.log"
+
+    @property
+    def proc(self) -> subprocess.Popen | None:
+        """The started integration. Assigning it registers it for cleanup if gcl itself dies."""
+        return self._proc
+
+    @proc.setter
+    def proc(self, value: subprocess.Popen | None) -> None:
+        old = getattr(self, "_proc", None)
+        if old is not None and old is not value:   # replaced without stop(): never orphan it
+            _stop_all_live_of(old)
+        self._proc = value
+        if value is not None:
+            _track(value)
 
     def describe(self) -> dict:
         full = self.versions()
@@ -288,6 +363,8 @@ class Adapter:
         go with it."""
         if self.proc is None:
             return
+        with _LIVE_LOCK:
+            _LIVE.discard(self.proc)
 
         def signal_group(sig):
             with contextlib.suppress(ProcessLookupError, PermissionError):
@@ -299,7 +376,7 @@ class Adapter:
         signal_group(signal.SIGKILL)  # whatever survived, descendants included
         with contextlib.suppress(subprocess.TimeoutExpired):
             self.proc.wait(timeout=5)
-        self.proc = None
+        self._proc = None
 
 
 # --------------------------------------------------------------------------- LiteLLM

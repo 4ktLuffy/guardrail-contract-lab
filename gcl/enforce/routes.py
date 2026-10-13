@@ -47,6 +47,7 @@ from .mcp_surfaces import (
     BENIGN_REPLY_TEXT,
     PROTOCOL,
     _blocked,
+    _distinct_seen,
     _sentence_arrived,
     _strings,
     _text_leaked,
@@ -179,7 +180,8 @@ def _answer_state(obs) -> str:
 
 def judge_control(obs, ends: list, settled: bool = True) -> tuple[str, dict]:
     """(outcome, facts) of a carry control: carried / carried, marker stripped when every end got
-    its text, not carried only when the gateway said properly that it has no such route (404, 405,
+    its text (seen is proven, even if the answer was cut or the session unsettled), not carried only
+    when the gateway said properly that it has no such route (404, 405,
     501) or answered 200 and the text did not arrive; anything else is unverified."""
     state = []
     for e in ends:
@@ -188,13 +190,13 @@ def judge_control(obs, ends: list, settled: bool = True) -> tuple[str, dict]:
             state.append("intact")
         elif not e.present and _sentence_arrived(e.sentence, e.texts):
             state.append("stripped")
-        elif not e.present and _text_leaked(e.sentence, e.texts):
+        elif not e.present and (_text_leaked(e.sentence, e.texts) or _distinct_seen(e.sentence, e.texts)):
             state.append("altered")
         else:
             state.append("absent")
     facts = {"ends": dict(zip((e.name for e in ends), state, strict=True)), "status": obs.status if obs else None}
     ok = not _answer_state(obs)
-    if ok and all(s in ("intact", "stripped") for s in state):
+    if all(s in ("intact", "stripped") for s in state):   # a sighting is proof, answered or not
         out = "carried" if "stripped" not in state else "carried, marker stripped"
     elif not ok:
         out = _answer_state(obs)
@@ -206,7 +208,7 @@ def judge_control(obs, ends: list, settled: bool = True) -> tuple[str, dict]:
         out = "not carried"
     else:
         out = "unexpected status"
-    if not settled and policy_of(out, False) in ("held", "n/a"):
+    if not settled and policy_of(out, False) in ("held", "n/a") and not out.startswith("carried"):
         out = "unsettled"
     return out, facts
 
@@ -226,6 +228,8 @@ def judge_attack(obs, end: End, events: list, model_called: bool, settled: bool 
         return ("passed despite block" if shown else "passed unscanned"), facts
     if facts["payload_at_far_end"]:
         return "passed without marker", facts
+    if _distinct_seen(end.sentence, end.texts):   # a piece arrived: neither a leak proven nor an absence
+        return "text altered", facts
     if _answer_state(obs):
         return _answer_state(obs), facts
     if not settled:

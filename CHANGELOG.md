@@ -10,6 +10,14 @@
   `--before-profile` / `--after-profile` per side. Reports which documented expectations were read for an
   older version than the one installed (re-read due). `gcl compare` now shares its classification
   (`compare.classify`) with it.
+- `gcl evidence-pack REPORT.json ... --out DIR` and `gcl evidence-verify DIR`: a compliance evidence pack
+  from stored reports. Maps check families to EU AI Act (2024/1689 as amended by 2026/1744), NIST AI RMF
+  1.0, NIST AI 600-1 and OWASP ids (reused from `gcl/standards.py`), each row with a reason and a
+  strength (direct / supporting). Coverage matrix with held, violated, unverified, not tested and not
+  applicable cells and counts; unverified is never promoted. Manifest with SHA-256 of every input and
+  output plus each run's receipt; optional `--sign-key` HMAC-SHA256 (integrity, not identity). Dates block,
+  a "considered, not mapped" list, ISO/IEC 42001 listed as not mapped. New modules `gcl/frameworks.py`,
+  `gcl/evidence.py`.
 - `--extra config`: is the configured policy the one that runs. A policy that fails to load must
   not allow everything; a live edit (tighten, loosen, once per edit mechanism) must take effect; a
   scoped policy must apply to its scope and only to it. Two stand-in scanners of gcl's own (A allows,
@@ -28,6 +36,62 @@
   ASI08:2026 (Cascading Failures) only on a policy that failed to load.
 - Severity: a config result is trigger "configuration not applied" (0), not an operator mistake (-1).
 - A stop outside the policy's scope without scanner B consulted is unverified, not violated.
+
+- `--extra mcp`: sixteen more surfaces, m19-m34, each with a carry control and an attack and
+  version-gated: `completion/complete` argument (m19) and values (m20), resource templates
+  (m21 description, m22 uriTemplate), `resource_link` items (m23), tool `outputSchema` descriptions
+  (m24), tool `annotations.title` (m25), elicitation message (m26), requestedSchema (m27), the
+  client's answer (m28) and URL mode (m34), `notifications/progress` message (m29), the client's
+  `roots/list` answer (m30), `_meta` on results (m31) and requests (m32), JSON-RPC error `data` (m33).
+  The reference MCP gateway holds all of them in `strict` and leaks all of them in `naive`.
+  `mcp_client.Answers` lets a session put text into what the client answers to server requests;
+  `resources/templates/list` is paged like the other lists. On the table a surface not in the
+  negotiated protocol reads "not in protocol", not "not carried".
+
+- `--extra routes`: is the same guard on every route to the same action. An adapter declares `routes`
+  (`reference` and `litellm`: chat completions, streamed, `/v1/messages`, `/v1/responses`,
+  `/v1/completions`; MCP gateways: `tools/call`, a batch, a direct call to a hidden tool,
+  `resources/read`, `prompts/get`, which run as the surfaces m00, m16, m15, m09, m10). Each route gets a
+  carry control and an attack in the request and in the reply, with the surfaces' proof rules (not
+  carried is n/a and needs a proper 404/405/501 or a 200 without the text; never held), and a parity
+  summary: one route held and another violated is "parity broken", naming both. Results are mode
+  `route` (ids r01..), with a section in the terminal and HTML reports, SARIF rules `GCL-E-route-*`,
+  compare, findings and the table (a `routes` column).
+- The reference gateway serves `/v1/messages`, `/v1/completions` and `/v1/responses` besides chat
+  completions (anything else is 404) and answers `stream: true` as an event stream; `strict` guards every
+  route, `naive` only chat completions (the LiteLLM #40583 shape). The mock model also serves
+  `POST /responses` and `/completions`, which LiteLLM calls when it carries `/v1/messages` and
+  `/v1/completions`.
+
+**Fixed** (`--extra mcp`: results are now reported only with full proof)
+- A reply counts as an answer only if it is a valid JSON-RPC 2.0 response: `jsonrpc` "2.0", exactly
+  one of `result` / `error`, an error with an integer `code` and a string `message`. `error: null`,
+  both members or a missing `jsonrpc` no longer end as "not carried" or "dropped unscanned".
+- The surface's own request must have been sent and answered. An initialize error ends as the new
+  unverified outcome "handshake failed", a skipped step as "probe not sent", never n/a or held.
+  m17's handshake and m18's list must be answered too.
+- A session that did not settle is "unsettled" (unverified), not held or n/a; a proven leak stays
+  violated. `evidence.settled` records it.
+- "stopped" and "passed despite block" need a block answer whose delivery is confirmed; a missing
+  delivery receipt is "unconfirmed".
+- m00 judges the note in and the reply out each on the stand-in events that carry its own marker.
+- `--extra mcp`: observe everything. stdio sessions read until the server has been quiet (0.3 s,
+  at most 2 s) after the last answer instead of killing it with notifications still queued; over
+  HTTP the standalone GET stream is opened after the handshake and what arrives on it counts (a
+  405 is recorded as `evidence.standalone_stream`); a stream that cannot be watched makes an
+  absence-based result the new unverified outcome `stream not observed`.
+- `--extra mcp`: the payload counts, not only the marker. A gateway that strips `GCL-A-...` but
+  forwards the injection sentence is the new violated outcome `passed without marker` (was
+  "stopped" or "dropped unscanned"); a control whose marker is stripped but whose benign sentence
+  arrives whole is `carried, marker stripped` (held, the attack then runs; was n/a), a partly
+  arrived one is the unverified `text altered`.
+- `--extra mcp`: m00's reply out has its own sentences (no shared fragment with the note in), and
+  the argument of every other session is a third benign sentence, so a refusal that quotes what it
+  refuses cannot read as the other end's text arriving ("passed without marker" without proof).
+- `--extra mcp`: lists are read to their end (`nextCursor`, 20 pages at most) and names match the
+  adapter's documented name exactly before a recorded suffix match. A list not read to its end is
+  `list incomplete` and several equally good suffix matches are `name ambiguous`, both unverified,
+  never "not listed" or n/a. The mock MCP server can paginate (test option).
 
 ## 0.4.0 — 2026-10-12
 

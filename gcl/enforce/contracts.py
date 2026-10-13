@@ -155,7 +155,7 @@ class Result:
         return d
 
 
-EXTRAS = ("stream", "history", "retry", "mcp", "config")
+EXTRAS = ("stream", "history", "retry", "mcp", "config", "routes")
 FOLLOW_UP = "Thanks. Anything else?"
 
 
@@ -681,6 +681,11 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
 
         raise ValueError(f"--extra mcp needs an MCP gateway: {adapter.name} has no MCP transport (try "
                          + ", ".join(n for n, a in ADAPTERS.items() if a.mcp_transport) + ")")
+    if "routes" in extra and not (adapter.routes or adapter.mcp_transport):
+        from .adapters import ADAPTERS
+
+        raise ValueError(f"--extra routes needs an adapter that declares routes: {adapter.name} has none (try "
+                         + ", ".join(n for n, a in ADAPTERS.items() if a.routes or a.mcp_transport) + ")")
     if "config" in extra and not adapter.config_checks:
         from .adapters import ADAPTERS
 
@@ -699,6 +704,10 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
     mcp_error = ""
     config_results: list[dict] = []
     config_error = ""
+    route_results: list[dict] = []
+    route_block: dict = {}
+    route_error = ""
+    own_routes: list[dict] = []
     with StandInScanner(adapter.protocol) as scanner, \
             MockModel("…", judge=scanner if adapter.protocol.shared_endpoint else None,
                       host=getattr(adapter, "model_host", "127.0.0.1")) as model:
@@ -746,6 +755,15 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
                 except Exception as e:  # the ordinary results are already measured: keep them
                     mcp_error = f"{type(e).__name__}: {e}"
                     surfaces = unverified_surfaces(run_id, only, f"error: {mcp_error}")
+            if "routes" in extra:
+                from .routes import run_routes
+
+                try:
+                    route_results, route_block = run_routes(adapter, model, scanner, run_id, timeout_s, say,
+                                                            only=only, surfaces=surfaces or None,
+                                                            protocol=mcp_protocol)
+                except Exception as e:  # the ordinary results are already measured: keep them
+                    route_error = f"{type(e).__name__}: {e}"
             if "config" in extra:
                 from .config_checks import run_config, unverified_checks
 
@@ -921,11 +939,24 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         out["results"] += surfaces
         out["mcp_surfaces"] = {"summary": summarize(surfaces), "protocol": negotiated_protocol(surfaces, mcp_protocol),
                                **({"error": mcp_error} if mcp_error else {})}
+    if "routes" in extra:
+        from .routes import counted
+
+        own_routes = counted(route_results)
+        _gate_surfaces(own_routes, results)   # the same opening / closing controls gate these results
+        _label_surfaces(own_routes, adapter)
+        out["summary"] = _summary(results, surfaces + own_routes)
+        out["results"] += own_routes
+        out["routes"] = {**route_block, **({"error": route_error} if route_error else {})}
+        if route_error and not route_block:
+            out["routes"].update({
+                "summary": {"routes": 0, "held": 0, "violated": 0, "unverified": 0, "n/a": 0},
+                "parity": {"state": "unverified", "message": f"the route phase failed: {route_error}"}, "routes": []})
     if "config" in extra:
         from .config_checks import summarize as summarize_config
 
         _gate_surfaces(config_results, results)  # the same opening / closing controls gate these results
-        out["summary"] = _summary(results, surfaces + config_results)
+        out["summary"] = _summary(results, surfaces + own_routes + config_results)
         out["results"] += config_results
         out["config_checks"] = {"summary": summarize_config(config_results),
                                 **({"error": config_error} if config_error else {})}

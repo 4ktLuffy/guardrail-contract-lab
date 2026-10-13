@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 
 LEAKS = ("passed", "altered", "blocked after send", "failed after send", "tool executed", "retained",
-         "passed unscanned", "passed despite block")  # the last two: an MCP surface (--extra mcp)
+         "passed unscanned", "passed despite block", "passed without marker")  # the last three: an MCP surface
 
 
 def _runs(runs_dir: Path):
@@ -28,7 +28,7 @@ def _runs(runs_dir: Path):
 
 def _cell(r: dict) -> str:
     if r["policy"] == "n/a":
-        return "not carried"
+        return "not in protocol" if r["observed"] == "not in protocol" else "not carried"
     if r["policy"] == "unverified":
         return "unverified"
     if r["policy"] == "held":
@@ -69,6 +69,7 @@ def build(runs_dir: Path, ledger: dict | None = None, public: bool = False) -> d
         row = rows.setdefault(name, {})
         surfaces: list[str] = []
         configs: list[str] = []
+        routes: list[str] = []
         for r in run["results"]:
             s = r["scenario"]
             if s.get("control") or s.get("attack"):
@@ -84,6 +85,12 @@ def build(runs_dir: Path, ledger: dict | None = None, public: bool = False) -> d
                 else:
                     surfaces.append(s["surface"]["id"] + ("" if r["policy"] == "held" else
                                                           ":" + _cell(r).replace(" (documented)", "")))
+                continue
+            if s["mode"] == "route":
+                if s["role"]:
+                    continue
+                routes.append(s["route"]["route"] + ("" if r["policy"] == "held" else
+                                                     ":" + ("n/a" if r["policy"] == "n/a" else _cell(r))))
                 continue
             if s["mode"] == "config":
                 if s["role"]:
@@ -115,6 +122,13 @@ def build(runs_dir: Path, ledger: dict | None = None, public: bool = False) -> d
                 cols.append("mcp surfaces")
             row["mcp surfaces"] = f"{row['mcp surfaces']} / {cell}" if row.get("mcp surfaces") not in (None, cell) \
                 else cell
+        if routes:
+            par = (run.get("routes") or {}).get("parity", {}).get("state")
+            cell = (f"{sum(1 for x in routes if ':' not in x)}/{len(routes)} hold"
+                    + "".join(f"; {x}" for x in routes if ":" in x) + (f"; parity {par}" if par else ""))
+            if "routes" not in cols:
+                cols.append("routes")
+            row["routes"] = cell
         if configs:
             n_held = sum(1 for x in configs if ":" not in x and x != "withheld")
             cell = f"{n_held}/{len(configs)} hold" + "".join(f"; {x}" for x in configs if ":" in x or x == "withheld")

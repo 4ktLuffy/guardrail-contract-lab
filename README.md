@@ -45,7 +45,7 @@ On the bundled fixtures (written for the demo; see [NUMBERS.md](NUMBERS.md)):
 | **91.7% → 0.0%** | recall in English vs Arabic for the same, reasonable, English rule set |
 | **6 of 6** scanner faults | still let the tool call run, in a fail-open tool runner (0 of 6 after the fix) |
 | **18 of 38** gateway scenarios | break a gateway's own fail-closed promise, end to end (0 of 38 for the strict build) |
-| **15 of 18** MCP surfaces | reach the client or server unscanned through a naive MCP gateway (0 of 18 for the strict build; 2 more not carried) |
+| **25 of 34** MCP surfaces | reach the client or server unscanned through a naive MCP gateway (0 of 34 for the strict build; 8 more not carried or not in the protocol version) |
 
 ## Commands
 

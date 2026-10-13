@@ -20,6 +20,7 @@ import json
 import os
 import queue
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -30,6 +31,26 @@ _MAX_BODY = 1 << 20      # at most 1 MiB kept of any one HTTP response
 _MAX_TOTAL = 4 << 20     # and 4 MiB of a whole session
 _ANSWER_TEXT = "GCL client: sampling answered with a fixed benign result."
 HANDSHAKE_ID = "gcl-init"
+LIST_METHODS = ("tools/list", "resources/list", "resources/templates/list", "prompts/list")
+MAX_PAGES = 20       # pages followed of one list (the first page included)
+QUIET_S = 0.3        # how long a session must be silent before it is called quiet
+DRAIN_CAP_S = 2.0    # and the longest it is watched for late traffic after its last answer
+
+
+def valid_response(m) -> bool:
+    """`m` is a JSON-RPC 2.0 response object: "jsonrpc" "2.0", an id member, no method, and
+    exactly one of "result" / "error", the error an object with an integer code and a string
+    message. `{"id": 3, "error": null}`, a reply with both members or with no "jsonrpc", and a
+    non-JSON body are not answers: the one definition every "was it answered" decision uses."""
+    if not isinstance(m, dict) or "_raw" in m or m.get("method") is not None:
+        return False
+    if m.get("jsonrpc") != "2.0" or "id" not in m or ("result" in m) == ("error" in m):
+        return False
+    if "error" in m:
+        err = m["error"]
+        return (isinstance(err, dict) and isinstance(err.get("code"), int) and not isinstance(err.get("code"), bool)
+                and isinstance(err.get("message"), str))
+    return True
 
 
 @dataclass
@@ -51,6 +72,18 @@ class Exchange:
     # a refusal: nothing came back, and the session ended, rather than hung or broke.
     http_refused: dict = field(default_factory=dict)
     http_refusal: bool = False
+    # The server -> client channel that is not the reply to a request. HTTP: the standalone
+    # GET stream of streamable HTTP, opened after the handshake. stream is "" (not tried: stdio),
+    # "open" (200 event stream; what arrived is in the log with via "sse-get"), "refused" (a 4xx,
+    # 405 being the spec's "this server offers none") or "failed" (anything else: a connection
+    # error, a 5xx, a 200 that is no event stream, a stream that died). stdio: late lines after the
+    # last answer are drained until the session is quiet. `unobserved` says why some traffic could
+    # not be watched (a failed stream, a session still talking at the cap): such a session proves
+    # no absence, only what it did see.
+    stream: str = ""
+    stream_status: int | None = None
+    stream_note: str = ""
+    unobserved: str = ""
 
     def add(self, direction: str, msg, via: str, status: int | None = None) -> None:
         self.log.append({"dir": direction, "msg": msg, "via": via, "status": status, "t": time.monotonic()})
@@ -62,23 +95,29 @@ class Exchange:
         return [e["msg"] for e in self.log if e["dir"] == "sent"]
 
     def response_to(self, rid) -> dict | None:
-        """The received response (result or error) for request id `rid`, if any."""
+        """The received JSON-RPC response (valid_response: result or error) for request id
+        `rid`, if any. HTTP status is not looked at here; `proper` does that."""
         for m in self.received():
-            if isinstance(m, dict) and m.get("id") == rid and m.get("method") is None and "_raw" not in m:
+            if valid_response(m) and m.get("id") == rid:
                 return m
         return None
 
+    def sent_ids(self) -> set:
+        """Ids of the requests gcl sent, inside batches too (not notifications, not gcl's own
+        answers to server requests): what a session can claim to have asked."""
+        return {i for m in self.sent() for i in _request_ids(m)}
+
     def proper(self, rid) -> bool:
-        """Request `rid` got a proper answer: a JSON-RPC result or error object for it, with
-        HTTP status below 400 or an error object (a 5xx page, or a result under 4xx/5xx, is not).
+        """Request `rid` got a proper answer: a valid JSON-RPC response (valid_response) for it,
+        with HTTP status below 400 or an error object (a 5xx page, or a result under 4xx/5xx,
+        is not).
         A batch refused as a whole, with one error object whose id is null, answers every
         request in it."""
         if rid in self.refused:
             return True
         for e in self.log:
             m = e["msg"]
-            if (e["dir"] == "recv" and isinstance(m, dict) and "_raw" not in m and m.get("id") == rid
-                    and m.get("method") is None and ("result" in m or "error" in m)
+            if (e["dir"] == "recv" and valid_response(m) and m.get("id") == rid
                     and (e["status"] is None or e["status"] < 400 or "error" in m)):
                 return True
         return False
@@ -104,9 +143,18 @@ class Exchange:
         return json.dumps(self.received(), ensure_ascii=False)
 
 
-def auto_answer(req: dict) -> dict:
+class Answers(dict):
+    """A step that sends nothing: the results the client gives to server requests of this
+    session, by method, in place of the fixed benign ones (`{"roots/list": {...}}`). It rides in
+    the steps list so adapters pass it through untouched; it is how a surface puts text into
+    what the client says back (roots names, elicitation content)."""
+
+
+def auto_answer(req: dict, answers: dict | None = None) -> dict:
     """The client's reply to a server request."""
     method, rid = req.get("method"), req.get("id")
+    if answers and method in answers:
+        return {"jsonrpc": "2.0", "id": rid, "result": answers[method]}
     if method == "sampling/createMessage":
         result = {"role": "assistant", "content": {"type": "text", "text": _ANSWER_TEXT},
                   "model": "gcl-client", "stopReason": "endTurn"}
@@ -143,14 +191,37 @@ def _request_ids(step) -> list:
     return [m["id"] for m in msgs if isinstance(m, dict) and m.get("method") is not None and m.get("id") is not None]
 
 
+def next_page(ex: Exchange, req: dict, prev_id, k: int, seen: set) -> dict | None:
+    """The request for page `k` of the list that list request `req` started, once the answer to
+    `prev_id` names a nextCursor gcl has not used yet; None ends the list. The page id is
+    "<first id>.<k>", so the pages of one list can be told apart from the caller's own ids."""
+    r = ex.response_to(prev_id)
+    res = r.get("result") if r and "result" in r and ex.proper(prev_id) else None
+    cur = res.get("nextCursor") if isinstance(res, dict) else None
+    if not isinstance(cur, str) or not cur or cur in seen:
+        return None
+    seen.add(cur)
+    return {"jsonrpc": "2.0", "id": f"{req['id']}.{k}", "method": req["method"],
+            "params": {**(req.get("params") or {}), "cursor": cur}}
+
+
+def list_requests(step) -> list[dict]:
+    msgs = step if isinstance(step, list) else [step]
+    return [m for m in msgs if isinstance(m, dict) and m.get("method") in LIST_METHODS and m.get("id") is not None]
+
+
 class _Http:
     """One MCP streamable-HTTP session: carries Mcp-Session-Id, reads JSON or SSE replies."""
 
-    def __init__(self, url: str, headers: dict | None, deadline: float, ex: Exchange):
+    def __init__(self, url: str, headers: dict | None, deadline: float, ex: Exchange, answers: dict | None = None):
         self.url, self.base_headers, self.deadline, self.ex = url, dict(headers or {}), deadline, ex
+        self.answers = answers
         self.parts = urlsplit(url)
         self.total = 0
         self.protocol: str | None = None
+        self._stream_conn = None
+        self._stream_thread: threading.Thread | None = None
+        self._closing = False
 
     def _conn(self) -> http.client.HTTPConnection:
         left = self.deadline - time.monotonic()
@@ -168,6 +239,88 @@ class _Http:
             h["Mcp-Protocol-Version"] = self.protocol
         return h
 
+    def _get_headers(self) -> dict:
+        h = {"Accept": "text/event-stream"}
+        h.update(self.base_headers)
+        if self.ex.session_id:
+            h["Mcp-Session-Id"] = self.ex.session_id
+        if self.protocol:
+            h["Mcp-Protocol-Version"] = self.protocol
+        return h
+
+    def open_stream(self) -> None:
+        """Open the standalone GET stream (streamable HTTP: the server may send requests and
+        notifications on it at any time, outside any reply) and read it on a thread until
+        close_stream. A 4xx (405 is the spec's "none offered") is recorded as refused; anything
+        that is neither that nor an event stream is a failure to observe."""
+        ex = self.ex
+        try:
+            left = self.deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("deadline reached")
+            cls = http.client.HTTPSConnection if self.parts.scheme == "https" else http.client.HTTPConnection
+            conn = cls(self.parts.hostname, self.parts.port, timeout=min(left, 5.0))
+            path = (self.parts.path or "/") + (f"?{self.parts.query}" if self.parts.query else "")
+            conn.request("GET", path, headers=self._get_headers())
+            resp = conn.getresponse()
+        except (OSError, http.client.HTTPException) as e:
+            ex.stream, ex.stream_note = "failed", f"{type(e).__name__}: {e}"
+            ex.unobserved = f"the standalone GET stream could not be opened ({ex.stream_note})"
+            return
+        ex.stream_status = resp.status
+        if 400 <= resp.status < 500:
+            ex.stream, ex.stream_note = "refused", f"HTTP {resp.status}"
+            with contextlib.suppress(OSError, http.client.HTTPException):
+                resp.read(1024)
+            conn.close()
+            return
+        if resp.status != 200 or "text/event-stream" not in (resp.getheader("Content-Type") or ""):
+            ex.stream, ex.stream_note = "failed", f"HTTP {resp.status} {resp.getheader('Content-Type') or ''}".strip()
+            ex.unobserved = f"the standalone GET stream answered HTTP {resp.status} and is no event stream"
+            conn.close()
+            return
+        ex.stream = "open"
+        self._stream_conn = conn
+        self._stream_thread = threading.Thread(target=self._read_stream, args=(conn, resp), daemon=True)
+        self._stream_thread.start()
+
+    def _read_stream(self, conn, resp) -> None:
+        try:
+            self._sse(conn, resp, True, "sse-get")
+        except (OSError, TimeoutError, http.client.HTTPException, ValueError) as e:
+            if not self._closing:   # a stream that dies is a failure to observe, not a quiet one
+                self.ex.stream, self.ex.stream_note = "failed", f"{type(e).__name__}: {e}"
+                self.ex.unobserved = f"the standalone GET stream died ({self.ex.stream_note})"
+
+    def close_stream(self) -> None:
+        """Let the standalone stream go quiet (bounded by QUIET_S / DRAIN_CAP_S and the
+        deadline), then close it. A stream still delivering at the cap is not fully observed."""
+        t, conn = self._stream_thread, self._stream_conn
+        if t is None or conn is None:
+            return
+        self._stream_thread = None   # once: the end of a session closes it a second time
+        try:
+            end = min(self.deadline, time.monotonic() + DRAIN_CAP_S)
+            seen, quiet_from = len(self.ex.log), time.monotonic()
+            while t.is_alive():
+                now = time.monotonic()
+                if len(self.ex.log) != seen:
+                    seen, quiet_from = len(self.ex.log), now
+                if now - quiet_from >= QUIET_S:
+                    break
+                if now >= end:
+                    self.ex.unobserved = (self.ex.unobserved
+                                         or "the standalone GET stream was still delivering at the cap")
+                    break
+                time.sleep(0.02)
+        finally:
+            self._closing = True
+            with contextlib.suppress(OSError):
+                if conn.sock is not None:
+                    conn.sock.shutdown(socket.SHUT_RDWR)
+            t.join(2.0)
+            conn.close()
+
     def post(self, msg, record: bool = True, answer: bool = True) -> None:
         """POST one message or batch; record the reply, answering server requests as they come."""
         if record:
@@ -182,21 +335,21 @@ class _Http:
             if sid and not self.ex.session_id:
                 self.ex.session_id = sid
             if "text/event-stream" in (resp.getheader("Content-Type") or ""):
-                self._sse(conn, resp, answer)
+                self._sse(conn, resp, answer, "sse")
             else:
                 body = self._read(resp)
                 self._record_body(body, resp.status)
                 if 400 <= resp.status < 500:
                     answered = {e["msg"].get("id") for e in self.ex.log[mark:]
-                                if e["dir"] == "recv" and isinstance(e["msg"], dict) and "_raw" not in e["msg"]}
+                                if e["dir"] == "recv" and valid_response(e["msg"])}
                     for rid in _request_ids(msg):
                         if rid not in answered:
                             self.ex.http_refused[rid] = resp.status
         finally:
             conn.close()
         if isinstance(msg, list) and any(
-                e["dir"] == "recv" and isinstance(e["msg"], dict) and "error" in e["msg"] and e["msg"].get("id") is None
-                and e["msg"].get("method") is None for e in self.ex.log[mark:]):
+                e["dir"] == "recv" and valid_response(e["msg"]) and "error" in e["msg"] and e["msg"].get("id") is None
+                for e in self.ex.log[mark:]):
             self.ex.refused.update(_request_ids(msg))
 
     def _room(self) -> int:
@@ -227,7 +380,7 @@ class _Http:
         for m in obj if isinstance(obj, list) else [obj]:
             self.ex.add("recv", m, "json", status)
 
-    def _sse(self, conn, resp, answer: bool) -> None:
+    def _sse(self, conn, resp, answer: bool, via: str = "sse") -> None:
         data: list[str] = []
         size = 0
         while True:
@@ -242,7 +395,8 @@ class _Http:
                 raise
             except OSError as e:
                 # A stream that dies mid-way is a failed session, not a short answer.
-                self.ex.error = self.ex.error or f"transport failure: {type(e).__name__}: {e}"
+                if via == "sse":
+                    self.ex.error = self.ex.error or f"transport failure: {type(e).__name__}: {e}"
                 raise
             if not raw:
                 break
@@ -252,30 +406,34 @@ class _Http:
                 self.ex.truncated = True
                 self.ex.error = self.ex.error or "event stream truncated at the byte cap"
                 break
+            if self._closing:
+                break
             line = raw.decode("utf-8", "replace").rstrip("\r\n")
             if line.startswith("data:"):
                 data.append(line[5:].removeprefix(" "))
             elif not line and data:
-                self._event("\n".join(data), resp.status, conn, answer)
+                self._event("\n".join(data), resp.status, conn, answer, via)
                 data = []
         if data:
-            self._event("\n".join(data), resp.status, conn, answer)
+            self._event("\n".join(data), resp.status, conn, answer, via)
 
-    def _event(self, text: str, status: int, conn, answer: bool) -> None:
+    def _event(self, text: str, status: int, conn, answer: bool, via: str = "sse") -> None:
+        if via == "sse-get" and not text.strip():
+            return   # the empty priming event a server may open the stream with: no message
         try:
             msg = json.loads(text)
         except ValueError:
-            self.ex.add("recv", {"_raw": text}, "sse", status)
+            self.ex.add("recv", {"_raw": text}, via, status)
             return
         for m in msg if isinstance(msg, list) else [msg]:
-            self.ex.add("recv", m, "sse", status)
+            self.ex.add("recv", m, via, status)
             if answer and is_server_request(m):
                 # The server holds its stream open for this answer, so it goes out on a
                 # second connection while this one keeps reading.
                 self.answer(m)
 
     def answer(self, req: dict) -> None:
-        reply = auto_answer(req)
+        reply = auto_answer(req, self.answers)
         self.ex.add("sent", reply, "json")
         c = self._conn()
         try:
@@ -295,16 +453,19 @@ def http_session(url: str, headers: dict | None, steps: list, timeout_s: float =
     returns in Mcp-Session-Id is carried on every later request."""
     ex = Exchange()
     deadline = time.monotonic() + timeout_s
-    cli = _Http(url, headers, deadline, ex)
+    answers = next((dict(st) for st in steps if isinstance(st, Answers)), None)
+    steps = [st for st in steps if not isinstance(st, Answers)]
+    cli = _Http(url, headers, deadline, ex, answers)
     try:
         cli.post(_initialize(protocol))
         init = ex.response_to(HANDSHAKE_ID)
-        if not init or "result" not in init:
+        if not init or "result" not in init or not ex.proper(HANDSHAKE_ID):
             ex.conclude([HANDSHAKE_ID])  # a refused handshake is an ending, not a hang
             ex.error = ex.error or "initialize got no result"
             return ex
         cli.protocol = (init["result"] or {}).get("protocolVersion") or protocol
         cli.post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        cli.open_stream()
         expected: list = [HANDSHAKE_ID]
         for step in steps:
             msg = _resolve(step, ex)
@@ -312,9 +473,21 @@ def http_session(url: str, headers: dict | None, steps: list, timeout_s: float =
                 continue
             expected += _request_ids(msg)
             cli.post(msg)
+            for req in list_requests(msg):   # follow nextCursor, bounded: a list is not its first page
+                prev, seen = req["id"], set()
+                for k in range(1, MAX_PAGES):
+                    page = next_page(ex, req, prev, k, seen)
+                    if page is None:
+                        break
+                    expected.append(page["id"])
+                    cli.post(page)
+                    prev = page["id"]
+        cli.close_stream()
         ex.conclude(expected)
     except (OSError, http.client.HTTPException) as e:
         ex.error = ex.error or f"{type(e).__name__}: {e}"
+    finally:
+        cli.close_stream()
     return ex
 
 
@@ -345,6 +518,8 @@ def _kill_group(proc: subprocess.Popen) -> None:
 def stdio_session(argv: list[str], env: dict | None, steps: list, timeout_s: float = 30.0,
                   protocol: str = "2025-03-26", cwd: str | None = None) -> Exchange:
     """The same session over a child process speaking newline-delimited JSON-RPC."""
+    answers = next((dict(st) for st in steps if isinstance(st, Answers)), None)
+    steps = [st for st in steps if not isinstance(st, Answers)]
     ex = Exchange()
     deadline = time.monotonic() + timeout_s
     try:
@@ -373,6 +548,24 @@ def stdio_session(argv: list[str], env: dict | None, steps: list, timeout_s: flo
         proc.stdin.write((json.dumps(msg, ensure_ascii=False) + "\n").encode())
         proc.stdin.flush()
 
+    def take(line: str, pending: set | None) -> None:
+        """Record one line; answer server requests; tick off the ids it answers."""
+        if line == "\0cap":
+            raise OSError(f"output truncated at {_MAX_TOTAL} bytes")
+        if not line:
+            return
+        try:
+            m = json.loads(line)
+        except ValueError:
+            ex.add("recv", {"_raw": line}, "stdio")
+            return
+        for one in m if isinstance(m, list) else [m]:
+            ex.add("recv", one, "stdio")
+            if is_server_request(one):
+                send(auto_answer(one, answers))
+            elif pending is not None and isinstance(one, dict) and one.get("method") is None:
+                pending.discard(json.dumps(one.get("id")))
+
     def collect(wait_ids: list) -> None:
         """Read lines until every id in wait_ids has a response; answer server requests."""
         pending = set(map(json.dumps, wait_ids))
@@ -386,27 +579,31 @@ def stdio_session(argv: list[str], env: dict | None, steps: list, timeout_s: flo
                 raise TimeoutError("deadline reached") from None
             if line is None:
                 raise EOFError("server closed stdout")
-            if line == "\0cap":
-                raise OSError(f"output truncated at {_MAX_TOTAL} bytes")
-            if not line:
-                continue
+            take(line, pending)
+
+    def drain() -> None:
+        """After the last answer, keep reading until the server has been silent for QUIET_S
+        (bounded by DRAIN_CAP_S and the deadline): a notification or server request queued
+        behind the result is part of what the session received. A server still talking at the
+        cap leaves the session not fully observed."""
+        end = min(deadline, time.monotonic() + DRAIN_CAP_S)
+        while True:
             try:
-                m = json.loads(line)
-            except ValueError:
-                ex.add("recv", {"_raw": line}, "stdio")
-                continue
-            for one in m if isinstance(m, list) else [m]:
-                ex.add("recv", one, "stdio")
-                if is_server_request(one):
-                    send(auto_answer(one))
-                elif isinstance(one, dict) and one.get("method") is None:
-                    pending.discard(json.dumps(one.get("id")))
+                line = lines.get(timeout=QUIET_S)
+            except queue.Empty:
+                return
+            if line is None:
+                return
+            take(line, None)
+            if time.monotonic() >= end:
+                ex.unobserved = ex.unobserved or "the server was still sending at the end of the drain"
+                return
 
     try:
         send(_initialize(protocol))
         collect([HANDSHAKE_ID])
         init = ex.response_to(HANDSHAKE_ID)
-        if not init or "result" not in init:
+        if not init or "result" not in init or not ex.proper(HANDSHAKE_ID):
             ex.conclude([HANDSHAKE_ID])
             ex.error = ex.error or "initialize got no result"
             return ex
@@ -419,6 +616,18 @@ def stdio_session(argv: list[str], env: dict | None, steps: list, timeout_s: flo
             expected += _request_ids(msg)
             send(msg)
             collect(_request_ids(msg))
+            for req in list_requests(msg):
+                prev, seen = req["id"], set()
+                for k in range(1, MAX_PAGES):
+                    page = next_page(ex, req, prev, k, seen)
+                    if page is None:
+                        break
+                    expected.append(page["id"])
+                    send(page)
+                    collect([page["id"]])
+                    prev = page["id"]
+        with contextlib.suppress(BrokenPipeError):   # answering a late request of a server that has gone
+            drain()
         ex.conclude(expected)
     except (OSError, EOFError, TimeoutError) as e:
         ex.error = f"{type(e).__name__}: {e}"

@@ -269,9 +269,38 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   `tools/list`, `prompts/list` and `resources/list` (the entry ending in `gcl_probe` /
   `gcl-probe`, `gcl_prompt`, `note`), with the adapter's `mcp_name` as the fallback when the
   list is not a proper result. m15 uses `mcp_name` for its unlisted tool by design. A
-  proper list that does not show the item makes the surface "not carried".
-- The attack is judged on its marker. A gateway that forwards the sentence without the marker
-  is counted as "stopped" when the stand-in was shown it, and "dropped unscanned" otherwise.
+  proper list (every page, `nextCursor` followed up to 20 pages) that does not show the item
+  makes the surface "not carried"; a list not read to its end is "list incomplete". The
+  adapter's documented name is matched exactly; only if it is not listed does the entry ending
+  like it count, recorded as "matched by suffix" (several such entries: "name ambiguous").
+- The attack is judged on its marker and on its sentence. The sentence is looked for with the
+  ordinary contracts' fragment rule (any distinctive word pair of ATTACK_TEXT), so a gateway
+  that strips the marker and forwards the sentence reads "passed without marker" (violated),
+  also if only part of the sentence survived. A sentence a gateway paraphrases or encodes (no
+  fragment left) is not seen: that reads as stopped or dropped. The benign control is "carried"
+  without its marker only if the whole sentence arrived (case, punctuation and spacing aside);
+  part of it is "text altered" (unverified). For m14 only `arguments.meta` is searched, since
+  the benign note travels beside the payload there.
+- m19-m34: one field per surface (m21 description but not name, m23 description but not name or
+  uri, m25 `annotations.title` only since the other hints are booleans, m27 one property
+  description). A gateway that scans only some fields of a place reads as held for the field
+  tested. Each field and the protocol version it first
+  appeared in (`since`) were checked against `schema/<version>/schema.ts` of github.com/modelcontextprotocol/modelcontextprotocol (versions 2025-03-26, 2025-06-18, 2025-11-25). Task-augmented
+  and other 2025-11-25 additions beyond URL-mode elicitation are not covered. m29 is sent only
+  to a request that carries a progress token, as the specification requires of a server. m30
+  and m28 judge the client's answer where the mock server received it; a gateway that rewrites
+  the answer before the server is seen as "stripped"/"altered" like any other surface.
+- A sentence found at a far end must be that far end's own: m00's reply out has sentences of its
+  own, and gcl's requests carry a note no payload shares a fragment with. A gateway that quotes the
+  text it blocks back to the client (the same surface's payload) is still counted as that
+  payload arriving, as it did before the payload search: the sentence did reach the model.
+- Server-to-client traffic outside the replies is watched, not provoked: over HTTP the
+  standalone GET stream is opened once after the handshake and read until it has been quiet for
+  0.3 s (at most 2 s); a 4xx answer (405 is the spec's "none") is recorded as "refused". Traffic
+  a server sends later than that, or only on a stream opened by another request, is not seen. A
+  stdio server is watched the same way after its last answer. If the stream cannot be opened or
+  dies, or a server is still sending at the cap, absence-based outcomes become "stream not
+  observed".
 - The stdio adapter (`lasso-mcp-gateway`) starts a gateway per session.
 - `contextforge` caches a backend's tools, prompts and resources at registration; the adapter
   re-registers the mock server when the surface or payload changes (provisioning, not a
@@ -283,6 +312,27 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
 - Real-gateway surface runs are opt-in (`GCL_INTEG_INVARIANT_PYTHON`, `GCL_INTEG_LASSO_PYTHON`)
   and are not in CI.
 
+## Route parity (`--extra routes`)
+- A route is one way to reach the same action, as declared by the adapter; routes it does not declare
+  are not tried (embeddings, files, audio, other vendors' paths). Whether a guard *should* apply to a
+  route is the adapter's declaration, not gcl's opinion.
+- The request is one user message and the reply one assistant message. Tool calls, images, multi-turn
+  history and system prompts on the other routes are not sent: a gateway that guards only some content
+  types of a route reads as held.
+- "Not carried" needs HTTP 404, 405 or 501, or a 200 in which the text did not arrive. A gateway that
+  answers a missing route with another status (400, 403, 500) is unverified, not n/a. A route that
+  fails because gcl's mock model lacks the upstream shape would read the same: the mock serves chat
+  completions, `/responses` and `/completions`, and a gateway that translates to anything else gets
+  404 from the mock (an unexpected upstream path is recorded in `unexpected`). LiteLLM answers
+  `429` ("all deployments in cooldown") on later routes after such a failure, which is unverified.
+- Streaming is judged on what the client received: the marker or the sentence anywhere in the event
+  stream is a leak, even if an error event follows (LiteLLM 1.105.0 streams the first chunks of a blocked
+  reply before the error).
+- The MCP routes are the surfaces m00, m16, m15, m09 and m10: their limits are the surfaces'. The route
+  table copies their outcome; it adds no second judgement.
+- Parity compares the routes of one adapter against each other. Two routes that are both unguarded are
+  "equal" (and violated): parity says nothing about whether the guard exists.
+
 ## Findings ledger
 - Severity is a fixed, published rule over a few fields, not a CVSS score. "Documented"
   comes from gcl's own map of each integration's docs (quoted in every report); "default
@@ -293,6 +343,34 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   what a reproduction file actually did — it checks the declaration and that gcl's own
   stand-in answers are not reused verbatim.
 - `check` compares newer runs only when they are in the folder it is given.
+
+## Evidence pack (`gcl evidence-pack`)
+- It is technical test evidence, not a conformity assessment and not legal advice. The mapping from
+  results to provisions is gcl's reading of the text, kept as data in `gcl/frameworks.py` so it can be
+  disputed line by line. gcl tests a guardrail integration against stand-ins, not a deployed AI system;
+  most rows are therefore "supporting", and a "held" cell says the tests gcl ran held, not that a
+  provision is met.
+- ISO/IEC 42001 is not mapped: iso.org blocked every fetch and Annex A is a paid standard, so no
+  control text was read and none is cited.
+- The OWASP MCP Top 10 is in Beta; its ids (and titles) are provisional. `gcl/standards.py` keeps the
+  repository's title for MCP06:2025 ("Intent Flow Subversion"), the project page prints "Prompt
+  Injection via Contextual Payloads"; the id is the same.
+- EU AI Act text was read from the Publications Office copies of the Official Journal (EUR-Lex was not
+  reachable). The corrigendum to Regulation (EU) 2026/1744 dated 2026-09-29, the corrigenda to 2024/1689
+  and the 2026-07-27 consolidation were not read. A text search of the Omnibus found no amendment to
+  Arts 9, 12, 13, 15, 26 or 55; that is a search, not a legal review. No harmonised standard was found
+  cited in the Official Journal, so no presumption of conformity can be claimed.
+- Art 55(1)(a) (adversarial testing) applies to providers of general-purpose AI models with systemic
+  risk and to the model; the attack-corpus and MCP rows are context for such a provider at most.
+  Art 12 (the system's own logs) is not mapped: gcl's run records are records of a test.
+  MS-2.7-007 asks for red-teaming; a scripted corpus is not a human red team.
+- The pack cell is the worst state of all results in that check family across all inputs. Mixing a
+  `strict` and a `naive` run shows "violated"; the per-report table and the lists of violated and
+  unverified scenario ids keep them apart. Mix only runs you mean to compare.
+- `gcl coverage` stores recall but no pass/fail threshold, so its languages count as unverified in the
+  pack, with the numbers beside them. A `gcl check` report has no mapping and is only hashed.
+- The HMAC covers `manifest.json` (which holds the hashes); it is not a signature by a responsible
+  person as Annex IV 2(g) describes. The key is read from a file, never from the command line.
 
 ## What it cannot see
 - Keyword rules cannot tell "disable the firewall" from "don't disable the firewall".

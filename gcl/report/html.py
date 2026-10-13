@@ -272,7 +272,7 @@ def _enforce(sec: dict) -> str:
            "deviates": "error", "unspecified": ""}
     for r in sec["results"]:
         s, ev = r["scenario"], r["evidence"]
-        if s["mode"] in ("surface", "config"):
+        if s["mode"] in ("surface", "config", "route"):
             continue  # their own table below
         notes = "".join(f"<br><small>{e(n)}</small>" for n in r["notes"])
         evidence = (f"client {e(ev['client_status'])} · model requests {e(ev['model_requests'])} · "
@@ -286,6 +286,7 @@ def _enforce(sec: dict) -> str:
                    f"<td><small>{evidence}</small>{notes}</td></tr>")
     out.append("</table></div>")
     out.append(_surfaces(sec))
+    out.append(_routes(sec))
     out.append(_config(sec))
     return "\n".join(out)
 
@@ -317,6 +318,30 @@ def _config(sec: dict) -> str:
     out.append("</table></div>")
     for src in sec["integration"].get("config_documented_source") or []:
         out.append(_doc_source(src))
+    return "".join(out)
+
+
+def _routes(sec: dict) -> str:
+    """Route parity (`--extra routes`): one row per route and the parity verdict."""
+    rt = sec.get("routes")
+    if not rt:
+        return ""
+    sm, par = rt["summary"], rt["parity"]
+    cls = {"held": "okc", "violated": "error", "unverified": "warning", "n/a": ""}
+    pcls = "error" if par["state"] == "broken" else "okc" if par["state"] == "equal" else "warning"
+    out = [(f"<h3>Route parity</h3><p class='sub'>{sm['held']} held, {sm['violated']} violated, "
+            f"{sm['unverified']} unverified, {sm['n/a']} not carried, of {sm['routes']} routes. Each route is run "
+            "with a benign carry control, then an attack in the request and one in the reply.</p>"),
+           (f"<p class='lv {pcls}'><b>Parity {e(par['state'])}:</b> {e(par['message'])}</p>"),
+           ("<div class='scroll'><table><tr><th>Id</th><th>Route</th><th>Kind</th><th>Carried</th>"
+            "<th>Outcome</th><th>Policy</th></tr>")]
+    for r in rt["routes"]:
+        carried = {True: "yes", False: "no", None: "?"}[r["carried"]]
+        via = f" <small>(surface {e(r['surface'])})</small>" if r["surface"] else ""
+        out.append(f"<tr><td><code>{e(r['id'])}</code></td><td>{e(r['name'])}{via}</td><td>{e(r['kind'])}</td>"
+                   f"<td>{carried}</td><td><b>{e(r['observed'])}</b></td>"
+                   f'<td class="lv {cls[r["policy"]]}">{e(r["policy"])}</td></tr>')
+    out.append("</table></div>")
     return "".join(out)
 
 

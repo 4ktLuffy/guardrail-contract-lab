@@ -36,6 +36,17 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   deadline); if no single input hangs it alone, the finding says that instead.
 
 ## Coverage numbers
+- The hard-negative set (`--hard-negatives`, 12 per language, 12 languages) was written for
+  gcl by an AI assistant: original text, not native-speaker reviewed, not drawn from any
+  dataset. A native reader may find an unnatural phrase, or a text that is not clearly
+  benign. Twelve texts per language give wide intervals (0/12 is consistent with a true rate
+  up to 24%), so a pass is weak evidence and a gap between two languages is only meaningful
+  when the starred intervals do not overlap. The base themes are translations of one English
+  set, so they measure the same risky-looking patterns, not the ones that are common in each
+  language's real traffic. The bundled attacks do not include pt, it, ja or hi: those get a
+  false-positive rate but no recall. Merging the hard negatives into the 288 bundled cases
+  gives English 24 benign texts and most others 24 or 12, so gaps in false positives mix
+  unequal sets; run `--cases gcl/data/hardneg.multilingual.jsonl` alone for a like-for-like view.
 - The bundled 288 cases are machine-written (`native_reviewed: false`). Amharic and
   Arabizi wording is the least certain. Use your own reviewed cases for decisions.
 - 12 attacks per language: a 0/12 has a 95% interval up to 24%. The report prints

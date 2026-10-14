@@ -577,6 +577,42 @@ report lists, per package, whether the version you are moving to is past it. gcl
 integration's effective defaults, so a changed default (a new `default_on`, a flipped fail-open
 setting) shows up only as a changed scenario result, never as a line of its own.
 
+#### Trustworthy adapters (`--attest`, `gcl replay`)
+
+```bash
+gcl enforce reference --python "$PY" --profile strict --attest --out out/ref   # mutation control + receipt
+gcl replay out/ref/repro/reference-naive-i04-input-error                       # or a .zip of that folder
+```
+
+The ordinary controls prove an integration acts on a verdict *when the verdict is the one the plan
+expects*. They cannot tell an adapter that is wired to the integration's own guard from one that asks
+the stand-in a question and then decides from a table, a script or a mock. `--attest` closes that gap
+(the **mutation control**): the opening controls are re-run twice more, on fresh sessions, with the
+stand-in forced to **always allow** and to **always block**, same scenario ids and texts. The outcome
+has to flip with it: the block control must now pass, the allow control must now stop, and the stand-in
+must have been asked each time. If it does not, the adapter is a stub: every result becomes unverified
+("adapter did not reach the control: not evidence"), the receipt lists a problem and the run exits 2,
+whatever `--fail-on` says. It never upgrades a verdict; when it passes, nothing changes (the naive
+gateway still violates its 18 scenarios with `--attest`). It is opt-in because it costs two more
+integration starts (about 10 s on the reference gateway); use it for every adapter you did not write by
+hand, and always in a fleet.
+
+The receipt also carries a **control-path attestation** (always on, descriptive): the environment the
+adapter launched into, each command it started with the sha256 of every file it names (the gateway
+script, a driver, a config), the installed packages with versions, and who called the stand-in (the
+`User-Agent` of the integration's own HTTP client). A stubbed control shows up as no launched file, no
+package, a caller that is not the integration. It adds notes, never a verdict change; only the mutation
+control demotes.
+
+`gcl replay BUNDLE` re-runs one stored finding from its bundle alone, offline, in well under a minute
+for the reference gateway, and compares what was observed and judged with what the bundle stored:
+**reproduced** (exit 0), **not reproduced** (1), **unverified** (2). Bundles written by `--out` are
+sealed (`bundle.json` holds a sha256 per file), and replay checks the seal, the integration's installed
+version, the control file's digest and that the scenario at that id is the stored one before it starts
+anything. A bundle that is damaged, edited, unsealed, missing its integration, or pinned to a version or
+file that has since changed is **unverified**, never a reproduce; `--allow-version-drift` runs it anyway
+and says so. See [LIMITATIONS.md](LIMITATIONS.md#trustworthy-adapters---attest-gcl-replay).
+
 ### `gcl findings` — a ledger that only holds what runs can back
 
 ```bash

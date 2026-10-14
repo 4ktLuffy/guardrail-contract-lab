@@ -856,7 +856,10 @@ class StandInScanner:
         scanned = proto.scanned(body) if (proto.scanned and isinstance(body, dict)) else None
         ev = {"t": time.monotonic(), "stage": stage, "claimed_stage": claimed,
               "path": h.path, "valid": valid, "mode": mode, "body": body, "scanned": scanned,
-              "body_text": text, "answered": None, "fault_expressed": True, "t_done": None}
+              "body_text": text, "answered": None, "fault_expressed": True, "t_done": None,
+              # Who called: shown in the receipt's control-path attestation, never used in a verdict.
+              "client": {"user_agent": h.headers.get("User-Agent") if getattr(h, "headers", None) else None,
+                         "peer": (getattr(h, "client_address", None) or ("?",))[0]}}
         self.events.append(ev)
         current["ev"] = ev
         if not valid:

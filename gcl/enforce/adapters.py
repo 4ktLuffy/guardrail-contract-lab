@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -28,7 +29,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from .mcp_client import Exchange, http_session, stdio_session
-from .receipt import probe_versions
+from .receipt import file_digest, probe_versions
 from .routes import CHAT, CHAT_STREAM, COMPLETIONS, MESSAGES, RESPONSES
 from .servers import MockModel, Protocol, StandInScanner
 
@@ -303,6 +304,13 @@ class Adapter:
         self._proc = value
         if value is not None:
             _track(value)
+            # Remember what was launched (for the receipt's control-path attestation): stop() clears
+            # the process, the description is read after it.
+            args = getattr(value, "args", None)
+            argv = [str(a) for a in (args if isinstance(args, (list, tuple)) else [args] if args else [])]
+            launches = self.__dict__.setdefault("_launches", [])
+            if argv and argv not in launches and len(launches) < 8:
+                launches.append(argv)
 
     def describe(self) -> dict:
         full = self.versions()
@@ -317,6 +325,57 @@ class Adapter:
                 "documented_source": self.documented_sources.get(self.profile, {}),
                 **({"config_documented_source": self.config_documented_sources.get(self.profile, [])}
                    if self.config_checks else {})}
+
+    def attest_control(self, integration: dict, config_files: dict | None = None) -> dict:
+        """Control-path attestation: best-effort evidence of WHICH code served the control, so a
+        stubbed one is visible in the receipt. Descriptive only. It never changes a verdict (the
+        mutation control is what demotes) and it cannot prove a negative: a gateway that calls
+        the real library is indistinguishable here from one that imitates it without the
+        library. What it records:
+          target     the environment the adapter launched into (the --python interpreter or the
+                     --env directory), resolved
+          launched   every command the adapter started, and each file named in it that exists
+                     (the gateway script, the config, a driver) with its sha256 and size
+          config_files  the generated configuration, by name, with its sha256
+          packages   the installed distributions the integration imported, version and location
+                     (already captured by the version probe, with install integrity)
+          notes      what could not be recorded, in plain words"""
+        notes: list[str] = []
+        target = Path(str(self.python))
+        target_info = {"kind": "node environment" if self.runtime == "node" else "python interpreter",
+                       "path": str(target.absolute()), "resolved": str(target.resolve()) if target.exists() else None,
+                       "exists": target.exists()}
+        launched = []
+        for argv in self.__dict__.get("_launches", []):
+            files = [d for a in argv[1:] if (d := file_digest(a)) is not None]
+            launched.append({"argv": argv, "files": files})
+        if not launched:
+            notes.append("no process was launched through the adapter: the integration runs in gcl's own "
+                         "process or was never started, so there is no entry file to name")
+        dists = ((integration or {}).get("install") or {}).get("dists") or {}
+        packages = {name: ({"version": d["version"], "location": d["location"]} if d else None)
+                    for name, d in dists.items()}
+        if not packages:
+            notes.append("no installed package was probed (the integration is a script, not a package)")
+        module = self._control_module()
+        expected = None
+        if module and not any(f["path"] == module["path"] for la in launched for f in la["files"]):
+            # A subclass of a bundled gateway that never launched it (a stub) must not borrow its identity.
+            expected, module = module, None
+            notes.append(f"the control module {Path(expected['path']).name} was expected but never launched by "
+                         "this adapter: the control may be a stub")
+        return {"adapter": self.name, "profile": self.profile, "gcl_adapter_class": type(self).__qualname__,
+                "control_module": module, "control_module_expected_not_launched": expected,
+                "target": target_info, "launched": launched,
+                "config_files": {n: hashlib.sha256(t.encode("utf-8")).hexdigest()
+                                 for n, t in (config_files or {}).items()},
+                "packages": packages, "notes": notes}
+
+    def _control_module(self) -> dict | None:
+        """The one file that IS the control, when the adapter knows it (the bundled reference
+        gateways): {"role", "version", "path", "sha256", "bytes"}. None when the control is an
+        installed package (see "packages") or unknown."""
+        return None
 
     def config_summary(self) -> dict:
         return {}
@@ -751,6 +810,15 @@ class NemoServer(Adapter):
 
 
 # --------------------------------------------------------------------------- reference
+def _bundled_control(path: Path, role: str) -> dict | None:
+    """Attestation entry for a gateway that ships inside gcl: its resolved path and digest, and
+    the gcl release it came with (it has no version of its own)."""
+    from .. import __version__
+
+    d = file_digest(path)
+    return {"role": role, "version": f"gcl {__version__} (bundled with the release)", **d} if d else None
+
+
 def _ref_gateway_path() -> Path:
     here = Path(__file__).resolve().parent.parent
     for cand in (here / "_examples" / "enforce" / "ref_gateway.py",
@@ -792,6 +860,9 @@ class ReferenceGateway(Adapter):
     def config_summary(self) -> dict:
         return {"gateway": "examples/enforce/ref_gateway.py", "policy": self.profile,
                 "documented_contract": "fail closed"}
+
+    def _control_module(self) -> dict | None:
+        return _bundled_control(_ref_gateway_path(), "the reference gateway's guard (the control under test)")
 
     def versions(self) -> dict:
         return _versions(self.python, [], self.workdir)
@@ -915,6 +986,9 @@ class ReferenceMCPGateway(Adapter):
     def config_summary(self) -> dict:
         return {"gateway": "examples/enforce/ref_mcp_gateway.py", "policy": self.profile,
                 "transport": "MCP streamable HTTP", "documented_contract": "fail closed", "tool": "gcl_probe"}
+
+    def _control_module(self) -> dict | None:
+        return _bundled_control(_ref_mcp_gateway_path(), "the reference MCP gateway's guard (the control under test)")
 
     def versions(self) -> dict:
         return _versions(self.python, [], self.workdir)

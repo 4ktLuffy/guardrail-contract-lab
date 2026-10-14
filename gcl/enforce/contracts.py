@@ -54,7 +54,7 @@ import itertools
 import json
 import re
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -620,9 +620,11 @@ def _reply_without_provider_call(s: Scenario, model_events: list, obs) -> bool:
     return any(f"GCL-R-{s.id}" in t for t in texts) or _leaks(s.reply_text, texts)
 
 
-def _receipt(adapter: Adapter, integration: dict, run_id: str, timeout_s: float) -> dict:
+def _receipt(adapter: Adapter, integration: dict, run_id: str, timeout_s: float,
+             control_path: dict | None = None) -> dict:
     """What produced this run: gcl's source, the integration's install, the vendor spec,
-    the docs version the expectations were read for. Problems are listed, not hidden."""
+    the docs version the expectations were read for, and (descriptive only) which files and
+    packages served the control. Problems are listed, not hidden."""
     install = integration.get("install") or {}
     problems = _rc.integrity_problems({"dists": install.get("dists") or {}})
     problems += _rc.docs_version_problems(integration.get("documented_source") or {},
@@ -633,7 +635,7 @@ def _receipt(adapter: Adapter, integration: dict, run_id: str, timeout_s: float)
     if src["dirty_files"]:
         problems.append(f"gcl has {len(src['dirty_files'])} uncommitted or untracked file(s)")
     return {"run_id": run_id, "gcl": src, "spec_sha256": _rc.spec_hash(getattr(adapter, "spec", None)),
-            "timeout_s": timeout_s, "problems": problems}
+            "timeout_s": timeout_s, "problems": problems, "control_path": control_path}
 
 
 def _settle(model: MockModel, scanner: StandInScanner, quiet_s: float, max_s: float) -> bool:
@@ -669,12 +671,20 @@ def _current_texts(texts: list[str], s: Scenario) -> tuple[list[str], int]:
 
 def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
                   only: set[str] | None = None, settle_s: float = 0.6, run_id: str | None = None,
-                  attacks: dict | None = None, extra: tuple = (), mcp_protocol: str = "2025-03-26") -> dict:
+                  attacks: dict | None = None, extra: tuple = (), mcp_protocol: str = "2025-03-26",
+                  attest: bool = False, plan: list[Scenario] | None = None) -> dict:
     """Run every scenario (or the controls plus `only`) against `adapter`. With
     `attacks` ({"cases", "flagged", "faults", "benign", "detector"}), run the attack × fault
     plan instead (see build_attack_scenarios). `mcp_protocol` is the MCP version the surfaces ask
-    for (`--extra mcp`). `--extra config` runs after everything else, see config_checks.py."""
+    for (`--extra mcp`). `--extra config` runs after everything else, see config_checks.py.
+
+    `attest` (`--attest`) adds the mutation control (see mutation_control): after the run, the
+    opening controls are re-run with the stand-in forced to the opposite verdict, and if the
+    outcome does not follow, every result is demoted to unverified. It only ever demotes.
+    `plan` is internal: an explicit scenario list, used by the mutation passes themselves (a
+    probe session: no receipt, no further attestation)."""
     say = progress or (lambda *_: None)
+    probe = plan is not None
     run_id = run_id or new_run_id()
     if "mcp" in extra and not adapter.mcp_transport:
         from .adapters import ADAPTERS
@@ -691,8 +701,10 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
 
         raise ValueError(f"--extra config needs an adapter that can start with a given policy: {adapter.name} "
                          "has none (try " + ", ".join(n for n, a in ADAPTERS.items() if a.config_checks) + ")")
-    plan = (build_attack_scenarios(adapter, attacks["cases"], attacks["flagged"], attacks["faults"],
-                                   attacks["benign"], run_id) if attacks else build_scenarios(adapter, run_id, extra))
+    if plan is None:
+        plan = (build_attack_scenarios(adapter, attacks["cases"], attacks["flagged"], attacks["faults"],
+                                       attacks["benign"], run_id) if attacks
+                else build_scenarios(adapter, run_id, extra))
     scenarios = [s for s in plan if not only or s.control or s.id in only]
     obs_by: dict[str, object] = {}
     windows: dict[str, tuple[float, float]] = {}
@@ -776,6 +788,20 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         finally:
             adapter.stop()
         config_files = adapter.config_files()
+
+    # What served the control is described from THIS run's launches, before the mutation passes
+    # start the integration again.
+    if probe:
+        integration, control_path = {"integration": adapter.name, "profile": adapter.profile, "config": {},
+                                     "versions": {}}, None
+    else:
+        integration = adapter.describe()
+        control_path = _control_path(adapter, integration, config_files, scanner_events)
+    # The mutation control runs on its own sessions after the integration stopped, so nothing
+    # it does can touch the events or windows the verdicts below are read from.
+    mutation = ({"state": "n/a", "requested": False, "reason": "not requested (enforce --attest)", "probes": []}
+                if not (attest and not probe) else mutation_control(adapter, timeout_s, say, settle_s))
+    demote = MUTATION_NOT_EVIDENCE if mutation["state"] == "failed" else None
 
     starts = sorted((w[0], sid) for sid, w in windows.items())
     nxt = {sid: (starts[k + 1][0] if k + 1 < len(starts) else float("inf")) for k, (_, sid) in enumerate(starts)}
@@ -911,15 +937,26 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         results.append(r)
 
     _judge(results, adapter)
+    if demote:
+        _demote_results(results, demote)
     _stand_in_confidence(results, adapter)
     from ..standards import risks
 
     for r in results:
         r.evidence["owasp"] = risks(adapter.name, r.scenario.stage, r.scenario.mode, r.observed, r.policy)
-    integration = adapter.describe()
+    if probe:   # a mutation pass: only its outcomes are read, nothing here is a report
+        receipt = {"run_id": run_id, "problems": []}
+    else:
+        receipt = _receipt(adapter, integration, run_id, timeout_s, control_path)
+        if mutation["state"] == "failed":
+            receipt["problems"].append(f"mutation control failed: {mutation['reason']}")
     out = {
         "integration": integration,
-        "receipt": {**_receipt(adapter, integration, run_id, timeout_s), "background_before_run": background},
+        "receipt": {**receipt, "background_before_run": background},
+        "mutation_control": mutation,
+        "run_args": {"extra": list(extra), "mcp_protocol": mcp_protocol, "attack_mode": bool(attacks),
+                     "judge_latency_s": getattr(adapter, "scanner_latency_s", 0.0), "target": str(adapter.python),
+                     "spec": getattr(adapter, "spec", None)},
         "timeout_s": timeout_s,
         "started_at": started,
         "results": [r.to_dict() for r in results],
@@ -934,6 +971,8 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         from .mcp_surfaces import negotiated_protocol, summarize
 
         _gate_surfaces(surfaces, results)
+        if demote:
+            _demote_rows(surfaces, demote)
         _label_surfaces(surfaces, adapter)
         out["summary"] = _summary(results, surfaces)
         out["results"] += surfaces
@@ -944,6 +983,9 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
 
         own_routes = counted(route_results)
         _gate_surfaces(own_routes, results)   # the same opening / closing controls gate these results
+        if demote:
+            _demote_rows(own_routes, demote)
+            _demote_route_block(route_block)
         _label_surfaces(own_routes, adapter)
         out["summary"] = _summary(results, surfaces + own_routes)
         out["results"] += own_routes
@@ -956,6 +998,8 @@ def run_contracts(adapter: Adapter, timeout_s: float = 20.0, progress=None,
         from .config_checks import summarize as summarize_config
 
         _gate_surfaces(config_results, results)  # the same opening / closing controls gate these results
+        if demote:
+            _demote_rows(config_results, demote)
         out["summary"] = _summary(results, surfaces + own_routes + config_results)
         out["results"] += config_results
         out["config_checks"] = {"summary": summarize_config(config_results),
@@ -1173,6 +1217,131 @@ def _broken_controls(results: list[Result]) -> tuple[list[Result], list[Result]]
             [r for r in results if r.scenario.phase == "close" and not _usable(r)])
 
 
+# --------------------------------------------------------------------------- mutation control
+MUTATION_NOT_EVIDENCE = "adapter did not reach the control: not evidence (the mutation control failed)"
+_MUTATION_STOPS = ("stopped", "blocked after send", "retained")
+
+
+def _mutation_probe(s: Scenario, forced: str, r: dict) -> dict:
+    """One opening control re-run with the stand-in forced to `forced`: did the outcome follow?
+    Allow must come back "passed" (the model got the text, the client got the reply). Block must
+    come back as a stop or a refusal — never a pass, never a crash that merely looks like one —
+    and in both cases the stand-in must actually have been asked about this scenario."""
+    ev, obs = r["evidence"], r["observed"]
+    consulted = ev.get("scanner_consulted_stage", 0)
+    status = ev.get("client_status")
+    if forced == "allow":
+        followed, want = obs == "passed", "passed"
+    else:
+        followed = obs in _MUTATION_STOPS and not (obs == "stopped" and status is not None and status >= 500)
+        want = "stopped or refused"
+    why = None
+    if not consulted:
+        why = "the stand-in was never asked about this request: the adapter does not reach it"
+    elif not followed:
+        why = f"observed {obs}, expected {want}: the outcome did not follow the stand-in's verdict"
+    return {"scenario": s.id, "stage": s.stage, "control": s.mode, "forced": forced,
+            "mutated": s.mode != forced, "observed": obs, "expected": want, "scanner_consulted": consulted,
+            "ok": why is None, "why": why}
+
+
+def mutation_control(adapter: Adapter, timeout_s: float, progress=None, settle_s: float = 0.6) -> dict:
+    """Prove the adapter reaches the real control, by swapping the control's behaviour.
+
+    The opening controls (input allow/block, output allow/block) are run twice more, each pass on
+    its own fresh session: once with the stand-in forced to ALWAYS ALLOW, once to ALWAYS BLOCK.
+    Same scenario ids, same texts, same order as the controls of the real run, so an adapter that
+    keys its answer on the scenario, on the position of a call, or on a canned script — instead
+    of on the stand-in's verdict — gives the same answer as before and is caught: a block
+    control that cannot be made to pass, or an allow that cannot be made to stop, means the
+    adapter is a stub or a mock, not a path to the integration's own enforcement.
+
+    The ordinary controls prove the integration acts on a verdict when the verdict matches the
+    plan; this proves the verdict is what it acts on. It costs two more integration starts, so
+    it is opt-in (`enforce --attest`); the fleet and any generated adapter should always use it.
+
+    State: "passed" (every probe followed), "failed" (one did not, or the passes could not run:
+    an unproven adapter is not trusted). A failure demotes the whole run to unverified in
+    run_contracts; a pass changes nothing."""
+    say = progress or (lambda *_: None)
+    t0 = time.monotonic()
+    probes: list[dict] = []
+    failure = ""
+    try:
+        for forced in ("allow", "block"):
+            run_id = new_run_id()
+            opening = [s for s in build_scenarios(adapter, run_id) if s.phase == "open"]
+            say(f"mutation control: stand-in forced to always {forced}")
+            run = run_contracts(adapter, timeout_s, progress=say, run_id=run_id, settle_s=settle_s,
+                                plan=[replace(s, mode=forced) for s in opening])
+            by_id = {r["scenario"]["id"]: r for r in run["results"]}
+            probes += [_mutation_probe(s, forced, by_id[s.id]) for s in opening]
+    except Exception as e:   # an adapter that cannot be re-run is unproven, which is what we report
+        failure = f"the mutation passes could not run: {type(e).__name__}: {e}"
+    bad = [p for p in probes if not p["ok"]]
+    for forced in ("allow", "block"):
+        if not failure and not any(p["mutated"] and p["forced"] == forced for p in probes):
+            failure = f"no control could be flipped to {forced}: nothing to prove the adapter reaches the control"
+    if not failure and bad:
+        failure = "; ".join(f"{p['scenario']} {p['stage']} {p['control']} control forced {p['forced']}: {p['why']}"
+                            for p in bad[:3]) + (f" (+{len(bad) - 3} more)" if len(bad) > 3 else "")
+    return {"state": "failed" if failure else "passed", "requested": True,
+            "reason": failure or ("every opening control followed the stand-in when forced to allow and to block "
+                                  f"({len([p for p in probes if p['mutated']])} flipped, {len(probes)} probes)"),
+            "probes": probes, "elapsed_s": round(time.monotonic() - t0, 1)}
+
+
+def _demote_results(results: list[Result], why: str) -> None:
+    """Demote only: whatever the result was, it becomes unverified. Never the other way."""
+    for r in results:
+        if r.policy != "unverified":
+            r.policy = r.documented = "unverified"
+            r.notes.append(why)
+
+
+def _demote_rows(rows: list[dict], why: str) -> None:
+    """The same for result dicts (MCP surfaces, routes, config checks), clearing OWASP tags like
+    _gate_surfaces: no evidence either way."""
+    for d in rows:
+        if d["policy"] != "unverified":
+            d["policy"] = d["documented"] = "unverified"
+            d["evidence"]["owasp"] = []
+            d["notes"].append(why)
+
+
+def _demote_route_block(block: dict) -> None:
+    """Routes carry their own parity summary, built before any gate: bring it in line."""
+    if not block or "routes" not in block:
+        return
+    from .routes import parity, summarize
+
+    for row in block["routes"]:
+        row["policy"], row["carried"] = "unverified", None
+    block["summary"], block["parity"] = summarize(block["routes"]), parity(block["routes"])
+
+
+# --------------------------------------------------------------------------- control-path attestation
+def _peers(scanner_events: list[dict]) -> dict:
+    """Who called the stand-in: the clients' User-Agent headers and peer addresses. Descriptive
+    only: a stubbed control is often visible as a caller that is not the integration's HTTP
+    client (or as no caller at all)."""
+    seen = [e["client"] for e in scanner_events if e.get("valid") and e.get("client")]
+    return {"requests": len(seen), "user_agents": sorted({c.get("user_agent") or "(none)" for c in seen}),
+            "peers": sorted({c.get("peer") or "?" for c in seen})}
+
+
+def _control_path(adapter: Adapter, integration: dict, config_files: dict, scanner_events: list[dict]) -> dict:
+    """Best-effort receipt of which code served the control (Adapter.attest_control), plus who
+    called the stand-in. It describes; it never changes a verdict, and a failure to gather it is
+    recorded, not raised."""
+    try:
+        cp = adapter.attest_control(integration, config_files)
+    except Exception as e:   # best-effort by contract
+        cp = {"error": f"{type(e).__name__}: {e}", "notes": ["control-path attestation could not be gathered"]}
+    cp["scanner_peers"] = _peers(scanner_events)
+    return cp
+
+
 # Modes whose result depends on the exact shape of the stand-in's answer: a correct verdict
 # the integration mishandled (or handled), or a verdict field the fault was aimed at. The
 # transport faults (error, timeout, malformed, empty, refused), wrong_schema (the whole
@@ -1333,6 +1502,8 @@ def write_bundles(run: dict, out: Path, replay: str = "") -> list[Path]:
             "verdicts": {"policy": r["policy"], "documented": r["documented"]}, "notes": r["notes"],
             "evidence": r["evidence"], "client_timeout_s": run["timeout_s"],
             "receipt": run.get("receipt"), "controls": controls,
+            # What `gcl replay` needs beyond the finding itself: the run's own arguments.
+            "replay": {**(run.get("run_args") or {}), "scenario_id": s["id"]},
             "truncated": bool(r["evidence"].get("client_body_truncated")
                               or any(a.get("body_truncated") for a in r["evidence"].get("attempts") or [])),
         }, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1340,5 +1511,8 @@ def write_bundles(run: dict, out: Path, replay: str = "") -> list[Path]:
             (d / f"config-{Path(name).name}").write_text(text, encoding="utf-8")
         if replay:
             (d / "REPLAY.txt").write_text(f"{replay} --scenario {s['id']}\n", encoding="utf-8")
+        from .replay import seal_bundle
+
+        seal_bundle(d)   # last: a sha256 per file, so `gcl replay` can tell a damaged or edited bundle
         written.append(d)
     return written

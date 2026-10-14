@@ -368,6 +368,11 @@ def enforce(
                                             "results to (code scanning needs one; default: the spec)."),
     force: bool = typer.Option(False, help="Write into a non-empty --out folder (default: refuse, so "
                                "reports and repro bundles of different runs never mix)."),
+    attest: bool = typer.Option(False, "--attest", help="Mutation control: re-run the opening controls twice "
+                                "with the stand-in forced to always-allow and always-block. If the outcome does "
+                                "not follow, the adapter does not reach the integration's own control (a stub or "
+                                "a mock): every result becomes unverified and the run exits 2, whatever --fail-on "
+                                "says. It only demotes. Costs two more integration starts."),
 ):
     """Does a real guardrail integration enforce what its scanner decides?"""
     from .enforce.adapters import ADAPTERS
@@ -441,12 +446,15 @@ def enforce(
         except ValueError as e:
             typer.echo(f"error: {e}", err=True)
             raise typer.Exit(2) from None
+    if attest and lats:
+        raise typer.BadParameter("run the mutation control once, on its own run (not per latency)",
+                                 param_hint="--attest")
     try:
         if lats and attack_plan:
             raise typer.BadParameter("use --judge-latency or attack mode, not both", param_hint="--judge-latency")
         if attack_plan:
             run = run_contracts(adapter, timeout or adapter.default_timeout_s, progress=_say,
-                                only=set(scenario) or None, attacks=attack_plan)
+                                only=set(scenario) or None, attacks=attack_plan, attest=attest)
         elif lats:
             from .enforce.contracts import latency_sweep
 
@@ -458,7 +466,8 @@ def enforce(
             run["latency_sweep"]["summaries"] = [r["summary"] for r in sweep["runs"]]
         else:
             run = run_contracts(adapter, timeout or adapter.default_timeout_s, progress=_say,
-                                only=set(scenario) or None, extra=extras, mcp_protocol=mcp_protocol)
+                                only=set(scenario) or None, extra=extras, mcp_protocol=mcp_protocol,
+                                attest=attest)
     except (RuntimeError, OSError) as e:  # OSError: URLError and friends from an adapter that failed to start
         typer.echo(f"error: {e}", err=True)
         raise typer.Exit(2) from None
@@ -495,12 +504,54 @@ def enforce(
     typer.echo(render_enforce(run))
     if out:
         typer.echo(f"\nReports: {out}/" + (f"  ({len(bundles)} repro bundle(s) in {out}/repro/)" if bundles else ""))
+    if (run.get("mutation_control") or {}).get("state") == "failed":
+        # Not a finding and not an incomplete run to wave through: the adapter is not trusted.
+        raise typer.Exit(2)
     sw = run.get("latency_sweep")
     if sw:
         codes = [_enforce_exit(sm, fail_on, allow_incomplete) for sm in sw["summaries"]]
         code = 1 if 1 in codes else (2 if 2 in codes or sw["unstable"] else 0)
         raise typer.Exit(0 if fail_on == "never" else code)
     raise typer.Exit(_enforce_exit(run["summary"], fail_on, allow_incomplete))
+
+
+@app.command()
+def replay(
+    bundle: Path = typer.Argument(..., help="A repro bundle: the directory `enforce --out` wrote under "
+                                  "repro/, or a zip of it."),
+    python: Path | None = typer.Option(None, "--python", "--env", help="Python (or, for Node integrations, "
+                                       "the install directory) to run the integration in, instead of the one "
+                                       "the bundle recorded."),
+    allow_drift: bool = typer.Option(False, "--allow-version-drift", help="Run even if the integration's "
+                                     "version or the control file changed since the bundle was written (the "
+                                     "result is then 'does it still happen here', noted as such)."),
+    attest: bool = typer.Option(False, "--attest", help="Also run the mutation control on the replay."),
+    out: Path | None = typer.Option(None, help="Write the replay record (JSON) here."),
+):
+    """Re-run one stored finding, offline, from its bundle. Exit 0 reproduced, 1 not reproduced,
+    2 unverified (damaged or unsealed bundle, missing integration, a pin changed, controls broke)."""
+    from .enforce.replay import replay as do_replay
+
+    res = do_replay(bundle, python=str(python) if python else None, allow_drift=allow_drift, attest=attest,
+                    progress=_say)
+    sc = res.get("scenario") or {}
+    typer.echo(f"Replay of {sc.get('id', '?')} {sc.get('stage', '')} {sc.get('mode', '')} "
+               f"from {bundle}: {res['status'].upper()}")
+    typer.echo(f"  {res['reason']}")
+    if res.get("stored"):
+        typer.echo(f"  stored   {res['stored']['observed']} / policy {res['stored']['policy']} / "
+                   f"docs {res['stored']['documented']}")
+    if res.get("replayed"):
+        typer.echo(f"  replayed {res['replayed']['observed']} / policy {res['replayed']['policy']} / "
+                   f"docs {res['replayed']['documented']}")
+    for ch in res["checks"]:
+        typer.echo(f"  {'ok  ' if ch['ok'] else 'FAIL'} {ch['check']}: {ch['detail']}")
+    for n in res["notes"]:
+        typer.echo(f"  note: {n}")
+    typer.echo(f"  ({res['elapsed_s']} s)")
+    if out:
+        R.write_json(res, out)
+    raise typer.Exit({"reproduced": 0, "not reproduced": 1}.get(res["status"], 2))
 
 
 def _enforce_exit(s: dict, fail_on: str, allow_incomplete: bool) -> int:

@@ -21,6 +21,30 @@
   (`@bytebase/dbhub`'s read-only mode does not stop a `PRAGMA user_version = N` assignment): red on
   `<= 0.22.5`, green on `>= 0.22.6`, both hand-checked against the throwaway SQLite file's own state.
   See README "Agent actions (`gcl actions`)".
+- `gcl enforce ... --attest`: the mutation control. After the run, the opening controls (input and
+  output, allow and block) are re-run on two fresh sessions with the stand-in forced to always allow
+  and to always block. The outcome has to follow: a block control that cannot be made to pass, an
+  allow that cannot be made to stop, a stand-in that is never asked, means the adapter does not reach
+  the integration's own control (a stub or a mock). Then every result becomes unverified ("adapter
+  did not reach the control: not evidence"), the receipt lists a problem, and the run exits 2 whatever
+  `--fail-on` / `--allow-incomplete` say. It only ever demotes; a pass changes nothing. Run-level field
+  `mutation_control` (`state` passed / failed / n/a, the probes, the reason). Opt-in because it costs two
+  more integration starts; the fleet and any generated adapter should always pass it. Not combinable
+  with `--judge-latency`.
+- Control-path attestation in the receipt (`receipt.control_path`, always on, descriptive, never changes
+  a verdict): the environment the adapter launched into, every command it started with each named file's
+  path / sha256 / size, the generated config's sha256, the installed packages with versions and
+  locations, the bundled reference gateway's path, digest and gcl release, and who called the stand-in
+  (User-Agent, peer). A bundled-gateway subclass that never launched the gateway says so instead of
+  borrowing its identity. New `Adapter.attest_control` and `receipt.file_digest`.
+- `gcl replay BUNDLE` (a repro bundle directory or a zip): re-runs exactly one stored finding offline from
+  the bundle's pinned inputs and says reproduced (exit 0), not reproduced (1) or unverified (2). Repro
+  bundles are now sealed (`bundle.json`: a sha256 per file) and carry what a replay needs (`finding.json`
+  `replay`: extras, MCP protocol, target interpreter, vendor spec, guard latency). Unverified, never a
+  false reproduce: damaged, edited, unsealed or incomplete bundle, unsafe zip, integration not installed,
+  a pinned version or control file changed (`--allow-version-drift` to run anyway), the scenario at that
+  id differs, attack-mode findings (the attack plan is not in the bundle), controls broken on replay.
+  New module `gcl/enforce/replay.py`.
 - `gcl upgrade-check ADAPTER --before PY --after PY`: the same enforce plan against the installed and the
   next version, one report (per scenario before -> after, regressions, improvements, unchanged); exit 1 on
   held -> violated, held -> unverified or a guard no longer consulted at a stage, exit 2 if the comparison

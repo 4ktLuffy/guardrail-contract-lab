@@ -416,6 +416,35 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
 - The HMAC covers `manifest.json` (which holds the hashes); it is not a signature by a responsible
   person as Annex IV 2(g) describes. The key is read from a file, never from the command line.
 
+## Trustworthy adapters (`--attest`, `gcl replay`)
+- The mutation control needs a controllable stand-in: it works by changing what the stand-in answers.
+  It proves the outcome follows the stand-in's verdict; it does not prove the code that followed it is
+  the vendor's. An adapter that calls the real library for the verdict but swaps out another part of
+  the integration, or a mock that really does read the stand-in's answer and acts on it, passes. An
+  integration whose guard is its own scanner (no stand-in to steer) cannot be attested this way, and
+  `harness_supplies_guard` adapters test the framework, with gcl's own guard, by design.
+- It is opt-in. Without `--attest` a stub that asks the stand-in and ignores the answer scores a perfect
+  run (the test suite keeps such an adapter to prove it). With it, a pass is not a proof of fidelity,
+  only the absence of this one failure; a failure to run the passes (the adapter cannot be restarted) is
+  treated as a failure, because an adapter that cannot be shown to reach the control is not believed.
+- Control-path attestation is best-effort and descriptive. It records what the adapter launched and what
+  was installed, from the adapter's own account (the process arguments it passed) and the version probe;
+  it cannot see inside the integration, and a stub that launches the real file and then talks to it
+  differently is not caught by it. It never changes a verdict: it only adds notes. The only thing that
+  demotes is the mutation control, and it only demotes (a result is never moved toward held).
+- A failed mutation control makes every result unverified, including violations: a leak found through a
+  stub says nothing about the integration. That is the point, and it can hide a real finding when the
+  adapter is merely flaky; rerun or fix the adapter before reading anything into the run.
+- `gcl replay`: the seal is a sha256 per file, so it catches damage and edits, not someone who edits a
+  file and its digest together; that needs a signature (not built). Bundles written before the seal
+  existed are unsealed, so replay refuses them (unverified). A replay is one run of one scenario, not a
+  repeat: a timing-dependent finding can come out "not reproduced" once and "reproduced" the next time.
+  The 3x unanimous repeat is not built. Attack-mode findings are not replayable from the bundle (the
+  frozen attack plan lives beside the report, not in the bundle). The regenerated config is compared with
+  the bundle's and a difference is a note (ports and temp paths always differ). The gcl source is not
+  pinned beyond the control file and the scenario text: a replay on a different gcl commit can reproduce
+  a finding, and says nothing about whether gcl changed.
+
 ## What it cannot see
 - Keyword rules cannot tell "disable the firewall" from "don't disable the firewall".
   `gcl` measures that as hard-negative false positives; it does not fix it.

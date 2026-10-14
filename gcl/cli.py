@@ -524,6 +524,68 @@ def _fixture_note(cases: list[dict]) -> str:
             "native-reviewed; per-language samples are small, so read the intervals.")
 
 
+# --------------------------------------------------------------------------- agent actions
+actions_app = typer.Typer(no_args_is_help=True, help="Agent actions: approval / read-only / "
+                          "allowlist controls, proven from an executor's own receipt, never from "
+                          "a reply's text (see gcl/enforce/ledger.py).")
+app.add_typer(actions_app, name="actions")
+
+
+@actions_app.command()
+def dbhub(
+    install: Path = typer.Option(..., exists=True, file_okay=False, help="The directory `npm pack` / "
+                                 "`npm install` unpacked @bytebase/dbhub into (holding dist/index.js "
+                                 "and, for its production dependencies, node_modules)."),
+    node: str = typer.Option("node", help="The node binary (needs node:sqlite, i.e. Node >=22.5)."),
+    db: Path = typer.Option(..., help="The throwaway SQLite file to probe (seeded once if it does "
+                            "not exist yet; never deleted or touched for real afterwards)."),
+    workdir: Path = typer.Option(..., file_okay=False, help="Where this run writes its own dbhub.toml."),
+    timeout: float = typer.Option(30.0, help="Seconds per probe."),
+    out: Path | None = typer.Option(None, help="Directory for report.json/.sarif."),
+    format: str = typer.Option("json", help="Files to write into --out: json, sarif."),
+    fail_on: str = typer.Option("policy", help="policy (any violation) | never"),
+    allow_incomplete: bool = typer.Option(False, help="Exit 0 even if the controls did not hold "
+                                          "(default: exit 2)."),
+):
+    """dbhub's read-only flag on execute_sql: a benign PRAGMA-assignment write that the
+    leading-keyword classifier misses (CVE-2026-61788 / GHSA-mwwr-p57h-56pf). Vulnerable
+    builds (<= 0.22.5) go red; 0.22.6 goes green -- see README "Agent actions"."""
+    from .enforce.actions import run_action_target
+    from .enforce.dbhub_target import DbhubTarget, seed_db
+
+    if fail_on not in ("policy", "never"):
+        raise typer.BadParameter("choose policy or never", param_hint="--fail-on")
+    if out and out.exists() and any(out.iterdir()):
+        raise typer.BadParameter(f"{out} is not empty; use a new folder", param_hint="--out")
+    seed_db(db)
+    target = DbhubTarget(node, install, db, workdir)
+    run = run_action_target(target, timeout, say=_say)
+    doc = R.envelope("actions", {"target": "dbhub", "install": str(install), "db": str(db)})
+    # Filed under "enforce" too (not only "actions"): `gcl findings add` and other tools
+    # that read a report by that key work on this report unchanged -- same Result shape,
+    # same receipt shape, just a different run mode (see enforce/actions.py's docstring).
+    doc["actions"] = doc["enforce"] = run
+    if out:
+        _write_outputs(doc, out, _formats(format))
+        if "sarif" in _formats(format):
+            from .report.sarif import enforce_sarif
+
+            R.write_json(enforce_sarif(run, str(workdir / "dbhub.toml")), out / "report.sarif")
+    for r in run["results"]:
+        s = r["scenario"]
+        pk = {"held": "ok", "violated": "error", "unverified": "warning"}[r["policy"]]
+        typer.echo(f"  {s['id']}  {r['policy']:<10} {s['mode']:<9} observed {r['observed']}"
+                  + (f"  [{pk}]" if pk != "ok" else ""))
+        for n in r["notes"]:
+            typer.echo(f"             {n}")
+    sm = run["summary"]
+    typer.echo(f"\n{sm['held']} held, {sm['violated']} violated, {sm['unverified']} unverified of "
+              f"{sm['checks']}.")
+    if out:
+        typer.echo(f"Report: {out}/")
+    raise typer.Exit(_enforce_exit(sm, fail_on, allow_incomplete))
+
+
 def main():  # pragma: no cover
     app()
 

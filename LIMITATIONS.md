@@ -348,6 +348,35 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
 - Parity compares the routes of one adapter against each other. Two routes that are both unguarded are
   "equal" (and violated): parity says nothing about whether the guard exists.
 
+## Agent actions (`gcl actions`)
+- The ledger needs the target to route through gcl's own stand-in executor (`sinks.py`), or, for a
+  real target that manages its own store, through gcl's own independent read of it. A target that
+  shells out to an absolute path instead of looking up the fake shell on PATH, or opens a database
+  by a hardcoded path instead of the one it was configured with, is not caught by any of this: the
+  ledger would simply never see a receipt and everything would read `unverified`, not `violated`.
+  Nothing here sandboxes a target; it only judges what it is shown.
+- stdio-MCP targets only, for now: `StdioMCPActionTarget` assumes one subprocess per probe, started
+  fresh and killed again (`mcp_client.stdio_session`), speaking newline-delimited JSON-RPC. An
+  HTTP-service or CLI-headless target (Phase 1's own roadmap: Gemini CLI, PraisonAI) needs its own
+  base shape; none is built yet.
+- `k00a`/`k00d` (the controls) use two different proofs by design: the approved probe is read-only,
+  so there is no persisted state to diff and its "ran" comes from the target's own structured reply
+  (there is nothing else to check for a read); the denied and bypass probes are judged only from
+  `observe()`'s before/after diff, never from what the target's reply claims. A target whose reads
+  have a side effect gcl does not know to look for (a cache, an audit log) is not covered by either.
+- The dbhub target reads one field (`PRAGMA user_version`) and one table (`gcl_marker`) as its whole
+  "observe" snapshot. A write that touches neither (a different pragma, a WAL-mode side channel) would
+  not be seen as "changed" even if it committed; the probe is chosen to land in the one field this
+  snapshot covers, not because the snapshot is exhaustive.
+- `judge()`'s "ran with no model turn" and "approved args != executed args" verdicts are exercised
+  only by synthetic events in `tests/test_phase1_actions.py`: dbhub's control (a read-only flag) has
+  no human approval step and no args/approver-vs-executor split to swap, so the real replay only ever
+  reaches "blocked" or "executed without approval". The richer verdicts are there for a future
+  approval-prompt target, not proven against a real one yet.
+- The known-CVE replay is pinned to one bypass (SQLite `PRAGMA x = ...`) on one engine (SQLite). The
+  same advisory's PostgreSQL bypasses (`setval`, `lo_export`, `dblink`) are not replayed: they need a
+  running PostgreSQL server, which is out of scope for a throwaway local target.
+
 ## Findings ledger
 - Severity is a fixed, published rule over a few fields, not a CVSS score. "Documented"
   comes from gcl's own map of each integration's docs (quoted in every report); "default

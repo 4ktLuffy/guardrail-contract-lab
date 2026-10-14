@@ -3,6 +3,13 @@
 ## Unreleased
 
 **New**
+- `gcl upgrade-check ADAPTER --before PY --after PY`: the same enforce plan against the installed and the
+  next version, one report (per scenario before -> after, regressions, improvements, unchanged); exit 1 on
+  held -> violated, held -> unverified or a guard no longer consulted at a stage, exit 2 if the comparison
+  could not be made (unusable controls on a side, guard never consulted, scenarios on one side only).
+  `--before-profile` / `--after-profile` per side. Reports which documented expectations were read for an
+  older version than the one installed (re-read due). `gcl compare` now shares its classification
+  (`compare.classify`) with it.
 - `gcl coverage` false-positive budget per language: every rate is printed with counts and its
   Wilson 95% interval (n = 0 is "not measured", never 0%), plus a gap-vs-English column for recall
   and false positives (starred when the intervals do not overlap).

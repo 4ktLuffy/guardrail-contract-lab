@@ -54,9 +54,9 @@ else is labelled.
   engine-relevant hazards and the "one rule is the whole story" coverage note.
 
 ## enforce (tests/test_enforce.py)
-- Reference gateway: the strict build holds all 22 scenarios and conforms to its docs on
-  every one; the naive build deviates on all 18 fault scenarios (9 faults × 2 stages)
-  while all four controls hold — checked.
+- Reference gateway: the strict build holds all 38 scenarios and conforms to its docs on
+  every one; the naive build deviates on 18 (the fault scenarios, 9 faults × 2 stages) and holds
+  the other 20, all controls among them — checked (`gcl demo`, re-run 2026-10-13: 18 of 38 / 0 of 38).
 - Adversarial gateways, each built to fool a sentinel-only judge: forwarding the blocked
   text with its marker stripped ("altered", violated); a rewrite that keeps only the
   marker (violated); rejecting the client, then forwarding 1 s later (caught as a late
@@ -238,18 +238,19 @@ else is labelled.
   misattributed timeouts, rewrites that changed what a rule matches, unbounded
   subprocesses, overclaims — was fixed and pinned by a regression test
   (`tests/test_review_round*.py` and the suites above).
-- Local runs: 301 tests pass (plus 12 opt-in real-integration tests, run separately against
-  twelve installed integrations) on Python 3.13.15 with Node 25.8.0; the demo runs
-  from an installed wheel outside the checkout.
+- Local runs: 639 tests pass and 20 are skipped (the opt-in real-integration tests, `GCL_INTEG_*`
+  unset), 0 fail, on Python 3.13.15 with Node 25.8.0 (2026-10-13, run file by file, six at a time; 336 s).
+  The earlier opt-in real-integration runs (twelve installed integrations) are recorded above, not
+  re-run for this count; the demo ran from the checkout on 2026-10-13 (190 s), from an installed wheel
+  outside it earlier — not re-checked.
 
 ## MCP surfaces (tests/test_mcp_surfaces.py, test_mcp_mock_surfaces.py, test_mcp_real_adapters.py)
-- Reference gateway, naive profile, every surface m00–m18 with its carry control: each
-  control is carried; 4 of 19 attacks are held (m00, m04, m13, m15), and the other 15
-  are "passed unscanned" and violated, with the OWASP IDs and the scanner never shown the
-  text — checked.
-- Reference gateway, strict profile: every carried surface is stopped and held, with the
-  scanner shown the text; m15 and m16 are "not carried" (n/a); nothing is violated or
-  unverified — checked.
+- Reference gateway, naive profile, every surface m00–m34 with its carry control: each control is
+  carried, 4 attacks are held (m00, m04, m13, m15), every other surface the protocol version has
+  is "passed unscanned" and violated, with the OWASP IDs and the scanner never shown the text — checked.
+- Reference gateway, strict profile: every carried surface is stopped and held, with the scanner shown
+  the text; m15 and m16 are "not carried" (n/a) and the surfaces newer than the protocol "not in
+  protocol"; nothing is violated or unverified — checked.
 - Mock MCP server, each surface over streamable HTTP and over the stdio bridge, read by
   gcl's raw MCP client: the payload arrives where the surface says, the SSE surfaces (m08,
   m11, m12, m13) stream, a client without SSE in its Accept falls back to JSON, a sampling
@@ -271,15 +272,112 @@ else is labelled.
 - Invariant and Lasso adapters: name mapping, and the URL, headers and argv each hands to the
   raw client — checked without a gateway.
 - Real gateways, opt-in (`GCL_INTEG_INVARIANT_PYTHON`: Invariant Gateway 0.0.9;
-  `GCL_INTEG_LASSO_PYTHON`: Lasso mcp-gateway 1.2.1): run 2026-10-11. The results are not
-  stated here; findings go to the maintainers first, as the README says.
+  `GCL_INTEG_LASSO_PYTHON`: Lasso mcp-gateway 1.2.1): run 2026-10-11, and re-run 2026-10-12/13
+  under the stricter rules above (all 35 surfaces, full observation, payload matching). The results
+  are not stated here; findings go to the maintainers first, as the README says.
 - ToolHive v0.51.4 real runs, opt-in (`--env` the `thv` binary): profiles `fail` and `ignore`, with
-  and without `--extra mcp`, run 2026-10-11 — checked; results withheld, as above. Extra real
-  profiles run 2026-10-11: Invariant `push`, Lasso `no_key`, ContextForge `enforce` and
-  `ignore_error` — checked; results withheld.
-- structuredContent (m02) is run at the default protocol 2025-03-26: reference gateway, naive 15
-  of 18 violated, strict 0 of 18 violated with 2 not carried (m15, m16) — checked.
+  and without `--extra mcp`, run 2026-10-11 and re-run 2026-10-12/13 under the stricter rules — checked;
+  results withheld, as above. Extra real profiles run 2026-10-11 and re-run 2026-10-12/13: Invariant
+  `push`, Lasso `no_key`, ContextForge `enforce` and `ignore_error` — checked; results withheld.
+- structuredContent (m02) is run at every protocol version (a gateway that drops it reads
+  n/a "not carried").
+
+## MCP surfaces, 35 of them, and what counts as proof (tests/test_mcp_next.py, test_mcp_presence.py, test_mcp_refusal.py, test_ref_mcp_gateway.py)
+- Reference MCP gateway, all 35 surfaces m00–m34 (each with a carry control), `--extra mcp` at the three
+  protocol versions, naive / strict. Violated: 25 / 0 at 2025-03-26, 29 / 0 at 2025-06-18, 30 / 0 at
+  2025-11-25. Naive holds 4 (m00, m04, m13, m15) at every version. Strict holds 27 / 32 / 33, with n/a
+  8 / 3 / 2 (not in protocol 6 / 2 / 1, not carried 2 / 1 / 1: m15 always, m16 at 2025-03-26).
+  Nothing is unverified — checked, re-run 2026-10-13 (counts in NUMBERS.md).
+- Proof rules, each pinned by a test that fails on the code before the fix: a reply is an answer only
+  as a valid JSON-RPC 2.0 response (`error: null`, both members, no `jsonrpc` are not); the surface's own
+  request must have been sent and answered (an initialize error is "handshake failed", a skipped
+  step "probe not sent"); a session that did not settle is unverified, a proven leak stays violated; a
+  block counts as "stopped" only with its delivery confirmed; stdio is read until the server is quiet,
+  the standalone GET stream is opened and watched, and a stream that cannot be watched makes an
+  absence unverified; lists are read to their end (20 pages) and names match exactly before a suffix,
+  else "list incomplete" / "name ambiguous"; the payload counts, not only the marker (a gateway that
+  strips `GCL-A-…` and forwards the injection sentence is "passed without marker"); the sentence is
+  matched by a run of four words around its distinctive word, so a gateway's own refusal text is not
+  a leak; a lone distinctive word is "text altered"; a sighting at the far end is proof even when
+  the result was lost — checked.
+- A gateway started by an adapter does not outlive the run (SIGTERM, SIGHUP, exit without `stop()`; the
+  bundled reference gateways also exit when their parent is gone) — checked (tests/test_process_cleanup.py).
+
+## Same guard on every route, `--extra routes` (tests/test_routes.py)
+- Reference gateway: strict holds all 5 routes (chat, chat streamed, `/v1/messages`, `/v1/responses`,
+  `/v1/completions`), parity equal; naive holds chat and chat streamed and violates the other 3, parity
+  broken. Reference MCP gateway: strict holds `tools/call`, `resources/read`, `prompts/get` and does not
+  carry the batch or the hidden tool (n/a), parity equal; naive holds `tools/call` and the hidden tool
+  and violates batch, `resources/read`, `prompts/get`, parity broken — checked, re-run 2026-10-13.
+- A route is "not carried" only on a proper 404, 405 or 501 or a 200 without the text, never held; parity
+  names both sides and ignores routes that did not carry; routes do not change the ordinary
+  results; routes appear in the terminal and HTML reports, SARIF, compare and table — checked.
+- LiteLLM 1.105.0: routes r01, r03, r04, r05 held; r02, a streamed chat completion, violated (the
+  blocked reply's text reaches the client before the block event); `/v1/messages` held — checked locally
+  (reported in the pull-request description #9), opt-in `GCL_INTEG_PYTHON`, not re-run for this file.
+
+## Config applied, `--extra config` (tests/test_config_checks.py, test_litellm_config.py)
+- Reference gateway: strict holds all 7 checks (3 load failures, tighten, loosen, scope in and out); naive
+  holds 1 and violates 6 (a missing file, invalid JSON and an unknown guard type all allow; an edit is
+  ignored; a scoped guard matches nothing); controls hold in both — checked, re-run 2026-10-13.
+- A check is never held without the receipt of which stand-in scanner (A allows, B blocks) answered;
+  a broken control makes every check unverified; a rejected edit is not a violation; an adapter without
+  the property gets no check for it; the extra is refused on adapters without it — checked.
+- LiteLLM 1.105.0 starts WITHOUT the guardrail for an unknown guardrail type and for
+  `generic_guardrail_api` without `api_base`; 1.99.0 refuses to start; `PUT /guardrails/{id}` on 1.99.0
+  answers 200 but the old policy keeps running (BerriAI/litellm#40201), `PATCH` applies; on 1.105.0 `PATCH`
+  and `PUT` both apply; scope by model held on both — checked locally (reported in pull-request
+  descriptions #3 and #7), live edits need `GCL_LITELLM_DATABASE_URL`, opt-in, not in CI, not re-run here.
+
+## Upgrade check (tests/test_upgrade_check.py)
+- `upgrade-check` on the reference gateway, strict → naive: exit 1, 18 regressions, 20 unchanged; strict
+  → strict: exit 0, 0 regressions, 38 unchanged — checked, re-run 2026-10-13.
+- Unit level: held → violated is a regression and violated → held an improvement; held → unverified
+  is a regression only when the after-controls hold; broken controls make the comparison unverified,
+  not regressed, and a proven leak survives them; a guard that went silent is a regression even if
+  everything still looks held; a guard never consulted proves nothing; scenarios on one side only and
+  different integrations are refused or unverified; a latency sweep is refused; "docs due" follows the
+  installed version against the version the docs were read for — checked.
+- LiteLLM 1.99.0 → 1.105.0 with `--extra config`: exit 1 with two regressions (the unknown guardrail type
+  and `generic_guardrail_api` without `api_base` now start without the guardrail) — checked locally
+  (reported in pull-request description #5), opt-in, not re-run here.
+
+## Coverage: false alarms per language (tests/test_lang_fpr.py)
+- Wilson intervals at zero and tiny n; n = 0 reads "not measured", never 0%; every rate prints with counts
+  and its interval; the gap to English is starred only when the intervals do not overlap; an unanswered
+  case is not counted as clean — checked.
+- Gate: `--max-fpr`, `--max-fpr-lang`, `--min-recall`, `--max-fp`: exit 1 naming language and counts; the
+  boundary is not a breach; a limit with nothing measured is a breach; an incomplete run exits 2;
+  fractions outside 0–1 and percents given as fractions are refused — checked.
+- Bundled hard negatives (`--hard-negatives`): 144 rows, 12 per language, consistent across languages, not
+  copied between them, marked as written for gcl — checked. They are machine-written and not
+  native-speaker reviewed: a smoke test, not a benchmark — not tested by a native speaker.
+- Measured with the bundled cases plus `--hard-negatives` (432 rows): the English-only rule set 2.4%
+  (7/288) false positives, recall unchanged at 11.8%; the substring detector (negative control) 42.4%
+  (122/288), 14 breaches of `--max-fpr 0.05 --max-fpr-lang 0.10`; the keyword example adapter 0.3% (1/288)
+  — checked, re-run 2026-10-13 (NUMBERS.md).
+
+## Evidence pack (tests/test_evidence_pack.py)
+- Every mapped id is on the list of provisions read from a primary source, with its URL; every row has a
+  reason, a strength and a known check family; ISO/IEC 42001 is not mapped; a status is never promoted
+  (unverified and missing stay as they are); a coverage report is never shown as held; a dirty tree or a
+  missing receipt is warned — checked.
+- Manifest: SHA-256 of every input and output, each run's receipt; a changed input, a changed output
+  and an extra file are each detected (exit 1); HMAC-SHA256 verifies, fails with a wrong key and on a
+  changed manifest; an unsigned pack claims nothing — checked.
+- On six real reference reports (config and routes, strict and naive, MCP at 2025-11-25, coverage): 199
+  results mapped (112 held, 72 violated, 12 unverified, 3 n/a), 10 files written, `evidence-verify`
+  8 files checked, signature verified, exit 0; the same pack with one byte appended to a copied input,
+  with `pack.json` edited, and with a stray file: exit 1 each — checked, 2026-10-13.
+- The mapping is gcl's reading of the texts, not a legal opinion or a conformity assessment — not
+  reviewed by a lawyer or an assessor.
 
 ## Not yet verified
 - CI matrix (Python 3.11–3.13 × Node 20/22): the workflow is written, not run.
 - Behaviour on Windows.
+- The 144 bundled hard negatives: no native-speaker review of any language.
+- LiteLLM 1.99.0 / 1.105.0 results above (config, routes, upgrade-check): taken from the pull-request
+  descriptions, not re-run when this file was updated; need `GCL_INTEG_PYTHON` and, for live edits,
+  `GCL_LITELLM_DATABASE_URL`.
+- Evidence pack: the mapping to the AI Act, NIST and OWASP has not been read by a lawyer or an assessor.
+- Serial wall time of the test suite (only the six-at-a-time run was timed).

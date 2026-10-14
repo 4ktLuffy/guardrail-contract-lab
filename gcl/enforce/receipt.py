@@ -53,6 +53,19 @@ def gcl_source() -> dict:
             "dirty_files": dirty, "source_sha256": source_hash()}
 
 
+def file_digest(path: str | Path, limit: int = 8_000_000) -> dict | None:
+    """{"path" (resolved), "sha256", "bytes"} of a regular file, or None if it is not one or is
+    unreadable or larger than `limit`. Used to pin the files that served a control."""
+    try:
+        p = Path(path).resolve()
+        if not p.is_file() or p.stat().st_size > limit:
+            return None
+        data = p.read_bytes()
+    except (OSError, ValueError):
+        return None
+    return {"path": str(p), "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+
+
 def spec_hash(spec: dict | None) -> str | None:
     if spec is None:
         return None

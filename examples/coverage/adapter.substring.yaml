@@ -1,0 +1,3 @@
+# The negative control: gcl coverage --adapter examples/coverage/adapter.substring.yaml --hard-negatives
+name: naive substring detector (negative control)
+argv: ["python3", "substring_detector.py"]

@@ -10,7 +10,7 @@ from __future__ import annotations
 import html
 import json
 
-from ..coverage import lang_name
+from ..coverage import fmt_rate, lang_name
 from .terminal import _na, show
 
 CSS = """
@@ -143,17 +143,27 @@ def _coverage(sec: dict) -> str:
                + _tile(f'{a["fp_pct"]}%', f'false positives ({a["flagged_benign"]}/{a["benign"]})',
                        bad_if_nonzero=False)
                + "</div>")
-    out.append("<div class='scroll'><table><tr><th>Language</th><th>Recall</th><th>95% CI</th>"
-               "<th>False positives</th><th>Hard-negative FP</th></tr>")
+    out.append("<div class='scroll'><table><tr><th>Language</th><th>Recall (95% CI)</th>"
+               "<th>False positives (95% CI)</th><th>Hard-negative FP (95% CI)</th>"
+               "<th>Gap vs English, points</th></tr>")
     for lg, row in sec["by_lang"].items():
-        ci = (f'{e(row["ci_low_pct"])}–{e(row["ci_high_pct"])}%'
-              if row["ci_low_pct"] is not None else "—")
+        g = row.get("gap_vs_en") or {}
+        gap = "; ".join(f"{n} {v['pp']:+}{'*' if v['clear'] else ''}"
+                        for n, v in (("recall", g.get("recall")), ("FP", g.get("fpr"))) if v) or "—"
         out.append(f'<tr><td><b>{e(lg)}</b></td><td><span class="cell"{_heat(row["recall"])}>'
-                   f'{e(row["recall_pct"])}% ({e(row["caught"])}/{e(row["attacks"])})</span></td>'
-                   f'<td>{ci}</td>'
-                   f'<td>{e(row["fp_pct"])}% ({e(row["flagged_benign"])}/{e(row["benign"])})</td>'
-                   f'<td>{e(row["hn_fp_pct"])}% ({e(row["hn_flagged"])}/{e(row["hn"])})</td></tr>')
+                   f'{e(fmt_rate(row["recall_cell"]))}</span></td>'
+                   f'<td>{e(fmt_rate(row["fpr"]))}</td>'
+                   f'<td>{e(fmt_rate(row["hn_fpr"]))}</td><td>{e(gap)}</td></tr>')
     out.append("</table></div>")
+    out.append('<p class="sub">* = the interval does not overlap English\'s; otherwise the gap may be '
+               'noise. Every rate shows its interval because the samples per language are small.</p>')
+    gate = sec.get("gate")
+    if gate:
+        if gate["breaches"]:
+            out.append('<div class="banner">Threshold breached:<ul>'
+                       + "".join(f"<li>{e(b['text'])}</li>" for b in gate["breaches"]) + "</ul></div>")
+        else:
+            out.append('<p class="sub">Thresholds met, on the observed rate (see the intervals).</p>')
     for d in sec.get("drivers", []):
         out.append(f'<p class="sub warning">Note: {e(d)}</p>')
     out.append(_compare(sec))

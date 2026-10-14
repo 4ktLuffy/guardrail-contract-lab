@@ -36,6 +36,17 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   deadline); if no single input hangs it alone, the finding says that instead.
 
 ## Coverage numbers
+- The hard-negative set (`--hard-negatives`, 12 per language, 12 languages) was written for
+  gcl by an AI assistant: original text, not native-speaker reviewed, not drawn from any
+  dataset. A native reader may find an unnatural phrase, or a text that is not clearly
+  benign. Twelve texts per language give wide intervals (0/12 is consistent with a true rate
+  up to 24%), so a pass is weak evidence and a gap between two languages is only meaningful
+  when the starred intervals do not overlap. The base themes are translations of one English
+  set, so they measure the same risky-looking patterns, not the ones that are common in each
+  language's real traffic. The bundled attacks do not include pt, it, ja or hi: those get a
+  false-positive rate but no recall. Merging the hard negatives into the 288 bundled cases
+  gives English 24 benign texts and most others 24 or 12, so gaps in false positives mix
+  unequal sets; run `--cases gcl/data/hardneg.multilingual.jsonl` alone for a like-for-like view.
 - The bundled 288 cases are machine-written (`native_reviewed: false`). Amharic and
   Arabizi wording is the least certain. Use your own reviewed cases for decisions.
 - 12 attacks per language: a 0/12 has a 95% interval up to 24%. The report prints
@@ -191,6 +202,14 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   by field name; a secret in a field with an innocent name is stored.
 - `gcl compare` matches scenarios by stage, guard behaviour, role and language; runs of
   two different gcl versions may plan different scenarios, listed as "only in old/new".
+- `gcl upgrade-check` runs the two installs one after the other, each with its own run id (so a cache
+  that outlives an install cannot answer for the other), on one machine; a difference can be a flaky
+  scenario rather than the upgrade, and nothing re-runs a regressed row to tell. It cannot read an
+  integration's effective defaults: a changed default is visible only through a scenario that exercises
+  it, and the "docs re-read due" list only compares version numbers against the version each
+  expectation was read for (a version that cannot be ordered is reported as "differs"). "Guard
+  consulted" counts valid scanner requests on the controls per stage; it does not show the guard was
+  consulted for every request, or that it is the same guard. Latency sweeps and attack mode are not supported.
 - The GitHub Action and the version-watch workflow are tested for their structure, not run
   on GitHub from this repository.
 

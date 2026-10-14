@@ -19,6 +19,7 @@ app = typer.Typer(add_completion=False, no_args_is_help=True,
 
 DATA = Path(__file__).parent / "data"
 BUNDLED_CASES = DATA / "cases.multilingual.jsonl"
+BUNDLED_HARDNEG = DATA / "hardneg.multilingual.jsonl"
 LEVELS = {"note": 0, "warning": 1, "error": 2}
 
 
@@ -152,18 +153,37 @@ def coverage(
     min_recall: float | None = typer.Option(None, help="Fail if any language is below this %."),
     max_fp: float | None = typer.Option(None, help="Fail if any language's false-positive rate "
                                         "(plain benign + hard negatives) is above this %."),
+    max_fpr: float | None = typer.Option(
+        None, help="Fail if the overall false-positive rate (a fraction, 0.05 = 5%) is above this."),
+    max_fpr_lang: float | None = typer.Option(
+        None, help="Fail if any language's false-positive rate (a fraction, 0.05 = 5%) is above this."),
+    hard_negatives: bool = typer.Option(
+        False, "--hard-negatives", help="Add gcl's per-language hard-negative set (benign text that "
+        "looks risky; 12 per language, authored for gcl, not native-reviewed) to the cases."),
     loader_drops_broken: bool = typer.Option(
         False, help="Measure as a loader that silently skips rules it cannot compile "
                     "(otherwise such rules make the run incomplete)."),
 ):
-    """Per-language recall and false-positive rate, with intervals."""
-    from .coverage import detect_with_adapter, detect_with_rules, load_adapter, summarize
+    """Per-language recall and false-positive rate, with intervals and a CI gate."""
+    from .coverage import (
+        detect_with_adapter,
+        detect_with_rules,
+        evaluate_gate,
+        load_adapter,
+        summarize,
+    )
     from .report.html import render_html
     from .report.terminal import render_coverage
 
     if bool(rules) == bool(adapter):
         raise typer.BadParameter("give exactly one of --rules or --adapter")
+    for opt, v in (("--max-fpr", max_fpr), ("--max-fpr-lang", max_fpr_lang)):
+        if v is not None and not 0 <= v <= 1:
+            raise typer.BadParameter(f"{opt} is a fraction between 0 and 1 (0.05 = 5%), got {v}")
     case_list = load_cases(cases)
+    if hard_negatives:
+        have = {c["id"] for c in case_list}
+        case_list += [c for c in load_cases(BUNDLED_HARDNEG) if c["id"] not in have]
     texts = [c["text"] for c in case_list]
     if rules:
         _load_rules_or_exit(rules)
@@ -174,6 +194,8 @@ def coverage(
     secs = [summarize(case_list, d) for d in dets]
     for s in secs:
         label = "bundled: cases.multilingual.jsonl" if cases == BUNDLED_CASES else str(cases)
+        if hard_negatives:
+            label += " + bundled: hardneg.multilingual.jsonl"
         s["cases"] = {"path": label, "n": len(case_list)}
         s["fixtures_note"] = _fixture_note(case_list)
     sec = secs[0]
@@ -184,18 +206,16 @@ def coverage(
     doc = R.envelope("coverage", {"rules": str(rules) if rules else None,
                                   "adapter": str(adapter) if adapter else None,
                                   "cases": "bundled" if cases == BUNDLED_CASES else str(cases)})
+    caps = [x for x in (max_fpr_lang, None if max_fp is None else max_fp / 100) if x is not None]
+    lang_cap = min(caps) if caps else None  # --max-fp (percent, older spelling) = --max-fpr-lang
+    gates = [evaluate_gate(s, min_recall, max_fpr, lang_cap) for s in secs]
+    if any(v is not None for v in (min_recall, max_fpr, lang_cap)):
+        sec["gate"] = gates[0]
     doc["coverage"] = sec
     typer.echo(render_coverage(sec))
     _write_outputs(doc, out, _formats(format), render_html)
     complete = all(d.complete for d in dets)
-    bad = []
-    for s in secs:
-        for r in s["by_lang"].values():
-            if min_recall is not None and r["recall_pct"] is not None and r["recall_pct"] < min_recall:
-                bad.append("error")
-            if max_fp is not None and r["all_benign_fp_pct"] is not None \
-                    and r["all_benign_fp_pct"] > max_fp:
-                bad.append("error")
+    bad = ["error" for g in gates for _ in g["breaches"]]
     raise typer.Exit(_exit(bad, complete, "error"))
 
 
@@ -284,6 +304,20 @@ def demo(
         webbrowser.open((out / "report.html").resolve().as_uri())
 
 
+def _make_adapter(cls, integration: str, where, profile: str, spec: Path | None):
+    """One adapter instance in a fresh work directory; the vendor adapters need their --spec."""
+    import tempfile
+
+    workdir = Path(tempfile.mkdtemp(prefix="gcl-enforce-"))
+    if integration in ("litellm-vendor", "nemo-vendor"):
+        if spec is None:
+            raise typer.BadParameter(f"{integration} needs --spec FILE", param_hint="--spec")
+        import json
+
+        return cls(str(where), workdir, profile, spec=json.loads(spec.read_text()))
+    return cls(str(where), workdir, profile)
+
+
 @app.command()
 def enforce(
     integration: str = typer.Argument(..., help="litellm | nemo"),
@@ -336,8 +370,6 @@ def enforce(
                                "reports and repro bundles of different runs never mix)."),
 ):
     """Does a real guardrail integration enforce what its scanner decides?"""
-    import tempfile
-
     from .enforce.adapters import ADAPTERS
     from .enforce.contracts import run_contracts, write_bundles
     from .report.html import render_html
@@ -357,15 +389,7 @@ def enforce(
     if where is None:
         flag = "--env" if cls.runtime == "node" else "--python"
         raise typer.BadParameter(f"{integration} needs {flag}", param_hint=flag)
-    workdir = Path(tempfile.mkdtemp(prefix="gcl-enforce-"))
-    if integration in ("litellm-vendor", "nemo-vendor"):
-        if spec is None:
-            raise typer.BadParameter(f"{integration} needs --spec FILE", param_hint="--spec")
-        import json
-
-        adapter = cls(str(where), workdir, profile, spec=json.loads(spec.read_text()))
-    else:
-        adapter = cls(str(where), workdir, profile)
+    adapter = _make_adapter(cls, integration, where, profile, spec)
     try:
         lats = [float(x) for x in judge_latency.split(",") if x.strip()]
     except ValueError:
@@ -682,6 +706,90 @@ def compare(old: Path = typer.Argument(..., exists=True, dir_okay=False, help="E
     if json_out:
         json_out.write_text(json.dumps(d, ensure_ascii=False, indent=2))
     raise typer.Exit(1 if d["regressions"] else 0)
+
+
+@app.command("upgrade-check")
+def upgrade_check(
+    integration: str = typer.Argument(..., help="Any `gcl enforce` integration."),
+    before: Path = typer.Option(..., exists=True, help="The install you run today: its Python (Node "
+                                "integrations: the directory holding its node_modules)."),
+    after: Path = typer.Option(..., exists=True, help="The install you are about to move to."),
+    profile: str = typer.Option("default", help="Integration profile, used on both sides."),
+    before_profile: str | None = typer.Option(None, help="Profile for the before side only (default: --profile)."),
+    after_profile: str | None = typer.Option(None, help="Profile for the after side only (default: --profile). "
+                                             "Differing profiles simulate an upgrade that changed behaviour."),
+    timeout: float | None = typer.Option(None, help="Client deadline per scenario, seconds."),
+    out: Path | None = typer.Option(None, help="Directory for before/, after/ (full enforce reports) and "
+                                    "upgrade-check.json."),
+    scenario: list[str] = typer.Option([], help="Run only this scenario id (repeatable); controls always run."),
+    spec: Path | None = typer.Option(None, exists=True, dir_okay=False, help="For the vendor adapters."),
+    extra: str = typer.Option("", help="Opt-in blind spots, as for `gcl enforce` (stream, history, retry, "
+                              "mcp, config)."),
+    mcp_protocol: str = typer.Option("2025-03-26", "--mcp-protocol", help="With --extra mcp."),
+    force: bool = typer.Option(False, help="Write into a non-empty --out folder."),
+):
+    """Run the same enforce plan against two installs and report what the upgrade changed.
+    Exit 1 on a regression (held -> violated or unverified, or a guard no longer consulted), 2 if the
+    comparison could not be made, 0 otherwise."""
+    import json
+
+    from .enforce.adapters import ADAPTERS
+    from .enforce.contracts import EXTRAS, run_contracts
+    from .enforce.mcp_surfaces import PROTOCOL, PROTOCOLS
+    from .report.html import render_html
+    from .upgrade import render
+    from .upgrade import upgrade_check as judge
+
+    if integration not in ADAPTERS:
+        raise typer.BadParameter(f"choose from {', '.join(ADAPTERS)}", param_hint="integration")
+    cls = ADAPTERS[integration]
+    profiles = {"before": before_profile or profile, "after": after_profile or profile}
+    for side, p in profiles.items():
+        if p not in cls.documented:
+            raise typer.BadParameter(f"{integration} profiles: {', '.join(cls.documented)}",
+                                     param_hint=f"--{side}-profile")
+    if out and out.exists() and any(out.iterdir()) and not force:
+        raise typer.BadParameter(f"{out} is not empty; use a new folder or --force", param_hint="--out")
+    extras = tuple(x.strip() for x in extra.split(",") if x.strip())
+    if any(x not in EXTRAS for x in extras):
+        raise typer.BadParameter(f"choose from {', '.join(EXTRAS)}", param_hint="--extra")
+    if mcp_protocol not in PROTOCOLS:
+        raise typer.BadParameter(f"choose from {', '.join(PROTOCOLS)}", param_hint="--mcp-protocol")
+    if "mcp" in extras and not cls.mcp_transport:
+        raise typer.BadParameter(f"{integration} is not an MCP gateway", param_hint="--extra")
+    if "config" in extras and not cls.config_checks:
+        raise typer.BadParameter(f"{integration} cannot start with a given policy", param_hint="--extra")
+    docs: dict[str, dict] = {}
+    # One side after the other, never together: the stand-ins and the integrations use free ports and the
+    # timing of a scenario must not depend on what the other install is doing. Each side gets its OWN
+    # run id: a cache that outlives one install must not be able to answer the other install's
+    # requests (sentinels carry the run id). The plan, and so every scenario id, is the same.
+    for side, where in (("before", before), ("after", after)):
+        adapter = _make_adapter(cls, integration, where, profiles[side], spec)
+        _say(f"upgrade-check: {side} ({where}, profile {profiles[side]})")
+        try:
+            run = run_contracts(adapter, timeout or adapter.default_timeout_s, progress=_say,
+                                only=set(scenario) or None, extra=extras, mcp_protocol=mcp_protocol)
+        except (RuntimeError, OSError, ValueError) as e:
+            typer.echo(f"error: {side}: {e}", err=True)
+            raise typer.Exit(2) from None
+        doc = R.envelope("enforce", {"integration": integration, "profile": profiles[side]})
+        doc["enforce"] = run
+        docs[side] = doc
+        if out:
+            _write_outputs(doc, out / side, ["json", "html"], render_html)
+    try:
+        d = judge(docs["before"]["enforce"], docs["after"]["enforce"])
+    except ValueError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2) from None
+    d["options"] = {"integration": integration, "extra": list(extras), "scenario": list(scenario),
+                    "mcp_protocol": mcp_protocol if mcp_protocol != PROTOCOL or "mcp" in extras else None}
+    typer.echo(render(d))
+    if out:
+        (out / "upgrade-check.json").write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+        typer.echo(f"\nReports: {out}/")
+    raise typer.Exit(d["exit_code"])
 
 
 @findings_app.command("disclose")

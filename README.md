@@ -45,7 +45,7 @@ On the bundled fixtures (written for the demo; see [NUMBERS.md](NUMBERS.md)):
 | **91.7% → 0.0%** | recall in English vs Arabic for the same, reasonable, English rule set |
 | **6 of 6** scanner faults | still let the tool call run, in a fail-open tool runner (0 of 6 after the fix) |
 | **18 of 38** gateway scenarios | break a gateway's own fail-closed promise, end to end (0 of 38 for the strict build) |
-| **15 of 18** MCP surfaces | reach the client or server unscanned through a naive MCP gateway (0 of 18 for the strict build; 2 more not carried) |
+| **25 of 34** MCP surfaces | reach the client or server unscanned through a naive MCP gateway (0 of 34 for the strict build; 8 more not carried or not in the protocol version) |
 
 ## Commands
 
@@ -116,13 +116,44 @@ and on *hard negatives* (benign text that uses the trigger words: "ignore the bl
 rows", "run the test suite"), an intent × language grid, and — with several engines —
 the same rules side by side per runtime.
 
+**False alarms next to gaps.** Every rate is printed as counts plus its Wilson interval
+(`2/12 = 16.7% [4.7-44.8]`), never a bare percentage, because per language the samples are
+small; a language with no cases of a kind says "not measured", not 0%. A gap-vs-English
+column gives the difference in points for recall and for false positives, starred only
+when the two intervals do not overlap. `--hard-negatives` adds gcl's own set: 12 benign
+texts that look risky in each of en, es, fr, he, pt, de, ar, ru, zh, it, ja, hi (144 rows):
+ten themes translated from one English base (a security guide about injection, a quoted
+attack asked about, "ignore" / "system" / "password" in everyday use, code and config,
+medical, legal, send-a-report-with-a-link, a magician's secret) plus two
+language-specific ones each (ordinary words that contain a trigger stem, and "forget the
+old schedule"). They were written for gcl by an AI assistant and are **not
+native-speaker reviewed**; treat them as a smoke test for false alarms, not a benchmark.
+Note the bundled attacks cover 12 other languages, so pt, it, ja and hi get a false-positive
+rate here but no recall.
+
+```bash
+gcl coverage --adapter my-guardrail.yaml --hard-negatives --max-fpr 0.05 --max-fpr-lang 0.10 --min-recall 50 --out reports
+```
+
+CI gate: `--min-recall` (percent, any language), `--max-fpr` (overall) and `--max-fpr-lang`
+(any language) as fractions (`0.05` = 5%); `--max-fp` is the older percent spelling of
+`--max-fpr-lang`. The run exits 1 and prints each breach with its counts and interval
+(`THRESHOLD BREACHED: false-positive rate in pt: 8/12 = 66.7% [39.1-86.2] ...`); the same
+breaches are in `report.json` under `coverage.gate`. An incomplete run exits 2, and a limit
+that nothing was measured against is a breach, not a pass. The gate compares the observed
+rate; with 12 texts a pass of 0/12 still allows a true rate near 24%, which is why the
+interval is printed. SARIF is not written for `coverage`.
+`examples/coverage/adapter.substring.yaml` is a deliberately naive word-list detector, the
+negative control: a real guardrail should do clearly better on `--hard-negatives`.
+
 Any guardrail can be measured, not only regex files: an **adapter** is a command that
 reads `{"id","text"}` JSON lines and writes `{"id","flagged"}` lines. A case with no
 answer is recorded as *incomplete*, never as "not flagged".
 
 Bundled cases: 12 attack intents × 12 languages (en, es, fr, de, ru, he, ar, zh,
 **Amharic, Swahili, Arabizi, code-switched**) plus 6 benign and 6 hard-negative texts
-each — 288 rows, machine-written, marked `native_reviewed: false`.
+each — 288 rows, machine-written, marked `native_reviewed: false`. The optional
+hard-negative set (above) is a separate 144-row file, `gcl/data/hardneg.multilingual.jsonl`.
 
 ### `gcl probe ADAPTER` — when the scanner fails, does the action still run?
 
@@ -467,6 +498,30 @@ what changed between two runs — typically before and after an upgrade — and 
 regression (held → violated). The repository is also a GitHub Action
 ([action.yml](action.yml)); [examples/ci/version-watch.yml](examples/ci/version-watch.yml)
 re-runs an integration on its latest release every week and fails on a regression.
+
+#### Before you upgrade: `gcl upgrade-check`
+
+```bash
+gcl upgrade-check litellm --before /envs/now/bin/python --after /envs/next/bin/python --out out/upgrade
+```
+
+Runs the same enforce plan (same options, same scenarios) against both installs, one after the
+other, and writes one report: per scenario before → after (outcome, policy, documented), the
+regressions, the improvements and what did not change. Exit 1 on any regression: held → violated,
+held → unverified (the run can no longer show what it showed), or a guard that is no longer
+consulted. Exit 2 when no regression was found but the comparison could not be made (a side's
+controls were not usable, the guard was never asked in either run, scenarios on one side only).
+`--before-profile` / `--after-profile` run a different profile on one side (the reference gateway:
+strict → naive is an upgrade that broke fail-closed). `--extra`, `--scenario`, `--spec`, `--timeout`
+work as in `gcl enforce`; `out/upgrade/before` and `after` hold the two full reports.
+
+Two checks come from the receipts, not the diff. *Guard consulted*: the controls send a message
+through each stage, so a stage whose controls reached the guard before the upgrade and did not after
+means the guard went silently absent, which is a regression even when nothing in the later scenarios
+needed it. *Docs due*: each adapter's documented expectations were read for a stated version; the
+report lists, per package, whether the version you are moving to is past it. gcl does not read the
+integration's effective defaults, so a changed default (a new `default_on`, a flipped fail-open
+setting) shows up only as a changed scenario result, never as a line of its own.
 
 ### `gcl findings` — a ledger that only holds what runs can back
 

@@ -3,6 +3,23 @@
 ## Unreleased
 
 **New**
+- `gcl upgrade-check ADAPTER --before PY --after PY`: the same enforce plan against the installed and the
+  next version, one report (per scenario before -> after, regressions, improvements, unchanged); exit 1 on
+  held -> violated, held -> unverified or a guard no longer consulted at a stage, exit 2 if the comparison
+  could not be made (unusable controls on a side, guard never consulted, scenarios on one side only).
+  `--before-profile` / `--after-profile` per side. Reports which documented expectations were read for an
+  older version than the one installed (re-read due). `gcl compare` now shares its classification
+  (`compare.classify`) with it.
+- `gcl coverage` false-positive budget per language: every rate is printed with counts and its
+  Wilson 95% interval (n = 0 is "not measured", never 0%), plus a gap-vs-English column for recall
+  and false positives (starred when the intervals do not overlap).
+- `--hard-negatives` adds a bundled set of 144 hard negatives (12 each in en, es, fr, he, pt, de,
+  ar, ru, zh, it, ja, hi: ten themes translated from one English base plus two language-specific),
+  `gcl/data/hardneg.multilingual.jsonl`. Authored for gcl by an AI assistant, not native-speaker reviewed.
+- CI gate for `coverage`: `--max-fpr` (overall) and `--max-fpr-lang` (per language) as fractions,
+  with the existing `--min-recall` and `--max-fp` (percent); exit 1 and a named breach, also in
+  `report.json` as `coverage.gate`. A limit with nothing measured is a breach.
+- `examples/coverage/adapter.substring.yaml`: a naive substring detector, the negative control.
 - `gcl evidence-pack REPORT.json ... --out DIR` and `gcl evidence-verify DIR`: a compliance evidence pack
   from stored reports. Maps check families to EU AI Act (2024/1689 as amended by 2026/1744), NIST AI RMF
   1.0, NIST AI 600-1 and OWASP ids (reused from `gcl/standards.py`), each row with a reason and a

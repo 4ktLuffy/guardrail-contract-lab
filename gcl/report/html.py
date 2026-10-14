@@ -235,6 +235,24 @@ def _receipt(rc: dict) -> str:
     return head + (f'<div class="warning"><b>Receipt problems</b><ul>{probs}</ul></div>' if probs else "")
 
 
+def _trust(sec: dict) -> str:
+    """The mutation control and the control-path attestation (descriptive; changes no verdict)."""
+    mc = sec.get("mutation_control") or {}
+    cp = (sec.get("receipt") or {}).get("control_path") or {}
+    out = []
+    if mc.get("requested"):
+        cls = "sub" if mc["state"] == "passed" else "warning"
+        out.append(f'<p class="{cls}"><b>Mutation control: {e(mc["state"])}</b> · {e(mc["reason"])}</p>')
+    mod = cp.get("control_module")
+    if mod:
+        out.append(f'<p class="sub">Control path: <code>{e(mod["path"])}</code> · {e(mod["version"])} · '
+                   f'sha256 <code>{e(mod["sha256"][:12])}</code></p>')
+    elif cp.get("packages"):
+        pk = ", ".join(f"{n} {d['version']}" if d else f"{n} (not installed)" for n, d in cp["packages"].items())
+        out.append(f'<p class="sub">Control path: {e(pk)}</p>')
+    return "".join(out)
+
+
 def _sweep(sw: dict) -> str:
     if not sw:
         return ""
@@ -265,6 +283,7 @@ def _enforce(sec: dict) -> str:
            + "</div>",
            _doc_source(i.get("documented_source") or {}),
            _receipt(sec.get("receipt") or {}),
+           _trust(sec),
            _sweep(sec.get("latency_sweep") or {}),
            ("<div class='scroll'><table><tr><th>Stage</th><th>Scanner</th><th>Lang</th>"
            "<th>Expected</th><th>Observed</th><th>Policy</th><th>Docs</th><th>Evidence</th></tr>")]

@@ -274,6 +274,32 @@ def _config_table(run: dict) -> list[str]:
     return lines
 
 
+def _trust_lines(run: dict) -> list[str]:
+    """Can the adapter be believed: the mutation control's state and, descriptively, what served the
+    control (best-effort, changes no verdict)."""
+    out = []
+    mc = run.get("mutation_control") or {}
+    if mc.get("requested"):
+        kind = "ok" if mc["state"] == "passed" else "error"
+        out.append(c(f"Mutation control: {mc['state']}: {mc['reason']}", kind))
+        if mc["state"] == "failed":
+            out.append(c("  every result below is unverified: the adapter did not reach the control.", "error"))
+    cp = (run.get("receipt") or {}).get("control_path") or {}
+    mod = cp.get("control_module")
+    if mod:
+        out.append(c(f"Control path: {mod['path']} ({mod['version']}) sha256 {mod['sha256'][:12]}", "dim"))
+    elif cp.get("packages"):
+        pk = ", ".join(f"{n} {d['version']}" if d else f"{n} (not installed)" for n, d in cp["packages"].items())
+        out.append(c(f"Control path: {pk}", "dim"))
+    peers = cp.get("scanner_peers") or {}
+    if peers.get("requests"):
+        out.append(c(f"  the stand-in was called {peers['requests']} time(s) by: "
+                     f"{', '.join(peers['user_agents'])}", "dim"))
+    for n in cp.get("notes") or []:
+        out.append(c(f"  note: {n}", "dim"))
+    return out
+
+
 def render_enforce(run: dict) -> str:
     i = run["integration"]
     v = ", ".join(f"{k} {val}" for k, val in i["versions"].items() if val)
@@ -289,6 +315,7 @@ def render_enforce(run: dict) -> str:
                        f"{(g.get('commit') or 'not a git checkout')[:12]}", "dim"))
         for p in rc.get("problems") or []:
             lines.append(c(f"Receipt: {p}", "warning"))
+        lines += _trust_lines(run)
     lines.append("")
     for r in run["results"]:
         s = r["scenario"]

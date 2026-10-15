@@ -727,6 +727,67 @@ def breach_dbhub(
     raise typer.Exit(_enforce_exit(merged, fail_on, allow_incomplete))
 
 
+@breach_app.command("postgres")
+def breach_postgres(
+    server_bin: Path = typer.Option(..., exists=True, dir_okay=False, help="The postgres-mcp "
+                                    "executable (installed in its own venv)."),
+    psql: Path = typer.Option(..., exists=True, dir_okay=False, help="psql binary gcl's own "
+                              "observer and seeding use."),
+    host: str = typer.Option("127.0.0.1", help="Throwaway Postgres host (loopback only)."),
+    port: int = typer.Option(..., help="Throwaway Postgres port (non-standard)."),
+    user: str = typer.Option("gcl", help="Throwaway Postgres role."),
+    dbname: str = typer.Option(..., help="THE throwaway database (gcl_marker is dropped and "
+                               "recreated in it every run; never anything but a test fixture)."),
+    forms: str = typer.Option(",".join(("plain_insert", "create_insert", "writable_cte", "function_write",
+                                        "select_into", "commit_escape", "set_rw_escape")),
+                              help="Comma-separated benign probe forms."),
+    timeout: float = typer.Option(30.0, help="Seconds per postgres-mcp round."),
+    repeats: int = typer.Option(3, help="Stability repeats per form (G6)."),
+    out: Path | None = typer.Option(None, help="Directory for report.json."),
+    fail_on: str = typer.Option("policy", help="policy (any violation) | never"),
+    allow_incomplete: bool = typer.Option(False, help="Exit 0 even if a cell could not be judged "
+                                          "(default: exit 2)."),
+):
+    """Enforcement test of postgres-mcp's own documented `--access-mode=restricted`: for each benign
+    probe form, a paired restricted-vs-unrestricted trial judged by gcl's own psql read. A form that
+    commits under restricted is a violated verdict. See gcl/enforce/breach/postgres_breach.py."""
+    from .enforce.breach.postgres_breach import (
+        G8_STATEMENT,
+        PROBE_FORMS,
+        PgStateObserver,
+        config_cell_target,
+        config_scenario,
+    )
+    from .enforce.breach.runner import run_paired_trial
+
+    if fail_on not in ("policy", "never"):
+        raise typer.BadParameter("choose policy or never", param_hint="--fail-on")
+    if out and out.exists() and any(out.iterdir()):
+        raise typer.BadParameter(f"{out} is not empty; use a new folder", param_hint="--out")
+    chosen = [f.strip() for f in forms.split(",") if f.strip()]
+    bad = [f for f in chosen if f not in PROBE_FORMS]
+    if bad or not chosen:
+        raise typer.BadParameter(f"unknown form(s) {bad}; choose from {list(PROBE_FORMS)}", param_hint="--forms")
+    dsn = {"host": host, "port": port, "user": user, "dbname": dbname}
+    reports: dict = {}
+    for form in chosen:
+        target = config_cell_target(str(server_bin), str(psql), dsn, form, timeout)
+        obs = PgStateObserver(str(psql), dsn, target)
+        reports[form] = run_paired_trial(config_scenario(form), target, [obs], repeats=repeats)
+        _print_breach_report(f"CONFIG cell, form {form} (restricted vs unrestricted)", reports[form])
+    typer.echo(f"\n{G8_STATEMENT}")
+
+    doc = R.envelope("breach", {"target": "postgres-mcp", "server_bin": str(server_bin), "forms": chosen})
+    doc["breach"] = reports
+    doc["g8"] = G8_STATEMENT
+    if out:
+        _write_outputs(doc, out, ["json"])
+        typer.echo(f"\nReport: {out}/")
+    keys = ("policy_violated", "documented_deviates", "unverified", "scenarios")
+    merged = {k: sum(r["summary"][k] for r in reports.values()) for k in keys}
+    raise typer.Exit(_enforce_exit(merged, fail_on, allow_incomplete))
+
+
 def main():  # pragma: no cover
     app()
 

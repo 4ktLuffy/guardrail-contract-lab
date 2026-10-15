@@ -727,6 +727,57 @@ def breach_dbhub(
     raise typer.Exit(_enforce_exit(merged, fail_on, allow_incomplete))
 
 
+# --------------------------------------------------------------------------- conform (ACC)
+conform_app = typer.Typer(no_args_is_help=True, help="`gcl conform`: Agent Control Conformance. Does a configured "
+                          "setting on a real agent framework take effect on the operation it governs? Judged "
+                          "from an independent observer, never the agent's reply "
+                          "(see gcl/enforce/conform/__init__.py).")
+app.add_typer(conform_app, name="conform")
+
+
+@conform_app.command("pydantic-ai")
+def conform_pydantic_ai(
+    python: Path = typer.Option(..., exists=True, dir_okay=False, help="The python of a venv that has "
+                                "pydantic-ai installed (the agent runs there, in its own process)."),
+    workdir: Path = typer.Option(..., file_okay=False, help="Throwaway directory the governed tool writes its "
+                                 "marker file into (reset every run; never anything but a test fixture)."),
+    timeout: float = typer.Option(90.0, help="Seconds per agent round."),
+    repeats: int = typer.Option(3, help="Stability repeats (G6)."),
+    out: Path | None = typer.Option(None, help="Directory for report.json."),
+    fail_on: str = typer.Option("policy", help="policy (any conformance gap) | never"),
+    allow_incomplete: bool = typer.Option(False, help="Exit 0 even if the cell could not be judged "
+                                          "(default: exit 2)."),
+):
+    """Conformance test of pydantic-ai's per-tool `requires_approval` setting (CONFIG cell: the same
+    build with the setting on vs off). See gcl/enforce/conform/pydantic_ai_conform.py."""
+    from .enforce.breach.runner import run_paired_trial
+    from .enforce.conform.pydantic_ai_conform import (
+        G8_STATEMENT,
+        MarkerFileObserver,
+        config_scenario,
+        make_target,
+    )
+
+    if fail_on not in ("policy", "never"):
+        raise typer.BadParameter("choose policy or never", param_hint="--fail-on")
+    if out and out.exists() and any(out.iterdir()):
+        raise typer.BadParameter(f"{out} is not empty; use a new folder", param_hint="--out")
+
+    fixture = workdir / "fixture"
+    target = make_target(python, fixture, timeout)
+    report = run_paired_trial(config_scenario(), target, [MarkerFileObserver(fixture, target)], repeats=repeats)
+    _print_breach_report("CONFIG cell (requires_approval on vs off)", report)
+    typer.echo(f"  corroboration only (never the judge): {target.corroboration}")
+    typer.echo(f"\n{G8_STATEMENT}")
+    doc = R.envelope("conform", {"target": "pydantic-ai", "python": str(python)})
+    doc["conform"] = {"config": report}
+    doc["g8"] = G8_STATEMENT
+    if out:
+        _write_outputs(doc, out, ["json"])
+        typer.echo(f"\nReport: {out}/")
+    raise typer.Exit(_enforce_exit(report["summary"], fail_on, allow_incomplete))
+
+
 def main():  # pragma: no cover
     app()
 

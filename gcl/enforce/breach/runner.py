@@ -321,7 +321,7 @@ def judge(scenario: Scenario, off: _Side, on: _Side) -> Outcome:
         return Outcome("unverified", gate, observed, [w for _, w, _ in failures],
                        _CELL_BY_GATE.get(gate, "unobserved"), controls, ev)
     note = (f"with the protection ON the exact terminal event ({event}) was not observed after a complete, "
-            "quiescent run; the OFF run observably escapes (calibrated)")
+            "quiescent run; with it OFF the event is observably produced (calibrated)")
     return Outcome("held", "verdict", "contained", [note], "calibrated+held", controls, ev)
 
 

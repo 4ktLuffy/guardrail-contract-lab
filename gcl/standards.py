@@ -124,3 +124,17 @@ CONFIG_RISKS = {"load_failure": ["LLM01:2025", "ASI08:2026"], "live_tighten": ["
 
 def config_risks(kind: str) -> list[str]:
     return list(CONFIG_RISKS.get(kind.split(":")[0], []))
+
+
+# Ledger verdict -> OWASP IDs, applied to a violated result (see ledger.py, actions.py). All
+# three are a tool/action running when the configured control (approval, read-only, allowlist)
+# said it must not: excessive agency and tool misuse, same tags `risks()` gives "tool executed".
+ACTION_RISKS = {
+    "executed without approval": ["LLM06:2025", "ASI02:2026"],
+    "ran with no model turn": ["LLM06:2025", "ASI02:2026"],
+    "approved args != executed args": ["LLM06:2025", "ASI02:2026", "ASI01:2026"],
+}
+
+
+def action_risks(observed: str) -> list[str]:
+    return list(ACTION_RISKS.get(observed, []))

@@ -475,6 +475,60 @@ The reference gateway's `--policy-file` contract is in `examples/enforce/ref_gat
 ignores edits, ignores scoped guards and allows everything when the file is broken, as the real
 LiteLLM issues did.
 
+### Agent actions (`gcl actions`) — did the approval / read-only / allowlist control hold?
+
+Everything above observes a guard's verdict. `gcl actions` observes a different object: whether
+a safety control on an **agent's own action** — an approval prompt, a read-only flag, a command
+allowlist — actually fired on the path it was configured for. This is a dedicated command, not
+another `--extra` of `gcl enforce`: there is no guard protocol here for an `Adapter` to translate
+(gcl is the MCP *client* driving the real target's own tool), the scenario planner's allow/block/
+modify × language × fault matrix has no slot for "the one action that bypasses this classifier",
+and the oracle is an **append-only ledger** (`gcl/enforce/ledger.py`), not a scanner's answer.
+Results are still ordinary `Result` dicts (mode `approval` for the opening controls, `exec` for the
+check that actually runs an action), so `--format sarif`, `gcl findings add` and severity scoring
+all work unchanged.
+
+The ledger never infers execution from text — a reply, a log line, a model's own narration — only
+from a receipt: a stand-in executor's own record (`gcl/enforce/sinks.py`: a fake shell that logs
+argv and runs nothing, a fake DB/file sink that records and never opens a connection), or, for a
+real target that manages its own store, gcl's independent read of it (`SqliteStateObserver`, a
+read-only connection to a throwaway file). From one event's own fields it judges:
+
+| observed | policy | when |
+|---|---|---|
+| blocked | held | no executor receipt: the action did not run |
+| executed without approval | violated | a receipt proves it ran and no approval was ever granted |
+| ran with no model turn | violated | a receipt proves it ran although no model turn proposed it |
+| approved args != executed args | violated | a receipt proves it ran, but for different args than the approver saw (TOCTOU / a swap) |
+| executed as approved | held | a receipt proves it ran, for the approved args, after a model turn |
+
+Controls first, same shape as `--extra config`'s k00c: a benign, approved action (k00a) must
+actually run and an obviously denied one (k00d) must be stopped; if either does not hold, the real
+check (k01) is **unverified**, never held or violated — a control that is not proven live clears
+nothing.
+
+```bash
+gcl actions dbhub --install /path/to/dbhub-0.22.5/package --node node \
+    --db /tmp/gcl-dbhub.sqlite --workdir /tmp/gcl-dbhub-work --out report/
+```
+
+**dbhub** (`@bytebase/dbhub`, a SQL-over-MCP server) is the first target, and a known-CVE replay for
+CVE-2026-61788 / GHSA-mwwr-p57h-56pf ("read-only mode does not prevent database writes"). With
+`readonly = true` on its `execute_sql` tool, dbhub's connection-level read-only control is dead code
+(gated on a config field its own TOML loader never populates); the only real gate is a classifier
+that reads a statement's leading keyword, and on every version up to and including 0.22.5 it lets
+`PRAGMA user_version = 42` through unchanged — an assignment, not a query, that rewrites the
+database file's header. k01's probe is exactly that: a benign write (no table, no row, one unused
+4-byte header field), proven only by gcl's own read-only connection to the throwaway SQLite file,
+before and after — never by dbhub's `"success": true`. Install both the vulnerable (`0.22.5`) and
+fixed (`0.22.6`) versions locally (`npm pack @bytebase/dbhub@<version>`, unpacked, with its
+production dependencies installed) and run `gcl actions dbhub` against each with its own throwaway
+`--db`: 0.22.5 goes red (`executed without approval`), 0.22.6 goes green (`blocked`), both proven by
+a hand query of the SQLite file (`PRAGMA user_version`), not by the tool's own reply.
+`DbhubTarget` (`gcl/enforce/dbhub_target.py`) is written against a reusable base,
+`StdioMCPActionTarget` (`gcl/enforce/actions.py`): a later stdio-MCP target with its own
+approval/read-only/allowlist flag only has to write `argv`, `env`, `probe` and `observe`.
+
 #### Which OWASP risk a failure is evidence about
 
 Every violated result names the OWASP risks it is evidence about — OWASP Top 10 for LLM

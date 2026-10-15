@@ -3,6 +3,24 @@
 ## Unreleased
 
 **New**
+- `gcl actions TARGET`: agent-action controls (approval / read-only / allowlist), generalising the
+  observed object from "a guard verdict" to "a safety control fired on its path". New
+  `gcl/enforce/ledger.py` (an append-only executor/approval ledger; pure verdicts: `blocked`/held,
+  `executed without approval`, `ran with no model turn`, `approved args != executed args` — all from
+  a recorded executor receipt, never from text) and `gcl/enforce/sinks.py` (stand-in executors that
+  record and never really act: a fake shell on PATH, a fake DB/file sink, plus
+  `SqliteStateObserver`, a read-only connection to a real target's own throwaway file). A dedicated
+  command rather than `gcl enforce --extra` (justified in `gcl/enforce/actions.py`'s docstring):
+  there is no guard protocol to translate, and the scenario planner has no slot for a ledger
+  verdict or a classifier bypass. Controls first (`k00a`/`k00d`, same shape as `--extra config`'s
+  k00c): a benign approved action must run and an obviously denied one must be stopped, or the real
+  check is unverified. Results are ordinary `Result` dicts (mode `approval`/`exec`), filed under
+  `enforce` too, so `--format sarif`, `gcl findings add` and severity scoring work unchanged.
+  First real target: **dbhub** (`gcl/enforce/dbhub_target.py`, `DbhubTarget` on a reusable
+  `StdioMCPActionTarget` base) — a known-CVE replay for CVE-2026-61788 / GHSA-mwwr-p57h-56pf
+  (`@bytebase/dbhub`'s read-only mode does not stop a `PRAGMA user_version = N` assignment): red on
+  `<= 0.22.5`, green on `>= 0.22.6`, both hand-checked against the throwaway SQLite file's own state.
+  See README "Agent actions (`gcl actions`)".
 - `gcl enforce ... --attest`: the mutation control. After the run, the opening controls (input and
   output, allow and block) are re-run on two fresh sessions with the stand-in forced to always allow
   and to always block. The outcome has to follow: a block control that cannot be made to pass, an

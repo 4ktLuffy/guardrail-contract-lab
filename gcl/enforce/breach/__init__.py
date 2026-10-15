@@ -52,8 +52,9 @@ throwaway fixture. Nothing here sends anything anywhere.
 from __future__ import annotations
 
 from .coverage import coverage_matrix
+from .driver import ConversationScript, ReachabilityTrace, ScriptedModelEndpoint, ScriptedStep
 from .runner import GATE_ORDER, run_paired_trial
 from .types import CALIBRATION_KINDS, Observer, Scenario, Target, Trace
 
-__all__ = ["CALIBRATION_KINDS", "GATE_ORDER", "Observer", "Scenario", "Target", "Trace", "coverage_matrix",
-           "run_paired_trial"]
+__all__ = ["CALIBRATION_KINDS", "GATE_ORDER", "ConversationScript", "Observer", "ReachabilityTrace", "Scenario",
+           "ScriptedModelEndpoint", "ScriptedStep", "Target", "Trace", "coverage_matrix", "run_paired_trial"]

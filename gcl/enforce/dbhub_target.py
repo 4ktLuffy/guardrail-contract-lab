@@ -20,6 +20,13 @@ The probe is exactly that assignment: benign (it touches no table, no row, nothi
 unused 4-byte header field SQLite reserves for the application's own use), and proven by
 gcl's own read-only connection to the throwaway file (`sinks.SqliteStateObserver`), before
 and after -- never by dbhub's own "success": true.
+
+Two more things keep that proof honest (see `actions.py`'s docstring): the observer is shown
+to be ALIVE before any probe is sent (`liveness_nudge`: gcl itself inserts a row and sets a
+different `user_version` through its own connection, the observer must see both, and both are
+put back), and the approved control is confirmed by the observer reading the same rows the
+reply returned (`confirm_approved`), not by the reply alone. A "blocked" additionally needs a
+completed, error-free exchange; a crashed dbhub that never ran the PRAGMA reads unverified.
 """
 
 from __future__ import annotations
@@ -28,7 +35,7 @@ import json
 import os
 import sqlite3
 from pathlib import Path
-from typing import ClassVar
+from typing import Callable, ClassVar
 
 from .actions import StdioMCPActionTarget
 from .mcp_client import Exchange
@@ -57,8 +64,8 @@ def seed_db(db_path: Path) -> None:
     to SQLite's default of 0. Idempotent and run every time, not only when the file is
     new -- a repeat run against the same file must not read a stale user_version from an
     earlier run as "no write happened" (a false green). This is gcl preparing its own
-    fixture before driving the target, the one write gcl itself ever makes to this file;
-    every later look is read-only, through SqliteStateObserver."""
+    fixture before driving the target (the liveness nudge is its only other write, also gcl's
+    own and also undone); every look at the state is read-only, through SqliteStateObserver."""
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(db_path)
@@ -67,6 +74,18 @@ def seed_db(db_path: Path) -> None:
         if not con.execute("SELECT 1 FROM gcl_marker WHERE note = ?", (_BENIGN_NOTE,)).fetchone():
             con.execute("INSERT INTO gcl_marker (note) VALUES (?)", (_BENIGN_NOTE,))
         con.execute("PRAGMA user_version = 0")
+        con.commit()
+    finally:
+        con.close()
+
+
+def _gcl_write(db_path: Path, sql: str, params: tuple = ()) -> None:
+    """gcl's own, writable connection to the throwaway file -- used only by `seed_db` and
+    the liveness nudge, never while a target process is running, and never on anything but
+    the file gcl created for this purpose. Every later look stays read-only."""
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(sql, params)
         con.commit()
     finally:
         con.close()
@@ -163,6 +182,47 @@ class DbhubTarget(StdioMCPActionTarget):
         rows = self.observer.read("SELECT id, note FROM gcl_marker ORDER BY id")
         uv = self.observer.read("PRAGMA user_version")
         return {"marker_rows": rows, "user_version": uv[0][0] if uv else None}
+
+    def liveness_nudge(self, kind: str, marker: str) -> Callable[[], None]:
+        """k00l: the denied probe moves `gcl_marker` rows, the bypass probe moves
+        `user_version`; the observer must be shown to see each. gcl changes them itself,
+        through its own connection, to values no probe uses (a row tagged with this
+        check's marker; `user_version` 1, the probe's own sentinel being 61788), and the
+        returned callable puts them back exactly."""
+        if kind == "denied":
+            _gcl_write(self.db_path, "INSERT INTO gcl_marker (note) VALUES (?)", (marker,))
+            return lambda: _gcl_write(self.db_path, "DELETE FROM gcl_marker WHERE note = ?", (marker,))
+        if kind == "bypass":
+            prior = self.observer.read("PRAGMA user_version")[0][0]
+            _gcl_write(self.db_path, "PRAGMA user_version = 1")
+            return lambda: _gcl_write(self.db_path, f"PRAGMA user_version = {int(prior)}")
+        raise ValueError(f"unknown liveness kind {kind!r}")
+
+    def reply_refused(self, ex: Exchange) -> bool | None:
+        """dbhub refuses with a tool result flagged `isError` / `success: false` (or a
+        JSON-RPC error). `False` only when the tool itself says `success: true`; anything
+        else unintelligible is None (cannot tell)."""
+        resp = ex.response_to(self.CALL_ID)
+        if not resp:
+            return None
+        if "error" in resp or (resp.get("result") or {}).get("isError") is True:
+            return True
+        doc = _tool_text(ex, self.CALL_ID)
+        if not doc:
+            return None
+        return False if doc.get("success") is True else (True if doc.get("success") is False else None)
+
+    def confirm_approved(self, ex: Exchange, before: dict, after: dict) -> bool:
+        """The reply's rows must be exactly what gcl itself reads from the store for the
+        same question, and the read must not have moved any state: a dbhub that answers
+        "benign" without really querying the database (or a canned reply) fails here."""
+        if before != after:
+            return False
+        doc = _tool_text(ex, self.CALL_ID) or {}
+        replied = [r.get("note") for r in ((doc.get("data") or {}).get("rows") or []) if isinstance(r, dict)]
+        seen = [n for (n,) in self.observer.read("SELECT note FROM gcl_marker WHERE note = ? ORDER BY id",
+                                                  (_BENIGN_NOTE,))]
+        return bool(seen) and replied == seen
 
     def reply_ok(self, ex: Exchange) -> bool:
         doc = _tool_text(ex, self.CALL_ID)

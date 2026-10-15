@@ -182,6 +182,7 @@ class _ScriptedTarget(StdioMCPActionTarget):
     def __init__(self, ran: dict[str, bool]):
         self.ran = ran
         self.calls: list[str] = []
+        self.nudge_level = 0
 
     def argv(self):
         raise AssertionError("never spawned: call() is overridden for this test double")
@@ -194,12 +195,24 @@ class _ScriptedTarget(StdioMCPActionTarget):
         return {"jsonrpc": "2.0", "id": "x", "method": "tools/call", "params": {"kind": kind}}
 
     def observe(self):
-        return {"n": len(self.calls)}
+        return {"n": len(self.calls), "nudge": self.nudge_level}
 
     def changed(self, before, after):
+        if before["nudge"] != after["nudge"]:      # gcl's own liveness change: a live observer sees it
+            return True
         return self.ran[self._last_kind()]
 
+    def liveness_nudge(self, kind, marker):
+        self.nudge_level += 1
+
+        def undo():
+            self.nudge_level -= 1
+        return undo
+
     def reply_ok(self, ex):
+        return self.ran["approved"]
+
+    def confirm_approved(self, ex, before, after):
         return self.ran["approved"]
 
     def _last_kind(self):
@@ -217,8 +230,9 @@ def test_controls_hold_and_bypass_is_judged():
     assert by_id["k00d"]["policy"] == "held"
     assert by_id["k01"]["policy"] == "violated"
     assert by_id["k01"]["observed"] == "executed without approval"
-    assert run["summary"] == {"checks": 3, "held": 2, "violated": 1, "unverified": 0,
-                              "scenarios": 3, "policy_held": 2, "policy_violated": 1,
+    assert by_id["k00l"]["policy"] == "held"
+    assert run["summary"] == {"checks": 4, "held": 3, "violated": 1, "unverified": 0,
+                              "scenarios": 4, "policy_held": 3, "policy_violated": 1,
                               "documented_deviates": 0, "documented_unspecified_violations": 1}
 
 
@@ -250,7 +264,7 @@ def test_broken_denied_control_also_makes_the_replay_unverified():
 def test_clean_target_holds_everywhere():
     target = _ScriptedTarget({"approved": True, "denied": False, "bypass": False})
     run = run_action_target(target, timeout_s=1.0)
-    assert run["summary"]["held"] == 3
+    assert run["summary"]["held"] == 4
     assert run["summary"]["violated"] == 0
     assert run["summary"]["unverified"] == 0
 

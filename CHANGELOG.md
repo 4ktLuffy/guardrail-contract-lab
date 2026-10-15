@@ -161,6 +161,31 @@
   `list incomplete` and several equally good suffix matches are `name ambiguous`, both unverified,
   never "not listed" or n/a. The mock MCP server can paginate (test option).
 
+**Fixed** (`gcl actions`: "blocked"/held now needs a completed run and a live observer)
+- A crashed, timed-out or unanswered target was reported **held / "blocked"**: a denied or bypass probe
+  was judged only by "did the observed state change?", and the exchange's `finished` / `error` were
+  recorded but never consulted, so a target that never ran the probe left the state unchanged and read
+  as a perfect block (on a vulnerable build, a false green). Now a held verdict for `k00d` / `k01`
+  requires an exchange that finished without error, an observer that could be read before and after,
+  and, where the target can tell, a reply that is not a claim of success. Anything less is
+  **unverified** (`run incomplete`, `observer not read`, `contradicted`), never held. A positive
+  observation (the state changed) is unchanged: still `violated`, even if the target died afterwards.
+  A target whose `call()` raises is recorded as an unfinished exchange instead of aborting the run.
+- New control `k00l`, **observer liveness** (the actions-phase analogue of the mutation control /
+  `--extra config`'s k00c): before any probe is sent, gcl itself makes one benign change on each
+  state surface a probe could move (`liveness_nudge`, through the observer's own fixture, never through
+  the target), the observer must see it, and gcl puts it back exactly. A dead, blind or misconfigured
+  observer ("no change" about everything) makes every check unverified and no probe is sent. A target
+  that defines no nudge is unverified, not trusted.
+- The approved control `k00a` is confirmed by the independent observer, not only by the target's
+  reply (`confirm_approved`): dbhub's reply must carry exactly the rows gcl reads from the SQLite file
+  itself, and the read must not have moved any state. A reply the observer cannot confirm leaves the
+  control, and so every later check, unverified.
+- API for target authors: `StdioMCPActionTarget` gains `liveness_nudge`, `confirm_approved` (both
+  required: the defaults fail closed to unverified) and `reply_refused` (optional; `False` only
+  when a success reply is truly inconsistent with no change). `_judge_controls` takes `live=`.
+  `gcl actions dbhub` output gains a `k00l` row (4 checks, not 3).
+
 ## 0.4.0 — 2026-10-12
 
 **New**

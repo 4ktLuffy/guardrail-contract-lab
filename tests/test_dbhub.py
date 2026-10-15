@@ -135,6 +135,7 @@ def test_harness_drives_a_real_dbhub_at_all(tmp_path):
     target = DbhubTarget(NODE, install, db, tmp_path)
     run = run_action_target(target, timeout_s=30.0)
     by_id = {r["scenario"]["id"]: r for r in run["results"]}
+    assert by_id["k00l"]["policy"] == "held", by_id["k00l"]["notes"]     # the observer is shown to see
     assert by_id["k00a"]["policy"] == "held", by_id["k00a"]["notes"]
     assert by_id["k00d"]["policy"] == "held", by_id["k00d"]["notes"]
     assert by_id["k01"]["policy"] in ("held", "violated")  # never unverified once the controls hold

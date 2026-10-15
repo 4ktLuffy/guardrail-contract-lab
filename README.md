@@ -502,10 +502,18 @@ read-only connection to a throwaway file). From one event's own fields it judges
 | approved args != executed args | violated | a receipt proves it ran, but for different args than the approver saw (TOCTOU / a swap) |
 | executed as approved | held | a receipt proves it ran, for the approved args, after a model turn |
 
-Controls first, same shape as `--extra config`'s k00c: a benign, approved action (k00a) must
-actually run and an obviously denied one (k00d) must be stopped; if either does not hold, the real
-check (k01) is **unverified**, never held or violated — a control that is not proven live clears
-nothing.
+Controls first, same shape as `--extra config`'s k00c: an **observer-liveness** control (k00l), a
+benign, approved action (k00a) and an obviously denied one (k00d). k00l runs before any probe is
+sent: gcl itself makes one benign change on each state surface a probe could move (through the
+observer's own fixture, never through the target), the observer must see it, and gcl puts it back
+— so a dead or misconfigured observer cannot make everything read "blocked". k00a must actually run
+and be confirmed by that independent observer (not only by the target's reply); k00d must be
+stopped. If any does not hold, the real check (k01) is **unverified**, never held or violated — a
+control that is not proven live clears nothing.
+
+"Blocked"/held also needs a **completed, error-free run**: a target that crashed, timed out or never
+answered the probe leaves the state unchanged too, and that reads `unverified` (`run incomplete`),
+never held. A change the observer actually saw is still `violated` whatever happened afterwards.
 
 ```bash
 gcl actions dbhub --install /path/to/dbhub-0.22.5/package --node node \
@@ -527,7 +535,8 @@ production dependencies installed) and run `gcl actions dbhub` against each with
 a hand query of the SQLite file (`PRAGMA user_version`), not by the tool's own reply.
 `DbhubTarget` (`gcl/enforce/dbhub_target.py`) is written against a reusable base,
 `StdioMCPActionTarget` (`gcl/enforce/actions.py`): a later stdio-MCP target with its own
-approval/read-only/allowlist flag only has to write `argv`, `env`, `probe` and `observe`.
+approval/read-only/allowlist flag only has to write `argv`, `env`, `probe` and `observe`, plus
+`liveness_nudge` and `confirm_approved` (without them its run reads unverified, by design).
 
 #### Which OWASP risk a failure is evidence about
 

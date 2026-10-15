@@ -359,11 +359,24 @@ What `gcl` does not do, or does only partly. Read this before quoting a number f
   fresh and killed again (`mcp_client.stdio_session`), speaking newline-delimited JSON-RPC. An
   HTTP-service or CLI-headless target (Phase 1's own roadmap: Gemini CLI, PraisonAI) needs its own
   base shape; none is built yet.
+- "Held" / "blocked" needs a **completed run and a live observer**. A denied or bypass probe is only
+  held if its exchange finished without error, the observer could be read before and after, and no
+  change was seen; a target that crashed, timed out or never answered leaves the state unchanged too,
+  and that is `unverified` (`run incomplete`), not a block. The observer is shown to see a change at
+  all by the liveness control `k00l` (gcl changes a benign value itself, through the observer's own
+  fixture, and puts it back); if it does not, every check is unverified. What `k00l` proves is that
+  the observer can see the surfaces gcl nudges (one per probe kind): a write to a field the observer
+  never reads is still not seen (see the dbhub snapshot note below), and a target must define
+  `liveness_nudge` / `confirm_approved` or it reads unverified, by design.
 - `k00a`/`k00d` (the controls) use two different proofs by design: the approved probe is read-only,
-  so there is no persisted state to diff and its "ran" comes from the target's own structured reply
-  (there is nothing else to check for a read); the denied and bypass probes are judged only from
-  `observe()`'s before/after diff, never from what the target's reply claims. A target whose reads
-  have a side effect gcl does not know to look for (a cache, an audit log) is not covered by either.
+  so there is no persisted state to diff; its "ran" needs the target's structured reply AND the
+  observer's independent confirmation that the reply matches the store (`confirm_approved`; dbhub
+  compares the returned rows with gcl's own read of the file). That confirms the data the read
+  returned, not that nothing else was touched. The denied and bypass probes are judged only from
+  `observe()`'s before/after diff (plus the completion gate above), never from what the target's reply
+  claims; the optional `reply_refused` hook can only demote a "held" (a success reply with no change
+  is a contradiction), never create a violation. A target whose reads have a side effect gcl does not
+  know to look for (a cache, an audit log) is not covered by either.
 - The dbhub target reads one field (`PRAGMA user_version`) and one table (`gcl_marker`) as its whole
   "observe" snapshot. A write that touches neither (a different pragma, a WAL-mode side channel) would
   not be seen as "changed" even if it committed; the probe is chosen to land in the one field this

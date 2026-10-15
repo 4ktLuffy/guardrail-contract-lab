@@ -21,6 +21,21 @@
   (`@bytebase/dbhub`'s read-only mode does not stop a `PRAGMA user_version = N` assignment): red on
   `<= 0.22.5`, green on `>= 0.22.6`, both hand-checked against the throwaway SQLite file's own state.
   See README "Agent actions (`gcl actions`)".
+- `gcl breach dbhub`: the real `@bytebase/dbhub` behind `gcl breach`'s step-1/2 Target/Observer/
+  scripted-driver interfaces (`gcl/enforce/breach/dbhub_breach.py`), reusing `gcl actions`' own
+  dbhub machinery (stdio client, seed, `SqliteStateObserver`, the `confirm_approved`/`liveness_nudge`
+  hooks). Two calibration cells, kept distinct end to end (G3): **config** (dbhub 0.22.6, `readonly`
+  toggled true/false — the signature same-build ON/OFF calibration) and **version** (the
+  CVE-2026-61788 replay, `readonly=true` both sides, 0.22.5 vs 0.22.6 toggled instead). One
+  `DbhubBreachTarget` serves both; its `manifest()` always carries a `readonly` key and a `version`
+  key (install path + package version + a `dist/index.js` content hash), and the runner's manifest
+  diff enforces that only the scenario's declared toggle differs between OFF and ON. Records the
+  guard-shares-scripted-endpoint hazard (G8) as N/A for this target (dbhub's control is engine-
+  level, no model/guard endpoint in the path) rather than working around it. Fault injection proves
+  the never-cry-wolf property on a REAL subprocess, not a fake: a killed-mid-step round
+  (`_kill_mid_step_round`, a genuinely incomplete real exchange) and an artificially tiny deadline
+  (`TimeoutTarget`) each read `unverified`, never a false `held`; so does a dead observer pointed at
+  the wrong SQLite file. See README "`gcl breach` (`gcl breach dbhub`)".
 - `gcl enforce ... --attest`: the mutation control. After the run, the opening controls (input and
   output, allow and block) are re-run on two fresh sessions with the stand-in forced to always allow
   and to always block. The outcome has to follow: a block control that cannot be made to pass, an

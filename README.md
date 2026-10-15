@@ -538,6 +538,54 @@ a hand query of the SQLite file (`PRAGMA user_version`), not by the tool's own r
 approval/read-only/allowlist flag only has to write `argv`, `env`, `probe` and `observe`, plus
 `liveness_nudge` and `confirm_approved` (without them its run reads unverified, by design).
 
+### `gcl breach` (`gcl breach dbhub`) — with the protection OFF, did the forbidden effect actually land?
+
+`gcl actions` asks whether a control fired on the path it is configured for. `gcl breach`
+(`gcl/enforce/breach/`) asks a narrower, paired question instead: assume the model side is already
+compromised (a scripted driver plays that part — see `gcl/enforce/breach/driver.py`), and for ONE
+named forbidden effect, did the protection stop it with the setting ON, compared against the SAME
+scenario run again with the setting OFF? A `Scenario` names one effect and its exact terminal event
+(a value durably recorded in a store, not a half-started write); `run_paired_trial` runs it OFF and
+ON on a fresh target each time and judges from independent `Observer`s — never from the target's own
+reply — through a fixed gate order (manifest-identical-except-the-toggle, an observer-liveness
+control, a permitted-action control, reachability, calibration, completion, then the verdict, then
+an N-repeat stability check): any gate that cannot be established forces **unverified**, never a
+false **held**.
+
+`gcl breach dbhub` is the first real target behind this interface, reusing `gcl actions`' own,
+already-reviewed dbhub machinery (stdio client, seed, `SqliteStateObserver`). It runs the SAME
+benign probe as `gcl actions dbhub` (`PRAGMA user_version = <n>`, derived from the scenario's own
+marker, not a fixed sentinel), judged the same way, but keeps TWO calibration *kinds* distinct
+rather than running one version replay:
+
+```bash
+gcl breach dbhub --install-026 /path/to/dbhub-0.22.6/package \
+    --install-025 /path/to/dbhub-0.22.5/package --node node \
+    --db /tmp/gcl-breach-config.sqlite --workdir /tmp/gcl-breach-work --out report/
+```
+
+- **config** — one dbhub build (0.22.6), `readonly` toggled true/false. This is the signature
+  same-build ON/OFF calibration: OFF (`readonly=false`) observably escapes, ON (`readonly=true`)
+  contains it.
+- **version** — the CVE-2026-61788 replay, `readonly=true` on both sides, the BUILD toggled instead
+  (0.22.5 vulnerable / 0.22.6 patched). Never reported as a config result, and vice versa.
+
+Both run through one `DbhubBreachTarget`; its `manifest()` always reports a `readonly` key and a
+`version` key (install path, package version, and a content hash of `dist/index.js`), and the
+runner's own manifest diff demands that only the scenario's declared toggle actually differs
+between OFF and ON. `--install-025` is optional — without it only the config cell runs.
+
+Guard-shares-scripted-endpoint hazard (a swapped model endpoint could nobble its own guard and fake
+a red): N/A here by construction — dbhub's `readonly` control is engine-level, with no model or
+guard endpoint in the path for the scripted relay to share. `gcl breach dbhub` prints this note on
+every run (`gcl/enforce/breach/dbhub_breach.py`'s `G8_STATEMENT`).
+
+Reachability note: for dbhub, gcl is both the scripted model AND the MCP client, so "the trigger
+was relayed through a real agent's own loop" is NOT exercised here — only that gcl's own relay
+machinery (step 2's `ConversationScript`/`ScriptedModelEndpoint`) correctly binds the scripted step
+to the marker before issuing it. Proving a real agent relays an injected trigger into this same tool
+call is a later milestone (smolagents/n8n targets), not this command.
+
 #### Which OWASP risk a failure is evidence about
 
 Every violated result names the OWASP risks it is evidence about — OWASP Top 10 for LLM

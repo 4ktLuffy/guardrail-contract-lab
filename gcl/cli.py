@@ -637,6 +637,96 @@ def dbhub(
     raise typer.Exit(_enforce_exit(sm, fail_on, allow_incomplete))
 
 
+# --------------------------------------------------------------------------- breach (step 3)
+breach_app = typer.Typer(no_args_is_help=True, help="`gcl breach`: paired OFF/ON trials of a real "
+                         "component's own protection, judged by gcl's own independent observers, "
+                         "never the component's reply (see gcl/enforce/breach/__init__.py).")
+app.add_typer(breach_app, name="breach")
+
+
+def _print_breach_report(label: str, report: dict) -> None:
+    t = report["trial"]
+    typer.echo(f"\n{label}: {t['policy']:<10} (gate={t['gate']}, cell={t['cell']}, stable={t['stable']})")
+    for r in report["results"]:
+        s = r["scenario"]
+        typer.echo(f"  {s['id']:<20} {r['policy']:<10} observed {r['observed']}")
+        for n in r["notes"]:
+            typer.echo(f"    note: {n}")
+
+
+@breach_app.command("dbhub")
+def breach_dbhub(
+    install_026: Path = typer.Option(..., exists=True, file_okay=False, help="@bytebase/dbhub "
+                                     ">=0.22.6 install dir (patched; the ON side of both cells)."),
+    install_025: Path | None = typer.Option(None, exists=True, file_okay=False, help="@bytebase/"
+                                            "dbhub <=0.22.5 install dir (vulnerable). Needed for "
+                                            "the VERSION (CVE replay) cell; the CONFIG cell alone "
+                                            "runs without it."),
+    node: str = typer.Option("node", help="The node binary (needs node:sqlite, i.e. Node >=22.5)."),
+    db: Path = typer.Option(..., help="Throwaway SQLite file for the CONFIG cell (recreated/reset "
+                            "every run; never anything but a test fixture)."),
+    db_version: Path | None = typer.Option(None, help="Throwaway SQLite file for the VERSION cell "
+                                           "(default: alongside --db)."),
+    workdir: Path = typer.Option(..., file_okay=False, help="Where each run writes its own "
+                                 "dbhub.toml."),
+    timeout: float = typer.Option(30.0, help="Seconds per dbhub round."),
+    repeats: int = typer.Option(3, help="Stability repeats per cell (G6)."),
+    out: Path | None = typer.Option(None, help="Directory for report.json."),
+    fail_on: str = typer.Option("policy", help="policy (any violation) | never"),
+    allow_incomplete: bool = typer.Option(False, help="Exit 0 even if a cell could not be judged "
+                                          "(default: exit 2)."),
+):
+    """Regression/enforcement test of dbhub's own documented `readonly` control: the CONFIG cell
+    (0.22.6, readonly on vs off) and, if --install-025 is given, the VERSION cell (CVE-2026-61788
+    replay, 0.22.5 vs 0.22.6, readonly=true both). See gcl/enforce/breach/dbhub_breach.py."""
+    from .enforce.breach.dbhub_breach import (
+        G8_STATEMENT,
+        DbhubStoreObserver,
+        config_cell_target,
+        config_scenario,
+        version_cell_target,
+        version_scenario,
+    )
+    from .enforce.breach.runner import run_paired_trial
+
+    if fail_on not in ("policy", "never"):
+        raise typer.BadParameter("choose policy or never", param_hint="--fail-on")
+    if out and out.exists() and any(out.iterdir()):
+        raise typer.BadParameter(f"{out} is not empty; use a new folder", param_hint="--out")
+
+    cfg_target = config_cell_target(node, install_026, db, workdir / "config", timeout)
+    cfg_obs = DbhubStoreObserver(db, cfg_target)
+    cfg_report = run_paired_trial(config_scenario(), cfg_target, [cfg_obs], repeats=repeats)
+    _print_breach_report("CONFIG cell (0.22.6, readonly on vs off)", cfg_report)
+
+    ver_report = None
+    if install_025:
+        db_v = db_version or db.with_name(f"{db.stem}-version{db.suffix}")
+        ver_target = version_cell_target(node, install_026, install_025, db_v, workdir / "version", timeout)
+        ver_obs = DbhubStoreObserver(db_v, ver_target)
+        ver_report = run_paired_trial(version_scenario(), ver_target, [ver_obs], repeats=repeats)
+        _print_breach_report("VERSION cell (0.22.5 vs 0.22.6, CVE-2026-61788 replay)", ver_report)
+    else:
+        typer.echo("\nVERSION cell: skipped (pass --install-025 to run the CVE replay too).")
+
+    typer.echo(f"\n{G8_STATEMENT}")
+
+    doc = R.envelope("breach", {"target": "dbhub", "install_026": str(install_026),
+                                "install_025": str(install_025) if install_025 else None})
+    doc["breach"] = {"config": cfg_report, **({"version": ver_report} if ver_report else {})}
+    doc["g8"] = G8_STATEMENT
+    if out:
+        _write_outputs(doc, out, ["json"])
+        typer.echo(f"\nReport: {out}/")
+
+    summaries = [cfg_report["summary"]] + ([ver_report["summary"]] if ver_report else [])
+    merged = {"policy_violated": sum(s["policy_violated"] for s in summaries),
+             "documented_deviates": sum(s["documented_deviates"] for s in summaries),
+             "unverified": sum(s["unverified"] for s in summaries),
+             "scenarios": sum(s["scenarios"] for s in summaries)}
+    raise typer.Exit(_enforce_exit(merged, fail_on, allow_incomplete))
+
+
 def main():  # pragma: no cover
     app()
 
